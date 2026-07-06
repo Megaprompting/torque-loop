@@ -148,7 +148,7 @@ node bin/ratchet --help
 Verify:
 
 ```bash
-ratchet --version      # -> ratchet 0.2.0
+ratchet --version      # -> ratchet 0.7.0
 ratchet init
 ratchet status
 ```

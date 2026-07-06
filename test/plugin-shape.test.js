@@ -132,6 +132,19 @@ ok('README command list matches the skill folders', () => {
   }
 });
 
+ok('README version examples match package.json (readouts must not drift)', () => {
+  // The project's whole claim is state/readout trust — a README that shows a
+  // stale `ratchet --version` output is the exact poison the receipt hunts.
+  // Any `-> ratchet <semver>` example in the README is a version surface.
+  const readme = read('README.md');
+  const hits = readme.match(/->\s*ratchet\s+\d+\.\d+\.\d+/g) || [];
+  assert.ok(hits.length >= 1, 'README shows a ratchet --version example');
+  for (const hit of hits) {
+    const v = hit.match(/(\d+\.\d+\.\d+)/)[1];
+    assert.strictEqual(v, pkg.version, `README version example "${hit.trim()}" matches package.json`);
+  }
+});
+
 ok('README does not mention removed command names', () => {
   const readme = read('README.md');
   assert.ok(!readme.includes('/ratchet:ratchet-evolve'), 'no stale /ratchet:ratchet-evolve in README');
