@@ -15,6 +15,7 @@
   },
   "scripts": {
     "test": "node test/cli.test.js && node test/evolve.test.js && node test/plugin-shape.test.js",
+    "preflight": "node scripts/preflight.js",
     "ratchet": "node bin/ratchet",
     "ratchet-evolve": "node bin/ratchet-evolve"
   },
