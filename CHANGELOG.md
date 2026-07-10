@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Hook drift guard.** `cmdHook`'s default case returns silently by design (a hook
+  must never break the session), which means a renamed or misspelled subcommand in
+  `hooks/hooks.json` would no-op forever in every installed copy with no error
+  anywhere. `plugin-shape` now asserts every hooks.json command is a
+  `ratchet hook <sub>` invocation whose subcommand `cmdHook` actually handles, and
+  that at least the three known hooks stay wired. CI-enforced (drift guard in the
+  test suite); proven red against a simulated rename before landing.
+
 - **README product thesis — verified guardrails lift cognitive load.** The README now
   states the payoff the execution framing only implied: externalized state lets the agent
   run on a smaller working set and spend its scarce attention on judgment, not bookkeeping.
