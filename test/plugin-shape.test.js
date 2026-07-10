@@ -174,6 +174,21 @@ ok('README does not mention removed command names', () => {
   assert.ok(!readme.includes('/ratchet:ratchet-evolve'), 'no stale /ratchet:ratchet-evolve in README');
 });
 
+ok('README states the product thesis: verified guardrails lift load, unverified ones add it', () => {
+  // The product thesis is load-bearing, not decoration. Torque Loop's pitch is that
+  // externalized *verified* state lifts the agent's cognitive load — and that the lift is
+  // conditional: an unverified guardrail is a liability, not relief, because it hides load
+  // instead of removing it. If that precondition silently drops out of the README, the
+  // whole apparatus reads as ceremony and the proof/seam gates look like bureaucracy. So
+  // guard it like a stale version. Tolerant to wording; pins the two load-bearing halves.
+  const readme = read('README.md');
+  assert.ok(/cognitive load/i.test(readme), 'README names the cognitive-load payoff');
+  assert.ok(
+    /unverified guardrail/i.test(readme) && /liabilit/i.test(readme),
+    'README states an unverified guardrail is a liability, not relief'
+  );
+});
+
 ok('the /ratchet:map fog gate is wired into the prompt catalog', () => {
   // The generic loops above already force skills/map to carry frontmatter and be
   // listed in the README. PROMPTS.md sync is otherwise untested, so guard it here:
