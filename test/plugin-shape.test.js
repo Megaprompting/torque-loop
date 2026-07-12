@@ -327,4 +327,52 @@ ok('handoff checkpoints through compile done, never the scalar bypass', () => {
   assert.ok(!/state set (dirty|lastCompileAt)/.test(handoff), 'and not the removed scalar bypass');
 });
 
+
+ok('the skill graph is derived from source, not remembered (drift guard)', () => {
+  // reference/graph/torque-loop.cypher is a knowledge graph of the skills. The whole point
+  // of committing it is that it is DERIVED: scripts/graph-gen.js reads skills/*/SKILL.md +
+  // PROMPTS.md and emits it. A hand-edited or stale graph is the exact liability the README
+  // names — a guardrail you trust without re-checking. So byte-match the committed file
+  // against a fresh generation; drift fails CI like a stale version. Normalize CRLF only so a
+  // clone whose autocrlf touched the file still checks content, not line endings (convention 16).
+  const graphGen = require('../scripts/graph-gen');
+  assert.ok(exists(graphGen.OUT_REL), 'reference/graph/torque-loop.cypher exists');
+  const committed = read(graphGen.OUT_REL).replace(/\r\n/g, '\n');
+  const generated = graphGen.buildCypher();
+  assert.strictEqual(
+    committed,
+    generated,
+    'reference/graph/torque-loop.cypher is stale — run: node scripts/graph-gen.js'
+  );
+});
+
+ok('the skill graph covers every skill and rebuilds cleanly', () => {
+  // Two structural invariants a pure byte-match would let regress silently:
+  // (1) every skill folder appears as a node — a skill added without regenerating is caught;
+  // (2) the delete-and-rebuild preamble survives — without it the reload is only additive and
+  //     a shrunk/reordered graph leaves stale STEP edges (the idempotency hole this closed).
+  const cypher = require('../scripts/graph-gen').buildCypher();
+  for (const name of skillDirs) {
+    assert.ok(
+      cypher.includes(`RatchetSkill {ns: 'torque-loop', name: '${name}'}`),
+      `skill "${name}" is a node in the graph`
+    );
+  }
+  assert.ok(
+    /MATCH \(n \{ns: 'torque-loop'\}\) DETACH DELETE n;/.test(cypher),
+    'the graph load starts with a namespace-scoped delete-and-rebuild'
+  );
+});
+
+ok('the graph README parks the aperture cross-links instead of smuggling them in', () => {
+  // The honest-scope boundary is load-bearing: the derived graph deliberately omits the
+  // aperture cross-links (a separate repo, never adversarially attacked) and documents that
+  // as a parked decision with an owner. If that note silently vanishes, the next author may
+  // re-add unverified edges as if they were canon. Guard the boundary like the README thesis.
+  assert.ok(exists('reference/graph/README.md'), 'reference/graph/README.md exists');
+  const doc = read('reference/graph/README.md');
+  assert.ok(/PARKED/.test(doc), 'README marks the aperture cross-links as PARKED');
+  assert.ok(/aperture/i.test(doc), 'README names the aperture bridge as the parked scope');
+});
+
 process.stdout.write(`\n${passed} passed\n`);

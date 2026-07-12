@@ -28,6 +28,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   load-bearing, so its removal fails CI like a stale version) — docs + drift guard, no
   runtime change.
 
+- **Skill graph, derived not remembered.** The first knowledge-graph pass at this plugin's
+  skills was hand-authored — a one-night snapshot with nothing tying it back to source, the
+  exact liability the README names (a guardrail you trust without re-checking). Replaced with
+  a generator (`scripts/graph-gen.js`, zero-dep, does not ship): it reads `skills/*/SKILL.md`
+  frontmatter + `reference/PROMPTS.md` and emits deterministic Cypher to
+  `reference/graph/torque-loop.cypher` (21 skill nodes, the canonical phase sequence,
+  skill→prompt IMPLEMENTS edges). The load script opens with a namespace-scoped
+  `DETACH DELETE` — a **delete-and-rebuild**, so a shrunk or reordered graph can never leave a
+  stale node or STEP edge behind (the earlier MERGE-only reload was additive-idempotent only).
+  `plugin-shape` byte-matches the committed file against a fresh generation, so a drifted graph
+  fails CI like a stale version — CI-enforced (drift guard in the test suite), proven red
+  against a mutated skill description before landing. The aperture mechanism cross-links from
+  the first pass are **deliberately parked, not shipped**: their far endpoint is a separate
+  repo and the pairings were never adversarially attacked — documented with an owner and route
+  in `reference/graph/README.md` (convention 15), not smuggled in as if derived.
+
 ## [0.8.0] - 2026-07-29 — Closure Gate
 
 0.7 gated the fog. It left the loop able to *stop* but not to *finish*: `compile done`
