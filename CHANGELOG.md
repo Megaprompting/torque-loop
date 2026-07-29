@@ -209,7 +209,10 @@ A second review pass closed four residuals in the fixes themselves:
   **Stated limit:** a pre-0.8 store created under an on-disk casing the directory no
   longer has is unrecoverable. The filesystem no longer holds the evidence of how it used
   to be spelled, and the both-exist refusal can only compare candidates it can still
-  compute. Such a store is orphaned, not lost — it remains on disk under its old slug.
+  compute. The same applies to UNC paths: the root canonicalization uppercases the server
+  and share names, which `readdir` cannot report the casing of either, so a mixed-case
+  pre-0.8 UNC store can be orphaned the same way. Such a store is orphaned, not lost — it
+  remains on disk under its old slug.
 - **`source` is refused if mentioned at all** on a bound event. Refusing only a *different*
   value let the forgery that matters — the right-looking `source:"evolve"` — through.
 - **A present `holes` value is a real hole, whatever its shape.** Canonicalization made

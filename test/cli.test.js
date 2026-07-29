@@ -1245,6 +1245,56 @@ ok('a scalar holes value is a real hole, and repairing it is a real revision', (
   assert.strictEqual(fs.readFileSync(state.statePath(cwd), 'utf8'), before, 'byte-identical after the repair');
 });
 
+ok('artifacts and lifecycle agree on what counts as a hole, shape for shape', () => {
+  // The split-brain: lifecycle counted a falsey-but-present holes value as one
+  // hole while the artifacts-side canonicalization erased it to []. Same record,
+  // two answers — so a new artifact lost its declared hole at BIRTH and the
+  // blocker lifecycle would have raised never had anything to raise it about.
+  // One table, both surfaces, no room for them to drift apart again.
+  const TABLE = [
+    { label: 'absent', payload: {}, holes: [] },
+    { label: 'empty array', payload: { holes: [] }, holes: [] },
+    { label: 'empty string', payload: { holes: '' }, holes: [''] },
+    { label: 'null', payload: { holes: null }, holes: ['null'] },
+    { label: 'zero', payload: { holes: 0 }, holes: ['0'] },
+    { label: 'false', payload: { holes: false }, holes: ['false'] },
+    { label: 'scalar', payload: { holes: 'TODO' }, holes: ['TODO'] },
+    { label: 'flat array', payload: { holes: ['a', 'b'] }, holes: ['a', 'b'] },
+  ];
+  for (const row of TABLE) {
+    state.initProject(cwd, { force: true });
+    const born = artifacts.addArtifact(cwd, { id: 'art-h', kind: 'spec', title: 't', ...row.payload });
+    assert.deepStrictEqual(born.holes, row.holes, `birth persists ${row.label} as ${JSON.stringify(row.holes)}`);
+    const stored = state.loadState(cwd).artifacts[0];
+    assert.deepStrictEqual(stored.holes, row.holes, `${row.label} survives the round trip to disk`);
+    const blocked = lifecycle.closureBlockers(state.loadState(cwd), [], stored, cwd).some((b) => b.code === 'holes');
+    assert.strictEqual(
+      blocked, row.holes.length > 0,
+      `${row.label}: the closure gate and the store must agree on whether it blocks`
+    );
+  }
+});
+
+ok('touching a legacy falsey-shaped record does not silently clear its hole', () => {
+  // The repair path erased it too: an edit that never mentions holes would
+  // canonicalize the stored falsey value to [] and the artifact would become
+  // closable, having lost a blocker nobody chose to waive.
+  for (const shape of ['', null, 0, false]) {
+    state.initProject(cwd, { force: true });
+    const s = state.loadState(cwd);
+    s.artifacts = [{ id: 'art-legacy-hole', at: '2026-07-01T00:00:00.000Z', kind: 'spec', title: 'x', status: 'v1', holes: shape, rev: 1 }];
+    state.saveState(cwd, s);
+
+    const touched = artifacts.addArtifact(cwd, { id: 'art-legacy-hole', title: 'x, retitled' });
+    assert.strictEqual(touched.holes.length, 1, `holes:${JSON.stringify(shape)} survives an unrelated edit`);
+    assert.strictEqual(typeof touched.holes[0], 'string', 'and is repaired into the canonical string shape');
+    const blocked = lifecycle
+      .closureBlockers(state.loadState(cwd), [], state.loadState(cwd).artifacts[0], cwd)
+      .some((b) => b.code === 'holes');
+    assert.ok(blocked, `holes:${JSON.stringify(shape)} still blocks the close after the touch`);
+  }
+});
+
 ok('clearing a lineage link is a revision; only an ABSENT one is idempotent', () => {
   state.initProject(cwd, { force: true });
   artifacts.addArtifact(cwd, { id: 'art-lineage', kind: 'spec', title: 'v2', revises: 'art-old' });

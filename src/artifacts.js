@@ -13,10 +13,9 @@ const lifecycle = require('./lifecycle');
 // its identity (id, kind) or the record of a gated transition.
 const ARTIFACT_MUTABLE = ['title', 'path', 'status', 'holes', 'revises'];
 
-function normalizeHoles(h) {
-  if (Array.isArray(h)) return h.map((x) => String(x));
-  return h ? [String(h)] : [];
-}
+// Presence, not truthiness — the shared rule lives in schemas so the writer and
+// the closure gate cannot drift into two answers about the same record.
+const normalizeHoles = schemas.normalizeHoles;
 
 // A probe's drain is an invariant, not a convention: build-for-learn code must
 // cost confidence until disposed or promoted, even when the caller omits it.
@@ -42,12 +41,15 @@ function canonicalFields(kind, item, fallback) {
     if (base[key] != null) return String(base[key]);
     return dflt;
   };
-  const holesSource = item.holes !== undefined ? item.holes : base.holes;
+  // Whichever object actually CARRIES the key owns the answer — a partial update
+  // that never mentions holes must inherit the stored ones, including a falsey
+  // one, rather than canonicalizing them away.
+  const holesOwner = Object.prototype.hasOwnProperty.call(item, 'holes') ? item : base;
   const out = {
     title: pick('title', 'untitled') || 'untitled',
     path: pick('path', ''),
     status: pick('status', 'v0') || 'v0',
-    holes: withProbeHole(kind, normalizeHoles(holesSource)),
+    holes: withProbeHole(kind, normalizeHoles(holesOwner)),
   };
   // `revises` is always present in the canonical shape, possibly '' — absent and
   // explicitly-empty are different intents: omitting it leaves the lineage

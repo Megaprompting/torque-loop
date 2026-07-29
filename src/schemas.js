@@ -89,6 +89,22 @@ const LEDGER_COLLECTIONS = {
 
 const SEVERITIES = ['critical', 'high', 'medium', 'low', 'info'];
 
+// The ONE rule for what an artifact's holes are. It takes the owning record, not
+// the value, because ABSENCE is the only thing that means zero — and absence is
+// a fact about the object, not about the value's truthiness. `holes: ""`,
+// `null`, `0` and `false` are values somebody wrote, and a value somebody wrote
+// is at least one unexplained hole.
+//
+// It lives here, used by BOTH the artifacts writer and the closure gate, because
+// two copies of this rule is exactly how they came to disagree: the gate counted
+// a falsey hole while the writer erased it, so an artifact could lose a blocker
+// at birth that the gate would have raised had it survived to disk.
+function normalizeHoles(owner) {
+  if (!owner || !Object.prototype.hasOwnProperty.call(owner, 'holes')) return [];
+  const raw = owner.holes;
+  return Array.isArray(raw) ? raw.map((x) => String(x)) : [String(raw)];
+}
+
 // The fog loop's text prefix. One constant, two ends of the lifecycle: the CLI
 // opens a loop with this prefix when `score aperture` raises mapRequired, and
 // artifacts.addArtifact closes loops with this prefix when the unknown-map
@@ -134,6 +150,7 @@ module.exports = {
   STATE_SCALARS,
   LEDGER_COLLECTIONS,
   SEVERITIES,
+  normalizeHoles,
   FOG_LOOP_PREFIX,
   PHASES,
   DEFECT_STATUSES,

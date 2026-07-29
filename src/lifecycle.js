@@ -3,6 +3,7 @@
 const fs = require('fs');
 const path = require('path');
 
+const schemas = require('./schemas');
 const scoring = require('./scoring');
 const { sha256 } = require('./evolve/snapshot');
 
@@ -188,17 +189,10 @@ function closureBlockers(state, events, artifact, cwd, request = {}) {
     });
   }
 
-  // Defensive normalization. A legacy record can carry holes in any shape, and
-  // `Array.isArray(...) ? ... : []` reads every one of them as ZERO holes —
-  // closing an artifact over an open hole nobody can see. ABSENCE is the only
-  // thing that means none: `hasOwnProperty`, not falsiness, because `holes: ""`
-  // and `holes: null` are values somebody wrote, and a value somebody wrote is
-  // at least one unexplained hole.
-  const holes = !Object.prototype.hasOwnProperty.call(artifact, 'holes')
-    ? []
-    : Array.isArray(artifact.holes)
-      ? artifact.holes
-      : [String(artifact.holes)];
+  // The same rule the writer uses, from the same place — a legacy record can
+  // carry holes in any shape, and a second copy of this logic is how the gate
+  // and the store came to disagree about whether a falsey hole exists.
+  const holes = schemas.normalizeHoles(artifact);
   const waived = Boolean(request.waiveHoles && String(request.owner || '').trim() && String(request.reason || '').trim());
   if (holes.length && !waived) {
     out.push({
