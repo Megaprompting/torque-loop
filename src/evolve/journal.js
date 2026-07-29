@@ -221,19 +221,25 @@ function appendEvent(cwd, fields, opts = {}) {
   const state = require('../state');
   const file = logPath(cwd);
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  // Make sure the store exists BEFORE taking either lock. Validation reads state,
-  // a first read CREATES it, and creating it takes the workspace lock — doing
-  // that from inside the journal lock would invert the declared order.
-  state.loadState(cwd);
   // A BOUND event's validation binds evidence to an artifact's exact revision and
   // hash, and the writers that can MOVE that revision take the workspace lock,
   // not the journal's. Holding only the journal lock excluded the wrong
   // processes: the artifact could go rev 1 → rev 2 between validation and append
   // without touching the journal at all. So a bound append holds both, in the
-  // declared order. An unbound event binds to nothing and needs only the journal.
+  // declared order — and the state read that materializes the store happens
+  // INSIDE the workspace lock, where it simply joins the open scope.
+  //
+  // An UNBOUND event binds to nothing in state and reads nothing from it, so it
+  // takes the journal lock alone. It used to call loadState unconditionally, which
+  // on a fresh store IS the locked init transition — so an unbound append queued
+  // behind (and on a busy store, died on) a lock it never needed.
   const bound = String(f.artifactId || '').trim();
   const run = () => appendLocked(cwd, f, opts, file, bound);
-  return bound ? state.withWorkspaceLock(cwd, 'evolve append (bound)', run) : run();
+  if (!bound) return run();
+  return state.withWorkspaceLock(cwd, 'evolve append (bound)', () => {
+    state.loadState(cwd); // materialize the store under the lock we already hold
+    return run();
+  });
 }
 
 function appendLocked(cwd, f, opts, file, bound) {
