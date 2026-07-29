@@ -61,6 +61,9 @@ const KIND_MODE = {
   'qa-ledger': 'workflow',
 };
 
+// Every bound event is written by this CLI path; the field records that fact.
+const BOUND_SOURCE = 'evolve';
+
 // Compute the binding the CLI will stamp, refusing everything a caller could
 // use to launder an unproven KEEP into the log. This stops IN-BAND laundering
 // by the model — it is not tamper-proofing: the journal is plaintext on a
@@ -117,8 +120,37 @@ function resolveBinding(cwd, fields, opts) {
   if (verifiedHash !== fp.hash) {
     throw new Error('file changed after verification — re-verify.');
   }
+  // The hash alone cannot see a metadata-only revision: retitle an artifact and
+  // the FILE is untouched, so rev-1 evidence would be stamped onto rev 2. The
+  // revision the harness actually ran against has to be carried and matched.
+  const verifiedRev = opts ? opts.verifiedRev : undefined;
+  if (!Number.isInteger(verifiedRev)) {
+    throw new Error(
+      'a bound event requires the verifiedRev from `ratchet-evolve verify <target> --artifact <id>` — ' +
+        'proof must name the exact revision it was gathered against'
+    );
+  }
+  if (verifiedRev !== fp.rev) {
+    throw new Error(
+      `artifact revised after verification — evidence is from rev ${verifiedRev}, the artifact is at rev ${fp.rev}. Re-verify.`
+    );
+  }
 
-  return { artifactId: id, artifactRev: fp.rev, artifactHash: fp.hash, hashScope: fp.hashScope, mode: derived };
+  // Provenance is stamped, not claimed: a caller-chosen `source` would let a
+  // hand-written line present itself as harness output.
+  const claimedSource = fields.source ? String(fields.source) : '';
+  if (claimedSource && claimedSource !== BOUND_SOURCE) {
+    throw new Error(`source "${claimedSource}" is stamped by the CLI on a bound event, not supplied — omit "source".`);
+  }
+
+  return {
+    artifactId: id,
+    artifactRev: fp.rev,
+    artifactHash: fp.hash,
+    hashScope: fp.hashScope,
+    mode: derived,
+    source: BOUND_SOURCE,
+  };
 }
 
 function appendEvent(cwd, fields, opts = {}) {

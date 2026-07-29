@@ -55,12 +55,16 @@ it was gathered against:
 ratchet-evolve verify <target> --artifact <id> --test "<the command>" --json
 ```
 
-That prints `verifiedHash` and `verifiedRev`. Carry `verifiedHash` into the log append —
-`log append` recomputes the hash and refuses if the file moved after the harness ran:
+That prints `verifiedHash` and `verifiedRev`. Carry **both** into the log append — it
+recomputes them and refuses if the file moved (`file changed after verification`) or if
+the artifact was revised after the harness ran (`artifact revised after verification`).
+The hash alone cannot catch a metadata-only revision: retitle an artifact and the file
+is untouched while the revision moves, so rev-1 evidence would be stamped onto rev 2.
 
 ```
 ratchet-evolve log append '{"target":"<target>","artifactId":"<id>","verdict":"KEEP",
-  "verification":{...from verify --json...},"verifiedHash":"<from verify>",
+  "verification":{...from verify --json...},
+  "verifiedHash":"<from verify>","verifiedRev":<from verify>,
   "seam":{"seamMatch":"exact","independentFromBuilderMethod":true,...}}'
 ```
 

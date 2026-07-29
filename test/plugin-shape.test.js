@@ -267,7 +267,13 @@ ok('attack and verify name the artifact they are about', () => {
 ok('verify binds its run and closes on green', () => {
   const verify = read('skills/verify/SKILL.md');
   assert.ok(/ratchet-evolve verify [^\r\n]*--artifact/.test(verify), 'verify runs bound to an artifact');
-  assert.ok(/verifiedHash/.test(verify), 'and carries the verifiedHash into log append');
+  // Not "the words appear somewhere": the log append EXAMPLE must carry both
+  // fields, because a caller copies that block. The hash alone cannot see a
+  // metadata-only revision, so the rev has to travel with it.
+  const append = /ratchet-evolve log append[\s\S]*?```/.exec(verify);
+  assert.ok(append, 'verify shows a log append example');
+  assert.ok(/verifiedHash/.test(append[0]), 'the log append example carries verifiedHash');
+  assert.ok(/verifiedRev/.test(append[0]), 'the log append example carries verifiedRev');
   assert.ok(/ratchet artifact close/.test(verify), 'a green bound run ends by closing the artifact');
 });
 

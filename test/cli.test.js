@@ -1248,7 +1248,7 @@ function keepFields(art, over) {
 
 ok('a bound append stamps the identity itself and refuses a caller-supplied one', () => {
   const { proj, art, fp } = boundFixture('bind-stamp');
-  const e = journal.appendEvent(proj, keepFields(art), { verifiedHash: fp.hash });
+  const e = journal.appendEvent(proj, keepFields(art), { verifiedHash: fp.hash, verifiedRev: fp.rev });
   assert.strictEqual(e.artifactId, art.id);
   assert.strictEqual(e.artifactRev, fp.rev, 'the CLI computed the rev');
   assert.strictEqual(e.artifactHash, fp.hash, 'the CLI computed the hash');
@@ -1257,13 +1257,13 @@ ok('a bound append stamps the identity itself and refuses a caller-supplied one'
 
   for (const forged of [{ artifactRev: 99 }, { artifactHash: 'deadbeef' }]) {
     assert.throws(
-      () => journal.appendEvent(proj, keepFields(art, forged), { verifiedHash: fp.hash }),
+      () => journal.appendEvent(proj, keepFields(art, forged), { verifiedHash: fp.hash, verifiedRev: fp.rev }),
       /computed by the CLI, not supplied/
     );
   }
   // and a bound event cannot carry a hand-picked id
   assert.throws(
-    () => journal.appendEvent(proj, keepFields(art, { id: 'evo_hand_written' }), { verifiedHash: fp.hash }),
+    () => journal.appendEvent(proj, keepFields(art, { id: 'evo_hand_written' }), { verifiedHash: fp.hash, verifiedRev: fp.rev }),
     /machine/i
   );
 });
@@ -1272,15 +1272,15 @@ ok('a code artifact cannot be bound through mode:"docs" to dodge the seam gate',
   const { proj, art, fp } = boundFixture('bind-mode');
   // docs mode skips the seam gate entirely — so the mode must be derived, not claimed.
   assert.throws(
-    () => journal.appendEvent(proj, keepFields(art, { mode: 'docs', seam: {} }), { verifiedHash: fp.hash }),
+    () => journal.appendEvent(proj, keepFields(art, { mode: 'docs', seam: {} }), { verifiedHash: fp.hash, verifiedRev: fp.rev }),
     /mode/i
   );
   // derived from the bound artifact, the seam gate bites
   assert.throws(
-    () => journal.appendEvent(proj, keepFields(art, { seam: {} }), { verifiedHash: fp.hash }),
+    () => journal.appendEvent(proj, keepFields(art, { seam: {} }), { verifiedHash: fp.hash, verifiedRev: fp.rev }),
     /seam/i
   );
-  const e = journal.appendEvent(proj, keepFields(art), { verifiedHash: fp.hash });
+  const e = journal.appendEvent(proj, keepFields(art), { verifiedHash: fp.hash, verifiedRev: fp.rev });
   assert.strictEqual(e.mode, 'code', 'mode is derived from the artifact it binds to');
 });
 
@@ -1289,22 +1289,57 @@ ok('binding refuses a stale verification — edit the file, the proof is void', 
   assert.throws(() => journal.appendEvent(proj, keepFields(art)), /verifiedHash/);
   fs.writeFileSync(file, 'edited after the harness ran', 'utf8');
   assert.throws(
-    () => journal.appendEvent(proj, keepFields(art), { verifiedHash: fp.hash }),
+    () => journal.appendEvent(proj, keepFields(art), { verifiedHash: fp.hash, verifiedRev: fp.rev }),
     /file changed after verification/
   );
   // re-verify and it lands
   const fresh = lifecycle.fingerprint(proj, art);
-  assert.ok(journal.appendEvent(proj, keepFields(art), { verifiedHash: fresh.hash }));
+  assert.ok(journal.appendEvent(proj, keepFields(art), { verifiedHash: fresh.hash, verifiedRev: fresh.rev }));
+});
+
+ok('binding refuses evidence gathered against an older revision', () => {
+  // The metadata-only revision: the FILE never changes, so verifiedHash still
+  // matches — but the artifact moved to rev 2 and the rev-1 evidence would be
+  // stamped onto it. The hash alone cannot see this; the rev has to be checked.
+  const { proj, art, fp } = boundFixture('bind-stale-rev');
+  artifacts.addArtifact(proj, { id: art.id, title: 'thing, retitled' });
+  const revised = state.loadState(proj).artifacts.find((a) => a.id === art.id);
+  assert.strictEqual(revised.rev, 2, 'a metadata-only revision still bumps rev');
+  assert.strictEqual(lifecycle.fingerprint(proj, revised).hash, fp.hash, 'and the file hash is unchanged');
+
+  assert.throws(
+    () => journal.appendEvent(proj, keepFields(revised), { verifiedHash: fp.hash, verifiedRev: 1 }),
+    /rev|re-verify/i
+  );
+  // a bound append must state the rev it verified at all
+  assert.throws(
+    () => journal.appendEvent(proj, keepFields(revised), { verifiedHash: fp.hash }),
+    /verifiedRev/
+  );
+  // re-verify against the current revision and it lands
+  const fresh = lifecycle.fingerprint(proj, revised);
+  const e = journal.appendEvent(proj, keepFields(revised), { verifiedHash: fresh.hash, verifiedRev: fresh.rev });
+  assert.strictEqual(e.artifactRev, 2);
+});
+
+ok('a bound event cannot claim its own provenance', () => {
+  const { proj, art, fp } = boundFixture('bind-source');
+  assert.throws(
+    () => journal.appendEvent(proj, keepFields(art, { source: 'forged' }), { verifiedHash: fp.hash, verifiedRev: fp.rev }),
+    /source/i
+  );
+  const e = journal.appendEvent(proj, keepFields(art), { verifiedHash: fp.hash, verifiedRev: fp.rev });
+  assert.strictEqual(e.source, 'evolve', 'the CLI stamps provenance on a bound event');
 });
 
 ok('binding refuses a missing or terminal artifact', () => {
   const { proj, art, fp } = boundFixture('bind-terminal');
   assert.throws(
-    () => journal.appendEvent(proj, keepFields({ id: 'art-nope' }), { verifiedHash: fp.hash }),
+    () => journal.appendEvent(proj, keepFields({ id: 'art-nope' }), { verifiedHash: fp.hash, verifiedRev: fp.rev }),
     /no artifact/
   );
   artifacts.retractArtifact(proj, art.id, { reason: 'obsolete' });
-  assert.throws(() => journal.appendEvent(proj, keepFields(art), { verifiedHash: fp.hash }), /retracted|left the lifecycle/);
+  assert.throws(() => journal.appendEvent(proj, keepFields(art), { verifiedHash: fp.hash, verifiedRev: fp.rev }), /retracted|left the lifecycle/);
 });
 
 ok('a v0.7 event stays valid and permanently unbound', () => {
@@ -1393,7 +1428,7 @@ ok('artifact close is earned by bound proof, then idempotent', () => {
     // no proof yet
     assert.throws(() => cli.run(['node', 'ratchet', 'artifact', 'close', art.id]), /no KEEP proof bound/);
     const v = evolveVerify.verify({ target: 'src/thing.js', testCommand: 'node -e 0', mode: 'code', cwd: proj, artifact: art });
-    journal.appendEvent(proj, keepFields(art), { verifiedHash: v.verifiedHash });
+    journal.appendEvent(proj, keepFields(art), { verifiedHash: v.verifiedHash, verifiedRev: v.verifiedRev });
 
     const first = say(() => cli.run(['node', 'ratchet', 'artifact', 'close', art.id]));
     assert.ok(/closed — rev 1/.test(first), first);
@@ -1418,7 +1453,7 @@ ok('revising an artifact invalidates the proof bound to its old revision', () =>
   const { proj, art } = boundFixture('close-revised', { kind: 'code', file: 'src/thing.js' });
   inProject(proj, () => {
     const v = evolveVerify.verify({ target: 'src/thing.js', testCommand: 'node -e 0', mode: 'code', cwd: proj, artifact: art });
-    journal.appendEvent(proj, keepFields(art), { verifiedHash: v.verifiedHash });
+    journal.appendEvent(proj, keepFields(art), { verifiedHash: v.verifiedHash, verifiedRev: v.verifiedRev });
     // rev 1 is closable...
     assert.deepStrictEqual(
       lifecycle.closureBlockers(state.loadState(proj), journal.readEvents(proj),
@@ -1443,7 +1478,7 @@ ok('a record-scope close must be authorized by name', () => {
     journal.appendEvent(proj, {
       target: 'CHANGELOG.md', artifactId: art.id, verdict: 'KEEP',
       verification: { manualChecks: ['read end to end against the diff'], result: 'manual' },
-    }, { verifiedHash: fp.hash });
+    }, { verifiedHash: fp.hash, verifiedRev: fp.rev });
     assert.throws(() => cli.run(['node', 'ratchet', 'artifact', 'close', art.id]), /record-scope/);
     cli.run(['node', 'ratchet', 'artifact', 'close', art.id, '--owner', 'danny', '--reason', 'no file ships; the record is the artifact']);
     assert.strictEqual(state.loadState(proj).artifacts.find((a) => a.id === art.id).status, 'closed');
@@ -1456,7 +1491,7 @@ ok('holes block a close until they are filled or waived by a named owner', () =>
     artifacts.addArtifact(proj, { id: art.id, holes: ['no rollback path'] });
     const live = state.loadState(proj).artifacts.find((a) => a.id === art.id);
     const v = evolveVerify.verify({ target: 'src/thing.js', testCommand: 'node -e 0', mode: 'code', cwd: proj, artifact: live });
-    journal.appendEvent(proj, keepFields(live), { verifiedHash: v.verifiedHash });
+    journal.appendEvent(proj, keepFields(live), { verifiedHash: v.verifiedHash, verifiedRev: v.verifiedRev });
     assert.throws(() => cli.run(['node', 'ratchet', 'artifact', 'close', art.id]), /open hole/);
     assert.throws(() => cli.run(['node', 'ratchet', 'artifact', 'close', art.id, '--waive-holes']), /open hole/);
     cli.run(['node', 'ratchet', 'artifact', 'close', art.id, '--waive-holes', '--owner', 'danny', '--reason', 'rollback lands next release']);
@@ -1553,7 +1588,7 @@ ok('end to end: build → bound verify → close → compile actually reaches CL
       target: 'src/shipped.js', artifactId: art.id, verdict: 'KEEP',
       chosenMutation: 'ship it', verification: v,
       seam: { evidenceType: 'test', testedSeam: 'node -e 0', shipSeam: 'node -e 0', seamMatch: 'exact', independentFromBuilderMethod: true },
-    }, { verifiedHash: v.verifiedHash });
+    }, { verifiedHash: v.verifiedHash, verifiedRev: v.verifiedRev });
 
     // the loop now names close, not compile
     assert.strictEqual(
@@ -1688,7 +1723,7 @@ ok('receipt PROOF uses the ACTIVE artifact\'s bound event, and labels legacy evi
 
     // now bind proof to the artifact itself
     const v = evolveVerify.verify({ target: 'src/thing.js', testCommand: 'node -e 0', mode: 'code', cwd: proj, artifact: art });
-    journal.appendEvent(proj, keepFields(art, { chosenMutation: 'bound' }), { verifiedHash: v.verifiedHash });
+    journal.appendEvent(proj, keepFields(art, { chosenMutation: 'bound' }), { verifiedHash: v.verifiedHash, verifiedRev: v.verifiedRev });
     r = receipt.assemble(proj);
     assert.strictEqual(r.proof.keep.binding, 'bound');
     assert.strictEqual(r.proof.keep.mutation, 'bound', 'the bound event wins over the last global KEEP');
