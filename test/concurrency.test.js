@@ -1223,6 +1223,49 @@ ok('C4 a tokenless judgment still verifies what the break moved', () => {
   fs.rmSync(`${lockDir}.decoy`, { recursive: true, force: true });
 });
 
+// --- M11 residual: validation needs the lock the WRITERS take ----------------
+
+ok('M11 a bound append holds the workspace lock while it validates', () => {
+  const proj = freshProject('m11-ws');
+  withOwnJournal(proj, () => {
+    fs.mkdirSync(path.join(proj, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(proj, 'src', 'b.js'), 'module.exports = 2;\n', 'utf8');
+    const art = artifacts.addArtifact(proj, { title: 'm11ws', kind: 'code', path: 'src/b.js' });
+    const fp = lifecycle.fingerprint(proj, art);
+
+    // The journal lock alone does not exclude the writers that can invalidate a
+    // binding: a workspace mutation can revise the artifact from rev 1 to rev 2
+    // between validation and append without ever touching the journal lock. A
+    // bound append has to hold the lock those writers take.
+    const realFingerprint = lifecycle.fingerprint;
+    const seen = [];
+    lifecycle.fingerprint = function (cwd, artifact) {
+      seen.push(fs.existsSync(workspaceLockDir(proj)));
+      return realFingerprint.call(lifecycle, cwd, artifact);
+    };
+    try {
+      journal.appendEvent(
+        proj,
+        {
+          target: 'src/b.js',
+          artifactId: art.id,
+          verdict: 'KEEP',
+          verification: { commands: [{ command: 'node -e 0', pass: true }], result: 'pass' },
+          seam: { evidenceType: 'test', testedSeam: 'x', shipSeam: 'x', seamMatch: 'exact', independentFromBuilderMethod: true },
+        },
+        { verifiedHash: fp.hash, verifiedRev: fp.rev }
+      );
+    } finally {
+      lifecycle.fingerprint = realFingerprint;
+    }
+    assert.ok(seen.length, 'the append must validate the binding');
+    assert.ok(
+      seen.every((locked) => locked),
+      `every validation of a bound event must hold the workspace lock — ${seen.filter((l) => !l).length} of ${seen.length} did not`
+    );
+  });
+});
+
 // --- M12 residual: the ledger is canonical too -------------------------------
 
 ok('M12 saveLedger takes the workspace lock like every other write', () => {
@@ -1406,6 +1449,39 @@ ok('N3 a creation that dies mid-write never leaves a malformed record', () => {
   }
   // And the store must still be openable afterwards, without a repair loop.
   assert.strictEqual(state.loadState(proj).rev, 0, 'the next read opens a clean store');
+});
+
+// --- N4: one file, one lock, whatever you call it ----------------------------
+
+ok('N4 a symlink alias of the journal shares the journal lock', () => {
+  const proj = freshProject('n4');
+  const real = path.join(proj, 'real-log.jsonl');
+  const alias = path.join(proj, 'alias-log.jsonl');
+  fs.writeFileSync(real, '', 'utf8');
+  let linked = true;
+  try {
+    fs.symlinkSync(real, alias, 'file');
+  } catch (_e) {
+    linked = false;
+  }
+  // A platform without symlink permission cannot host this falsifier; say so
+  // rather than passing quietly.
+  assert.ok(linked, 'this platform must allow file symlinks for this falsifier to mean anything');
+
+  // The lock key resolved the parent directory but kept the final component as
+  // spelled, so two names for one file were two locks — and two processes
+  // appended to one log with no exclusion between them.
+  const res = state.withFileLock(real, 'holding the real path', () =>
+    childRun(
+      proj,
+      `  const journal = require(path.join(SRC, 'evolve', 'journal.js'));
+  journal.appendEvent(process.cwd(), { target: 'alias', verdict: 'ASK' });
+  out.extra = 'appended through the alias';`,
+      { RATCHET_EVOLVE_LOG: alias, RATCHET_LOCK_TIMEOUT_MS: '600', RATCHET_LOCK_STALE_MS: '600000' }
+    )
+  );
+  assert.notStrictEqual(res.extra, 'appended through the alias', `the alias must not bypass the lock — child: ${JSON.stringify(res)}`);
+  assert.ok(/could not acquire/i.test(String(res.error)), `and must be refused by the lock; child said: ${res.error}`);
 });
 
 // --- N6/N10: a nonsense clock is not a shield; a refusal hands over the fix --

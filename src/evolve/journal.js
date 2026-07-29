@@ -16,15 +16,15 @@ function logPath(cwd = process.cwd()) {
   return path.join(cwd, '.ratchet', 'evolve-log.jsonl');
 }
 
-// A malformed line is a LOST EVENT. Dropping it silently means the trail is
-// short by one and every count derived from it is wrong with no sign that it is.
-// Warned once per read (not once per line) so a damaged log is impossible to
-// miss and impossible to drown in.
-let _warnedMalformed = '';
-
-function readEvents(cwd = process.cwd()) {
+// A malformed line is a LOST EVENT. Dropping it silently means the trail is short
+// by one and every count derived from it is wrong with no sign that it is — and a
+// dropped REVERT reads as "no REVERT", which is how a damaged log CERTIFIES a
+// closure instead of blocking it. So the damage is part of the RESULT, not just a
+// stderr side effect: each caller decides what it means for the question it is
+// asking, and the gate that certifies closure decides it means "refuse".
+function readEventsWithHealth(cwd = process.cwd()) {
   const file = logPath(cwd);
-  if (!fs.existsSync(file)) return [];
+  if (!fs.existsSync(file)) return { events: [], malformed: 0, file };
   const events = [];
   let malformed = 0;
   for (const raw of fs.readFileSync(file, 'utf8').split('\n')) {
@@ -36,14 +36,25 @@ function readEvents(cwd = process.cwd()) {
       malformed++;
     }
   }
-  if (malformed && _warnedMalformed !== `${file}:${malformed}`) {
-    _warnedMalformed = `${file}:${malformed}`;
+  return { events, malformed, file };
+}
+
+// The warning is per (file, count) and is best-effort NOISE CONTROL only. It is
+// deliberately not the mechanism any decision rests on: a process-global dedup
+// means an earlier read can silence a later one, so a gate that depended on
+// seeing this line would fail open exactly when it mattered most.
+let _warnedMalformed = '';
+
+function readEvents(cwd = process.cwd()) {
+  const read = readEventsWithHealth(cwd);
+  if (read.malformed && _warnedMalformed !== `${read.file}:${read.malformed}`) {
+    _warnedMalformed = `${read.file}:${read.malformed}`;
     process.stderr.write(
-      `[ratchet] ${malformed} unreadable line(s) in ${file} — those events are NOT counted in any verdict, ` +
+      `[ratchet] ${read.malformed} unreadable line(s) in ${read.file} — those events are NOT counted in any verdict, ` +
         'proof, or closure check. Repair or archive the log before trusting a count from it.\n'
     );
   }
-  return events;
+  return read.events;
 }
 
 function dateStamp(iso) {
@@ -207,19 +218,31 @@ function quarantinePartialLine(file) {
 
 function appendEvent(cwd, fields, opts = {}) {
   const f = fields || {};
+  const state = require('../state');
   const file = logPath(cwd);
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  // Make sure the store exists BEFORE taking the journal lock. Validation reads
-  // state, a first read CREATES it, and creating it takes the workspace lock —
-  // and the order is workspace → file, never the reverse. Doing it here keeps
-  // the whole validation below inside the lock without inverting the order.
-  require('../state').loadState(cwd);
+  // Make sure the store exists BEFORE taking either lock. Validation reads state,
+  // a first read CREATES it, and creating it takes the workspace lock — doing
+  // that from inside the journal lock would invert the declared order.
+  state.loadState(cwd);
+  // A BOUND event's validation binds evidence to an artifact's exact revision and
+  // hash, and the writers that can MOVE that revision take the workspace lock,
+  // not the journal's. Holding only the journal lock excluded the wrong
+  // processes: the artifact could go rev 1 → rev 2 between validation and append
+  // without touching the journal at all. So a bound append holds both, in the
+  // declared order. An unbound event binds to nothing and needs only the journal.
+  const bound = String(f.artifactId || '').trim();
+  const run = () => appendLocked(cwd, f, opts, file, bound);
+  return bound ? state.withWorkspaceLock(cwd, 'evolve append (bound)', run) : run();
+}
+
+function appendLocked(cwd, f, opts, file, bound) {
   return require('../state').withFileLock(file, 'evolve append', () => {
     // Validation happens UNDER the lock, not before it: the artifact can be
     // revised, closed, or re-bound between a pre-flight check and the append,
     // and evidence validated against a revision that is no longer current is
     // exactly the stale proof the binding exists to refuse.
-    const binding = String(f.artifactId || '').trim() ? resolveBinding(cwd, f, opts) : null;
+    const binding = bound ? resolveBinding(cwd, f, opts) : null;
     const event = newEvent(binding ? { ...f, ...binding } : f);
     // Proof gate: refuse to persist a KEEP without verification evidence. Throws
     // before any write, so the log never contains an unproven kept mutation.
@@ -261,4 +284,4 @@ function status(cwd = process.cwd()) {
   return { events: events.length, kept, reverted, revertedAndLearned, asks, targets, last };
 }
 
-module.exports = { logPath, readEvents, appendEvent, nextId, status };
+module.exports = { logPath, readEvents, readEventsWithHealth, appendEvent, nextId, status };
