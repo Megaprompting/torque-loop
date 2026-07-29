@@ -154,8 +154,9 @@ function run(argv) {
       if (flags.has('--force')) {
         assertMayWrite('init --force');
         const wipe = authorizeWipe(args, 'ratchet init --force');
-        // A wipe REPLACES the record rather than revising it, so it takes the
-        // lock but not the revision counter — the fresh state opens at rev 0.
+        // A wipe REPLACES the record, under the lock — and CONTINUES the revision
+        // counter, so a snapshot of the previous generation can never match the
+        // fresh one and overwrite it (initProject owns that rule).
         const forced = state.withWorkspaceLock(cwd, 'init --force', () =>
           state.initProject(cwd, { force: true, resetBy: wipe.owner, resetReason: wipe.reason })
         );
@@ -449,14 +450,15 @@ function cmdArtifactClose(cwd, argv) {
   if (!id) throw new Error('usage: ratchet artifact close <id> [--waive-holes --owner "<who>" --reason "<why>"]');
   // The blocker check and the certificate it authorizes run inside ONE
   // transaction: a defect landing between them would otherwise be closed over.
-  // The journal is read under ITS lock inside that transaction, because the
-  // proof this gate reads lives there — a REVERT appended between the read and
-  // the commit would otherwise be invisible and the artifact would close on a
-  // KEEP the record had already revoked. Lock order: workspace → journal.
+  // The journal lock is taken by the BOUNDARY so it spans the state commit too.
+  // Locking only the proof READ moved the window instead of closing it: a REVERT
+  // appended after the read but before the commit still landed on evidence this
+  // gate had stopped watching, and the artifact still closed on a revoked KEEP.
+  // Lock order: workspace → journal.
   return out(
-    mutate(cwd, 'artifact close', (s) =>
-      state.withFileLock(journal.logPath(cwd), 'artifact close (proof read)', () => closeArtifact(cwd, s, id, opts))
-    )
+    state.withWorkspaceMutation(cwd, { action: 'artifact close', alsoLockFile: journal.logPath(cwd) }, (s) =>
+      closeArtifact(cwd, s, id, opts)
+    ).result
   );
 }
 
@@ -481,12 +483,24 @@ function closeArtifact(cwd, s, id, opts) {
   const reason = strOpt(opts.reason);
   const waiveHoles = opts['waive-holes'] === true;
 
-  let events = [];
+  // FAIL CLOSED on a damaged proof record. A malformed line is a dropped event,
+  // and a dropped REVERT reads exactly like no REVERT — so a mangled log used to
+  // make this gate CERTIFY where it should refuse. Absence of evidence is not
+  // evidence of absence when the record itself is known to be short.
+  let read = { events: [], malformed: 0, file: journal.logPath(cwd) };
   try {
-    events = journal.readEvents(cwd);
+    read = journal.readEventsWithHealth(cwd);
   } catch (_e) {
-    events = [];
+    /* unreadable log → no events → the blockers below refuse for want of proof */
   }
+  if (read.malformed) {
+    throw new Error(
+      `cannot close artifact "${id}": proof record damaged — ${read.malformed} unreadable line(s) in ${read.file}. ` +
+        'A dropped event is indistinguishable from no event, so this closure cannot be certified. ' +
+        'Repair or archive the log, then re-run.'
+    );
+  }
+  const events = read.events;
   const blockers = lifecycle.closureBlockers(s, events, artifact, cwd, { waiveHoles, owner, reason });
   if (blockers.length) {
     throw new Error(

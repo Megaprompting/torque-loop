@@ -1181,6 +1181,61 @@ function closableArtifact(proj) {
   return art;
 }
 
+// --- C1 (attempt 2): the journal lock spans the state commit -----------------
+
+ok('C1 the journal stays locked until the closure commit has landed', () => {
+  const proj = freshProject('c1-commit');
+  withOwnJournal(proj, (log) => {
+    const art = closableArtifact(proj);
+
+    // Cycle 1 read the proof under the journal lock and then RELEASED it before
+    // the state commit. That moved the window, it did not close it: a REVERT
+    // appended between the release and the rename still lands on a journal the
+    // closure has already stopped looking at, and the artifact closes on a KEEP
+    // the record had revoked. So the probe fires at the canonical rename — the
+    // last instant the commit can still be stopped — and asks whether anyone
+    // else can touch the journal right then.
+    const realRename = fs.renameSync;
+    let probed = null;
+    fs.renameSync = function (from, to) {
+      if (probed === null && String(to) === state.statePath(proj)) {
+        probed = childRun(
+          proj,
+          `  const journal = require(path.join(SRC, 'evolve', 'journal.js'));
+  journal.appendEvent(process.cwd(), { target: 'sneak', verdict: 'REVERT', chosenMutation: 'revoke the proof mid-commit' });
+  out.extra = 'appended';`,
+          { RATCHET_EVOLVE_LOG: log, RATCHET_LOCK_TIMEOUT_MS: '900', RATCHET_LOCK_STALE_MS: '600000' }
+        );
+      }
+      return realRename.call(fs, from, to);
+    };
+    const prevCwd = process.cwd();
+    try {
+      process.chdir(proj);
+      cli.run(['node', 'ratchet', 'artifact', 'close', art.id]);
+    } finally {
+      process.chdir(prevCwd);
+      fs.renameSync = realRename;
+    }
+
+    assert.ok(probed, 'the probe must fire at the canonical rename — otherwise this proves nothing');
+    assert.notStrictEqual(
+      probed.extra,
+      'appended',
+      `no process may append to the journal while a closure is committing against it — the child appended: ${JSON.stringify(probed)}`
+    );
+    assert.ok(
+      /could not acquire/i.test(String(probed.error)),
+      `and the refusal must be the journal lock, not something else — child reported: ${probed.error}`
+    );
+    assert.strictEqual(
+      state.loadState(proj).artifacts.find((a) => a.id === art.id).status,
+      'closed',
+      'the legitimate close still completes'
+    );
+  });
+});
+
 // --- C4 residual: no card shape is exempt from verification ------------------
 
 ok('C4 a tokenless judgment still verifies what the break moved', () => {
@@ -1482,6 +1537,42 @@ ok('N4 a symlink alias of the journal shares the journal lock', () => {
   );
   assert.notStrictEqual(res.extra, 'appended through the alias', `the alias must not bypass the lock — child: ${JSON.stringify(res)}`);
   assert.ok(/could not acquire/i.test(String(res.error)), `and must be refused by the lock; child said: ${res.error}`);
+});
+
+// --- N5: a damaged proof record cannot certify anything ---------------------
+
+ok('N5 closure fails CLOSED when the journal has unreadable lines', () => {
+  const proj = freshProject('n5');
+  withOwnJournal(proj, (log) => {
+    const art = closableArtifact(proj);
+    // A newline-terminated malformed line is dropped in silence, so a REVERT
+    // that got mangled reads as "no REVERT" and the closure stamps the KEEP.
+    // Absence of evidence is not evidence of absence: a damaged proof record
+    // must refuse to certify, not certify by default.
+    fs.appendFileSync(log, '{"id":"evo_mangled","verdict":"REVE\n', 'utf8');
+
+    const health = journal.readEventsWithHealth(proj);
+    assert.strictEqual(health.malformed, 1, `the reader must REPORT the damage, not just warn about it — got ${health.malformed}`);
+
+    const prevCwd = process.cwd();
+    let refusal = null;
+    try {
+      process.chdir(proj);
+      cli.run(['node', 'ratchet', 'artifact', 'close', art.id]);
+    } catch (e) {
+      refusal = e;
+    } finally {
+      process.chdir(prevCwd);
+    }
+    assert.ok(refusal, 'a closure must not be certified against a damaged proof record');
+    assert.match(refusal.message, /damaged/i, `the refusal must name the damage; got: ${refusal.message}`);
+    assert.ok(String(refusal.message).includes(path.basename(log)), `and must name the log; got: ${refusal.message}`);
+    assert.notStrictEqual(
+      state.loadState(proj).artifacts.find((a) => a.id === art.id).status,
+      'closed',
+      'and the artifact must stay open'
+    );
+  });
 });
 
 // --- N6/N10: a nonsense clock is not a shield; a refusal hands over the fix --
