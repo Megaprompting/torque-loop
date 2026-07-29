@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-07-29 — Concurrency Gate
+
+0.2 gated proof; 0.3 the seam; 0.6 the fog; 0.7 the probe; 0.8 closure — and every one
+of those gates assumed, without ever saying it, that a single writer held the pen. Two
+agents on one store could each read rev N and both land rev N+1, and the record kept
+whichever truth wrote last. 0.9 gates the write itself — three attack rounds drove
+fourteen findings to three, and the three that remain are named in this entry rather
+than wished away: **no lock → no write. Two writers. One ordered truth.**
+
 ### Added
 
 #### Concurrency Gate — no lock → no write. Two writers. One ordered truth.
@@ -890,7 +899,8 @@ Initial public release.
 - Single-plugin marketplace manifest so the repo installs directly as a Claude Code plugin.
 - Zero-dependency smoke test suites for the state engine and the evolution helpers.
 
-[Unreleased]: https://github.com/TheLucidTech/torque-loop/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/Megaprompting/torque-loop/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/Megaprompting/torque-loop/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/TheLucidTech/torque-loop/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/TheLucidTech/torque-loop/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/TheLucidTech/torque-loop/compare/v0.5.0...v0.6.0
