@@ -1118,9 +1118,130 @@ ok('the defect transition engine enforces its own proof, not just the CLI', () =
   assert.strictEqual(state.loadState(cwd).defects.find((x) => x.id === d.id).status, 'open', 'nothing leaked through');
 });
 
-// --- closure derivation (0.8 Closure Gate) ----------------------------------
+// --- proof binding (0.8 Closure Gate) ---------------------------------------
 
 const lifecycle = require('../src/lifecycle');
+const evolveVerify = require('../src/evolve/verify');
+
+// A project with a real file on disk, an artifact pointing at it, and a helper
+// that hands back the fingerprint the CLI would compute.
+function boundFixture(name, { kind = 'code', file = 'src/thing.js', body = 'one' } = {}) {
+  const proj = path.join(tmp, name);
+  fs.rmSync(proj, { recursive: true, force: true });
+  fs.mkdirSync(path.join(proj, path.dirname(file)), { recursive: true });
+  fs.writeFileSync(path.join(proj, file), body, 'utf8');
+  state.initProject(proj, { force: true });
+  const art = artifacts.addArtifact(proj, { title: 'thing', kind, path: file });
+  return { proj, art, fp: lifecycle.fingerprint(proj, art), file: path.join(proj, file) };
+}
+
+function keepFields(art, over) {
+  return {
+    target: 'src/thing.js',
+    artifactId: art.id,
+    verdict: 'KEEP',
+    verification: { commands: [{ command: 'node -e 0', pass: true }], result: 'pass' },
+    seam: { evidenceType: 'test', testedSeam: 'x', shipSeam: 'x', seamMatch: 'exact', independentFromBuilderMethod: true },
+    ...over,
+  };
+}
+
+ok('a bound append stamps the identity itself and refuses a caller-supplied one', () => {
+  const { proj, art, fp } = boundFixture('bind-stamp');
+  const e = journal.appendEvent(proj, keepFields(art), { verifiedHash: fp.hash });
+  assert.strictEqual(e.artifactId, art.id);
+  assert.strictEqual(e.artifactRev, fp.rev, 'the CLI computed the rev');
+  assert.strictEqual(e.artifactHash, fp.hash, 'the CLI computed the hash');
+  assert.strictEqual(e.hashScope, 'file');
+  assert.strictEqual(e.source, 'evolve');
+
+  for (const forged of [{ artifactRev: 99 }, { artifactHash: 'deadbeef' }]) {
+    assert.throws(
+      () => journal.appendEvent(proj, keepFields(art, forged), { verifiedHash: fp.hash }),
+      /computed by the CLI, not supplied/
+    );
+  }
+  // and a bound event cannot carry a hand-picked id
+  assert.throws(
+    () => journal.appendEvent(proj, keepFields(art, { id: 'evo_hand_written' }), { verifiedHash: fp.hash }),
+    /machine/i
+  );
+});
+
+ok('a code artifact cannot be bound through mode:"docs" to dodge the seam gate', () => {
+  const { proj, art, fp } = boundFixture('bind-mode');
+  // docs mode skips the seam gate entirely — so the mode must be derived, not claimed.
+  assert.throws(
+    () => journal.appendEvent(proj, keepFields(art, { mode: 'docs', seam: {} }), { verifiedHash: fp.hash }),
+    /mode/i
+  );
+  // derived from the bound artifact, the seam gate bites
+  assert.throws(
+    () => journal.appendEvent(proj, keepFields(art, { seam: {} }), { verifiedHash: fp.hash }),
+    /seam/i
+  );
+  const e = journal.appendEvent(proj, keepFields(art), { verifiedHash: fp.hash });
+  assert.strictEqual(e.mode, 'code', 'mode is derived from the artifact it binds to');
+});
+
+ok('binding refuses a stale verification — edit the file, the proof is void', () => {
+  const { proj, art, fp, file } = boundFixture('bind-stale');
+  assert.throws(() => journal.appendEvent(proj, keepFields(art)), /verifiedHash/);
+  fs.writeFileSync(file, 'edited after the harness ran', 'utf8');
+  assert.throws(
+    () => journal.appendEvent(proj, keepFields(art), { verifiedHash: fp.hash }),
+    /file changed after verification/
+  );
+  // re-verify and it lands
+  const fresh = lifecycle.fingerprint(proj, art);
+  assert.ok(journal.appendEvent(proj, keepFields(art), { verifiedHash: fresh.hash }));
+});
+
+ok('binding refuses a missing or terminal artifact', () => {
+  const { proj, art, fp } = boundFixture('bind-terminal');
+  assert.throws(
+    () => journal.appendEvent(proj, keepFields({ id: 'art-nope' }), { verifiedHash: fp.hash }),
+    /no artifact/
+  );
+  artifacts.retractArtifact(proj, art.id, { reason: 'obsolete' });
+  assert.throws(() => journal.appendEvent(proj, keepFields(art), { verifiedHash: fp.hash }), /retracted|left the lifecycle/);
+});
+
+ok('a v0.7 event stays valid and permanently unbound', () => {
+  const { proj } = boundFixture('bind-legacy');
+  const e = journal.appendEvent(proj, { target: 'legacy.md', verdict: 'ASK' });
+  assert.strictEqual(e.artifactId, '', 'the binding fields exist and are empty, never omitted');
+  assert.strictEqual(e.artifactRev, null);
+  assert.strictEqual(e.hashScope, '');
+});
+
+ok('verify --artifact emits the fingerprint and refuses a target that moved under it', () => {
+  const { proj, art, fp, file } = boundFixture('verify-bound');
+  const v = evolveVerify.verify({ target: 'src/thing.js', testCommand: 'node -e 0', mode: 'code', cwd: proj, artifact: art });
+  assert.strictEqual(v.result, 'pass');
+  assert.strictEqual(v.artifactId, art.id);
+  assert.strictEqual(v.verifiedHash, fp.hash, 'the caller gets exactly what log append will demand');
+  assert.strictEqual(v.verifiedRev, fp.rev);
+  assert.strictEqual(v.hashScope, 'file');
+
+  // a harness that mutates its own target proves nothing about either version
+  const mutator = path.join(proj, 'mutate.js');
+  fs.writeFileSync(mutator, `require('fs').writeFileSync(${JSON.stringify(file)}, 'moved', 'utf8');`, 'utf8');
+  assert.throws(
+    () => evolveVerify.verify({ target: 'src/thing.js', testCommand: `node ${JSON.stringify(mutator)}`, mode: 'code', cwd: proj, artifact: art }),
+    /changed during verification/
+  );
+});
+
+ok('an unbound verify still returns the fixed shape, with the binding stated empty', () => {
+  const v = evolveVerify.verify({ target: 't', mode: 'prompt' });
+  assert.strictEqual(v.artifactId, '');
+  assert.strictEqual(v.verifiedHash, '');
+  assert.strictEqual(v.verifiedRev, null);
+  assert.strictEqual(v.hashScope, '');
+});
+
+// --- closure derivation (0.8 Closure Gate) ----------------------------------
 
 ok('fingerprint binds to file bytes, and says so when it cannot', () => {
   const proj = path.join(tmp, 'fp-fixture');

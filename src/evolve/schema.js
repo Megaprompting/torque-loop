@@ -72,6 +72,15 @@ function newEvent(f = {}) {
       proxyWarning: f.seam?.proxyWarning ?? f.proxyWarning ?? null,
       waiver: normalizeWaiver(f.seam?.waiver || f.waiver),
     },
+    // Proof binding (0.8). Which artifact record, at which exact revision and
+    // content hash, this event is evidence about. Additive and always present:
+    // a v0.7 event carries the empty shape and is permanently unbound — evidence
+    // about a file, never authority over a record.
+    artifactId: f.artifactId || '',
+    artifactRev: f.artifactRev != null ? f.artifactRev : null,
+    artifactHash: f.artifactHash || '',
+    hashScope: f.hashScope || '',
+    source: f.source || 'evolve',
     verdict: VERDICTS.includes(f.verdict) ? f.verdict : 'ASK',
     remainingRisks: Array.isArray(f.remainingRisks) ? f.remainingRisks : [],
     nextEdge: f.nextEdge || '',

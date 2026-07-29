@@ -51,23 +51,42 @@ const MANUAL_CHECKS = {
   workflow: ['a dry-run against a realistic scenario succeeds', 'no step silently no-ops'],
 };
 
-function verify({ target, testCommand, mode = 'code', cwd = process.cwd() }) {
-  if (testCommand) {
-    const r = runCommand(testCommand, cwd);
-    return {
-      target,
-      mode,
-      commands: [r],
-      manualChecks: [],
-      result: r.pass ? 'pass' : 'fail',
-    };
+// Evidence has to name the exact thing it was gathered against, or `log append`
+// cannot tell whether the file it is about to certify is still the file that was
+// tested. Bound verification fingerprints BEFORE and AFTER: if the target moved
+// under the harness (a test that rewrites its own subject is the classic case),
+// the run proves nothing about either version and is refused.
+function verify({ target, testCommand, mode = 'code', cwd = process.cwd(), artifact = null }) {
+  const lifecycle = require('../lifecycle');
+  const print = () => (artifact ? lifecycle.fingerprint(cwd, artifact) : null);
+  const before = print();
+
+  const result = testCommand
+    ? (() => {
+        const r = runCommand(testCommand, cwd);
+        return { commands: [r], manualChecks: [], result: r.pass ? 'pass' : 'fail' };
+      })()
+    : { commands: [], manualChecks: MANUAL_CHECKS[mode] || MANUAL_CHECKS.code, result: 'manual' };
+
+  const after = print();
+  if (before && after && (before.hash !== after.hash || before.rev !== after.rev)) {
+    throw new Error(
+      `target changed during verification — "${target}" is not the file the harness started on, so the run ` +
+        'proves nothing about either version. Settle the target and re-verify.'
+    );
   }
+
+  // The binding fields are always present; emptiness is stated, not omitted, so
+  // an unbound verify has the same shape as a bound one.
   return {
     target,
     mode,
-    commands: [],
-    manualChecks: MANUAL_CHECKS[mode] || MANUAL_CHECKS.code,
-    result: 'manual',
+    ...result,
+    artifactId: artifact ? artifact.id : '',
+    verifiedHash: after ? after.hash : '',
+    verifiedRev: after ? after.rev : null,
+    hashScope: after ? after.hashScope : '',
+    downgradeReason: after ? after.downgradeReason : '',
   };
 }
 

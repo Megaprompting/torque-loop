@@ -83,6 +83,14 @@ function renderVerify(v) {
   const o = [];
   o.push(`### Verify — ${v.target} (${v.mode})`);
   o.push(`Result: **${v.result.toUpperCase()}**`);
+  // The binding is always stated, including when there is none — an unbound run
+  // is evidence about a file and cannot authorize closing a record.
+  if (v.artifactId) {
+    o.push(`Bound to \`${v.artifactId}\` rev ${v.verifiedRev} · ${v.hashScope} hash \`${String(v.verifiedHash).slice(0, 8)}\``);
+    if (v.downgradeReason) o.push(`⚠ ${v.downgradeReason}`);
+  } else {
+    o.push('Bound to: — nothing (unbound: this cannot authorize closing an artifact; re-run with `--artifact <id>`)');
+  }
   if (v.commands.length) {
     for (const c of v.commands) {
       o.push('');
@@ -170,14 +178,30 @@ function run(argv) {
 
     case 'verify': {
       const target = sub;
-      if (!target) throw new Error('usage: ratchet-evolve verify <target> [--test "cmd"] [--mode m]');
-      const v = verify({ target, testCommand: opts.test, mode: opts.mode || 'auto', cwd });
+      if (!target) throw new Error('usage: ratchet-evolve verify <target> [--test "cmd"] [--mode m] [--artifact <id>]');
+      // --artifact binds the run to a state record, so the evidence carries the
+      // exact revision + hash `log append` will demand back.
+      const artifactId = typeof opts.artifact === 'string' ? opts.artifact.trim() : '';
+      let artifact = null;
+      if (artifactId) {
+        const s = require('../state').loadState(cwd);
+        const matches = (s.artifacts || []).filter((a) => a && a.id === artifactId);
+        if (matches.length > 1) throw new Error(`${matches.length} artifacts share the id "${artifactId}" — repair the store first`);
+        artifact = matches[0];
+        if (!artifact) throw new Error(`no artifact with id "${artifactId}"`);
+      }
+      const v = verify({ target, testCommand: opts.test, mode: opts.mode || 'auto', cwd, artifact });
       return out(asJson ? JSON.stringify(v, null, 2) : renderVerify(v));
     }
 
     case 'log': {
       if (sub === 'append') {
-        const event = journal.appendEvent(cwd, readPayload(pos[2]));
+        // verifiedHash travels in the payload (it comes straight out of
+        // `verify --json`) but it is not an event field — it is the proof that
+        // the bytes have not moved since the harness ran.
+        const payload = readPayload(pos[2]);
+        const { verifiedHash, verifiedRev, ...fields } = payload || {};
+        const event = journal.appendEvent(cwd, fields, { verifiedHash, verifiedRev });
         return out(`logged ${event.id} — ${event.target} — ${event.verdict}`);
       }
       // show
