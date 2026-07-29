@@ -582,6 +582,26 @@ ok('cold-start scanner flags retracted steering + unqualified git counts', () =>
   assert.strictEqual(lvl('no-retracted-claims'), 'fail');
 });
 
+ok('cold-start names the residue an interrupted write left in the store', () => {
+  // The 0.9 write path cannot corrupt the record, but it CAN die between the
+  // scratch file and the rename. Silence there reads as "nothing happened",
+  // which is the one thing an interrupted commit must never imply.
+  const proj = path.join(tmp, 'cold-residue');
+  fs.mkdirSync(path.join(proj, '.ratchet'), { recursive: true });
+  state.initProject(proj, { force: true });
+  const clean = coldStart.scan(proj).checks.find((c) => c.name.includes('interrupted-write residue'));
+  assert.strictEqual(clean.level, 'ok', 'a clean store says so');
+
+  fs.writeFileSync(path.join(state.projectDir(proj), 'state.json.tmp-abc-1234'), '{"half":');
+  fs.mkdirSync(path.join(state.projectDir(proj), '.lock'), { recursive: true });
+  const dirty = coldStart.scan(proj).checks.find((c) => c.name.includes('interrupted-write residue'));
+  assert.strictEqual(dirty.level, 'warn', 'residue is named, not hidden');
+  assert.match(dirty.detail, /scratch file/, `the scratch file is named: ${dirty.detail}`);
+  assert.match(dirty.detail, /lock is held/, `the held lock is named: ${dirty.detail}`);
+  assert.strictEqual(coldStart.scan(proj).ok, true, 'residue is not a steering contradiction — it warns, it does not fail');
+  fs.rmSync(path.join(state.projectDir(proj), '.lock'), { recursive: true, force: true });
+});
+
 ok('cold-start scanner is clean on healthy state and flags unimplemented checks transparently', () => {
   const proj = path.join(tmp, 'cold-clean');
   fs.mkdirSync(path.join(proj, '.ratchet'), { recursive: true });
