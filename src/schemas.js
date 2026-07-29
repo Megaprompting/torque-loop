@@ -2,8 +2,26 @@
 
 // Default document shapes + light validation. No external deps.
 
+const crypto = require('crypto');
+
 const STATE_VERSION = 1;
 const LEDGER_VERSION = 1;
+
+// The GENERATION of a record: which incarnation of this store it belongs to. A
+// wipe starts a new one, and a delta computed against a previous generation must
+// never be rebased into it — the whole point of an authorized reset is that
+// pre-reset intent stops applying.
+//
+// It is CSPRNG entropy, never a timestamp, for the same reason the lock's owner
+// card carries a token: `createdAt` comes from nowIso, which honours RATCHET_NOW,
+// and under a frozen clock — a supported mode — two generations stamp identically
+// and the check silently compares equal. Identity that can be made to collide by
+// a supported configuration is not identity. Minted here rather than through
+// state.makeId only because state.js requires this file, not the other way round;
+// same shape, same source of randomness.
+function newGeneration() {
+  return `gen-${Date.now().toString(36)}-${crypto.randomBytes(8).toString('hex')}`;
+}
 
 function nowIso(clock) {
   // Clock is injected so callers (and tests) can control time.
@@ -22,6 +40,9 @@ function newState(clock) {
     // can only work if the counter already exists in the wild; a state file
     // written before it started counting can never be retro-numbered.
     rev: 0,
+    // Which incarnation of this store the record belongs to (see newGeneration).
+    // Every creation and every wipe mints a fresh one, so no caller can forget to.
+    gen: newGeneration(),
     createdAt: t,
     updatedAt: t,
     title: '',
@@ -144,6 +165,7 @@ module.exports = {
   STATE_VERSION,
   LEDGER_VERSION,
   nowIso,
+  newGeneration,
   newState,
   newLedger,
   STATE_COLLECTIONS,

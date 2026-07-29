@@ -162,7 +162,12 @@ function readJson(file) {
 // where the only copy of the record used to be. A rename WITHIN one directory
 // is the closest thing every supported filesystem has to a single-instant swap
 // — including Windows, where fs.renameSync replaces an existing destination.
-function writeFileAtomic(file, data) {
+// `beforePublish` runs in the instant between "the new bytes are on disk" and
+// "the new bytes ARE the record" — the last point at which a publish can still be
+// called off. Every canonical publish passes an ownership check here, because a
+// check any earlier leaves the whole write-flush-close window unguarded: a
+// successor that appeared in there was invisible and the rename published anyway.
+function writeFileAtomic(file, data, beforePublish) {
   ensureDir(path.dirname(file));
   // 'wx' so the temp name is never an existing file, and the pid keeps two
   // processes committing at the same instant off each other's scratch space.
@@ -180,6 +185,7 @@ function writeFileAtomic(file, data) {
     }
     fs.closeSync(fd);
     fd = undefined;
+    if (beforePublish) beforePublish();
     fs.renameSync(tmp, file);
   } catch (e) {
     // A half-written temp file is residue, not a record. Name it, then drop it.
@@ -199,8 +205,13 @@ function writeFileAtomic(file, data) {
   }
 }
 
-function writeJson(file, obj) {
-  writeFileAtomic(file, JSON.stringify(obj, null, 2) + '\n');
+// EVERY publish through writeJson is fenced by default. Threading the check
+// through each call site would mean every future publisher has to remember it,
+// and three of them (the wipe, the corrupt-record repair, the ledger) had already
+// forgotten. The guard is defined further down — hoisting is fine, it only runs at
+// publish time — and it is a no-op unless a lock scope covers this file.
+function writeJson(file, obj, beforePublish) {
+  writeFileAtomic(file, JSON.stringify(obj, null, 2) + '\n', beforePublish || (() => fenceForFile(file)));
 }
 
 // Preserve, never silently lose. A tool whose promise is persistent state must
@@ -241,20 +252,30 @@ function readJsonResilient(file) {
   }
   if (!raw.trim()) return null; // empty file → fresh, no noisy backup
   try {
-    return JSON.parse(raw);
+    const parsed = JSON.parse(raw);
+    // `null`, `false`, `0`, `""` and `[]` all parse. They are not records, and the
+    // caller reinitializes over anything falsey — so they have to travel the SAME
+    // preservation path as malformed bytes, or a valid-but-unusable document gets
+    // replaced with no backup while the store promises it never destroys a record.
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+    return rejectUnusable(file, raw, `it parsed as ${Array.isArray(parsed) ? 'an array' : JSON.stringify(parsed)}, not a record`);
   } catch (_e) {
-    // Returning null tells the caller to reinitialize, which overwrites this
-    // file. Only say that once the bad bytes are safely copied: if the backup
-    // failed, the corrupt file is the ONLY copy of the record and clobbering it
-    // is a silent data loss the tool's whole promise forbids.
-    if (!backupCorrupt(file, raw)) {
-      throw new Error(
-        `${path.basename(file)} is malformed and could not be backed up — refusing to reinitialize over the only copy. ` +
-          'Move or repair the file by hand, then re-run.'
-      );
-    }
-    return null;
+    return rejectUnusable(file, raw, 'it is not valid JSON');
   }
+}
+
+// Returning null tells the caller to reinitialize, which overwrites this file.
+// Only say that once the bad bytes are safely copied: if the backup failed, this
+// file is the ONLY copy of the record and clobbering it is a silent data loss the
+// tool's whole promise forbids.
+function rejectUnusable(file, raw, why) {
+  if (!backupCorrupt(file, raw)) {
+    throw new Error(
+      `${path.basename(file)} cannot be used as a record (${why}) and could not be backed up — refusing to ` +
+        'reinitialize over the only copy. Move or repair the file by hand, then re-run.'
+    );
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -336,16 +357,24 @@ const FUTURE_SKEW_MS = 5000;
 
 function lockOwner(lockDir) {
   let raw = '';
+  // UNREADABLE IS NOT EMPTY. Mapping every read failure to '' made two different
+  // holdings nobody can read compare equal, and the break then carried off a live
+  // successor believing it had verified it. `absent` (there is provably no card)
+  // and `unreadable` (there may be one and we cannot see it) are different facts.
+  let absent = false;
+  let unreadable = false;
   try {
     raw = fs.readFileSync(ownerCardPath(lockDir), 'utf8');
-  } catch (_e) {
-    raw = '';
+  } catch (e) {
+    if (e && e.code === 'ENOENT') absent = true;
+    else unreadable = true;
   }
   let card = null;
   try {
     card = raw.trim() ? JSON.parse(raw) : null;
   } catch (_e) {
     card = null;
+    unreadable = true; // present, but its identity cannot be established
   }
   const stamped = card ? Date.parse(card.at) : NaN;
   let ageMs;
@@ -384,13 +413,27 @@ function lockOwner(lockDir) {
     believable,
     raw,
     card,
+    absent,
+    unreadable,
   };
 }
 
 // Is this the same holding we judged? Token when there is one, whole card when
 // there is not. A conditional check is not a check: a tokenless judgment that
 // skipped verification could carry off a live successor.
+//
+// An UNREADABLE identity matches nothing, including another unreadable one — that
+// is the R2 hole, where '' === '' let two unrelated holdings pass as the same.
+// A provably ABSENT card is a different case: it is a fact we can establish, and
+// two absences do compare equal. That is a deliberate narrowing, because the
+// alternative is that a lock whose owner died in the microsecond between mkdir and
+// the card write becomes permanently unbreakable — and with a fail-stop restore
+// that would wedge every later command. The residual window (a successor caught
+// mid-acquisition, also cardless) is covered by the commit-time ownership fence,
+// which refuses rather than double-writes.
 function sameHolding(judged, found) {
+  if (judged.unreadable || found.unreadable) return false;
+  if (judged.absent || found.absent) return judged.absent && found.absent;
   return judged.token ? found.token === judged.token : found.raw === judged.raw;
 }
 
@@ -461,23 +504,49 @@ function breakIfStale(lockDir) {
     } catch (_e) {
       /* fall through to the loud path */
     }
-    process.stderr.write(
-      `[ratchet] ABORTED a stale-lock break at ${lockDir}: judged ${owner.token ? `token ${owner.token.slice(0, 8)}` : 'a tokenless card'} ` +
-        `stale but moved ${moved.token ? `token ${moved.token.slice(0, 8)}` : 'a different card'} (pid ${moved.pid}). ` +
-        (restored
-          ? 'Restored it — no lock was destroyed.'
-          : `COULD NOT RESTORE: a holding is stranded at ${doomed} and its owner still believes it holds the lock. ` +
-            'Not acquiring in this pass; every commit re-verifies ownership, so the stranded owner will refuse rather ' +
-            'than double-write. Inspect by hand.') +
-        '\n'
+    const preamble =
+      `[ratchet] ABORTED a stale-lock break at ${lockDir}: judged ${owner.token ? `token ${owner.token.slice(0, 8)}` : 'a card with no token'} ` +
+      `stale but moved ${moved.token ? `token ${moved.token.slice(0, 8)}` : 'a different card'} (pid ${moved.pid}).`;
+    if (restored) {
+      process.stderr.write(`${preamble} Restored it — no lock was destroyed.\n`);
+      return false; // nothing was broken; let the loop retry against the restored holding
+    }
+    // FAIL-STOP. Returning "did not break" used to let the retry loop find the
+    // slot empty and take it: the same invocation that stranded somebody else's
+    // holding walked away with the lock it created room for. A call that broke
+    // something it could not verify does not get to profit from it. A fresh
+    // command may try again; this one is over.
+    const e = new Error(
+      `${preamble} COULD NOT RESTORE: a holding is stranded at ${doomed} and its owner still believes it holds ` +
+        `the lock at ${lockDir}. Refusing to acquire in the call that stranded it. Every commit re-verifies ` +
+        'ownership, so the stranded owner will refuse rather than double-write — inspect the stranded directory by hand.'
     );
-    return restored; // restored → retry the acquire loop; not restored → do not spin on it
+    e.code = 'ERATCHETLOCKINCIDENT';
+    e.lockDir = lockDir;
+    e.strandedAt = doomed;
+    throw e;
   }
   removeDirSync(doomed);
   process.stderr.write(
     `[ratchet] broke a stale lock at ${lockDir} — ${why}: pid ${owner.pid} (${owner.action}), ${Math.round(owner.ageMs / 1000)}s old.\n`
   );
   return true;
+}
+
+// Same reason removeDirSync retries: Windows refuses to rename a directory any
+// process still has open, and every waiter polls the owner card of the lock it is
+// waiting on. ENOENT is final — there is nothing left to move.
+function renameWithRetry(from, to) {
+  for (let i = 0; i < 5; i++) {
+    try {
+      fs.renameSync(from, to);
+      return true;
+    } catch (e) {
+      if (e && e.code === 'ENOENT') return false;
+      sleepSync(10);
+    }
+  }
+  return false;
 }
 
 // Windows answers EBUSY/EPERM for a directory whose handles the OS has not
@@ -538,32 +607,55 @@ function acquireLock(lockDir, action) {
 // delete blocks every future writer until the timeout, every time.
 function releaseLock(handle) {
   if (!handle || !handle.dir) return true;
-  const owner = lockOwner(handle.dir);
   if (!fs.existsSync(handle.dir)) return true; // already gone (broken as stale)
-  if (owner.token !== handle.token) {
+  // VERIFY BY MOVING, the same primitive the break uses. Reading the owner card
+  // and then deleting the directory is two steps, and a successor that acquires
+  // between them is deleted by a process that had already "checked" — the exact
+  // TOCTOU the release was supposed to be immune to. After an atomic rename, what
+  // we are holding is ours alone to inspect and nobody else can be inside it.
+  const releasing = `${handle.dir}.releasing-${crypto.randomBytes(4).toString('hex')}`;
+  if (!renameWithRetry(handle.dir, releasing)) {
+    // Windows refuses to rename a directory any process still has open, and other
+    // writers poll this one constantly. After the retries have failed, a lock we
+    // will not move is a lock nobody can take, so fall back to the older
+    // verify-in-place delete rather than wedging every future writer. That
+    // fallback carries the TOCTOU this function exists to remove — it needs a
+    // successor to acquire in the window AND five consecutive rename failures, and
+    // a stuck lock is the more likely harm.
+    const inPlace = lockOwner(handle.dir);
+    if (!fs.existsSync(handle.dir)) return true;
+    if (inPlace.unreadable || inPlace.token !== handle.token) {
+      process.stderr.write(`[ratchet] NOT releasing ${handle.dir}: could not move it and it is not ours. Leaving it alone.\n`);
+      return false;
+    }
+    return removeDirSync(handle.dir);
+  }
+  const owner = lockOwner(releasing);
+  if (!sameHolding({ token: handle.token, raw: '', absent: false, unreadable: false }, owner)) {
+    // Not ours. Put it back if the slot is free; never delete a holding we cannot
+    // prove is ours, and never leave one stranded in silence.
+    let restored = false;
+    try {
+      if (!fs.existsSync(handle.dir)) {
+        fs.renameSync(releasing, handle.dir);
+        restored = true;
+      }
+    } catch (_e) {
+      /* fall through to the loud path */
+    }
     process.stderr.write(
-      `[ratchet] NOT releasing ${handle.dir}: it is held by token ${(owner.token || 'none').slice(0, 8)} ` +
-        `(pid ${owner.pid}, ${owner.action}), not by this process's ${handle.token.slice(0, 8)}. ` +
-        'Our holding was broken as stale and somebody else owns the lock now — leaving it alone.\n'
+      `[ratchet] NOT releasing ${handle.dir}: it holds ${owner.token ? `token ${owner.token.slice(0, 8)}` : 'no readable owner card'} ` +
+        `(pid ${owner.pid}, ${owner.action}), not this process's ${handle.token.slice(0, 8)}. Our holding was broken or ` +
+        `replaced. ${restored ? 'Put it back untouched.' : `STRANDED at ${releasing} — inspect by hand.`}\n`
     );
     return false;
   }
-  if (removeDirSync(handle.dir)) return true;
-  // Could not delete it. Move it out of the way with the same atomic primitive a
-  // stale break uses, so the slot is free even if the bytes linger.
-  const doomed = `${handle.dir}.stale-${crypto.randomBytes(4).toString('hex')}`;
-  try {
-    fs.renameSync(handle.dir, doomed);
-    removeDirSync(doomed);
-    process.stderr.write(`[ratchet] could not delete ${handle.dir}; moved it aside so the next writer is not blocked.\n`);
-    return true;
-  } catch (_e) {
-    process.stderr.write(
-      `[ratchet] STUCK LOCK: could not release or move ${handle.dir} (pid ${process.pid}). ` +
-        'Every future writer here will wait for the timeout until it is removed by hand.\n'
-    );
-    return false;
-  }
+  if (removeDirSync(releasing)) return true;
+  process.stderr.write(
+    `[ratchet] could not delete ${releasing} (pid ${process.pid}); the lock slot is free, the residue is not. ` +
+      'Remove that directory by hand.\n'
+  );
+  return false;
 }
 
 // At most ONE lock scope is open per process, and it is remembered here. The
@@ -621,9 +713,23 @@ function withWorkspaceLock(cwd, action, fn) {
 // two processes each believing they hold one lock. Re-reading the owner card
 // immediately before the write turns every one of those into a LOSER-SIDE
 // REFUSAL that writes nothing, instead of a silent double write nobody detects.
+// The fence as writeJson applies it: does an open lock scope cover this file? If
+// so, our holding has to still be ours before the rename publishes it. Keyed on
+// the directory, so state.json, ledger.json and every future file in the store
+// are all covered without naming any of them.
+function fenceForFile(file) {
+  if (!_scope || !_scope.handle) return;
+  if (path.resolve(path.dirname(file)) !== path.resolve(_scope.dir)) return;
+  assertStillOwnerOfScope(path.basename(file));
+}
+
 function assertStillOwner(cwd, what) {
   const dir = projectDir(cwd);
   if (!_scope || _scope.dir !== dir || !_scope.handle) return;
+  assertStillOwnerOfScope(what);
+}
+
+function assertStillOwnerOfScope(what) {
   const owner = lockOwner(_scope.handle.dir);
   if (owner.token === _scope.handle.token) return;
   const e = new Error(
@@ -651,13 +757,37 @@ function fileLockDir(file) {
   try {
     return `${fs.realpathSync(file)}${LOCK_DIR_NAME}`;
   } catch (_e) {
-    /* the file does not exist yet */
+    /* the file does not exist yet — or it is a link to something that does not */
   }
+  // A DANGLING symlink makes realpath fail, and falling back to the link's own
+  // name changed the lock identity the moment the target appeared: the alias was
+  // locked as `alias.lock` before creation and as `real.lock` after, so one file
+  // could be held under two keys at once, each holder believing it was exclusive.
+  // Follow the link by hand instead — the target's name is knowable even when the
+  // target is not there yet.
+  const resolved = resolveLinkTarget(file);
   try {
-    return path.join(fs.realpathSync(path.dirname(file)), `${path.basename(file)}${LOCK_DIR_NAME}`);
+    return path.join(fs.realpathSync(path.dirname(resolved)), `${path.basename(resolved)}${LOCK_DIR_NAME}`);
   } catch (_e) {
-    return `${file}${LOCK_DIR_NAME}`; // parent does not exist either — lexical is all there is
+    return `${resolved}${LOCK_DIR_NAME}`; // parent does not exist either — lexical is all there is
   }
+}
+
+// Walk a chain of symlinks to the name it finally points at, whether or not that
+// name exists. Bounded, because a link cycle is a real thing and a hang is worse
+// than a bad lock key.
+function resolveLinkTarget(file) {
+  let current = path.resolve(file);
+  for (let hops = 0; hops < 32; hops++) {
+    let target;
+    try {
+      target = fs.readlinkSync(current);
+    } catch (_e) {
+      return current; // not a link (or unreadable): this is the final name
+    }
+    current = path.resolve(path.dirname(current), target);
+  }
+  return current;
 }
 
 // A generic lock for a file that is NOT in the workspace store — the evolution
@@ -696,6 +826,8 @@ function createJsonExclusive(file, obj) {
   try {
     writeFileAtomic(tmp, data);
     try {
+      // The link IS the publish here, so it carries the same fence a rename does.
+      fenceForFile(file);
       fs.linkSync(tmp, file);
       return true;
     } catch (e) {
@@ -710,7 +842,7 @@ function createJsonExclusive(file, obj) {
         // is exclusivity against writers that bypass the lock entirely — which
         // nothing in this codebase does, and which no advisory lock can stop.
         if (fs.existsSync(file)) return false;
-        writeFileAtomic(file, data);
+        writeFileAtomic(file, data, () => fenceForFile(file));
         return true;
       }
       throw e;
@@ -1007,16 +1139,22 @@ function saveState(cwd, state) {
 function rebaseAndCommit(cwd, state) {
   const disk = readJsonResilient(statePath(cwd));
   if (!disk) return commitState(cwd, state, revOf(state)); // nothing on disk to lose
-  // A wipe starts a new GENERATION of the record, and `createdAt` is its name. A
-  // delta computed against the old generation must never be merged into the new
-  // one, however the revision numbers happen to line up: the entire point of an
+  // A wipe starts a new GENERATION of the record, and `gen` is its name. A delta
+  // computed against the old generation must never be merged into the new one,
+  // however the revision numbers happen to line up: the entire point of an
   // authorized reset is that pre-reset intent stops applying, so rebasing it back
   // in resurrects exactly what somebody deliberately destroyed.
-  if (String(state.createdAt) !== String(disk.createdAt)) {
+  //
+  // This was `createdAt` and that was a hole: createdAt comes from nowIso, so a
+  // frozen RATCHET_NOW (supported, used by hooks and deterministic tests) made
+  // both generations stamp identically and the check passed. A record written
+  // before `gen` existed has none, and two such records compare equal — the
+  // pre-0.9 boundary, named in the CHANGELOG rather than papered over.
+  if (String(state.gen || '') !== String(disk.gen || '')) {
     const e = new Error(
-      `refused a write from a previous generation of this record (saveState): the snapshot was created at ` +
-        `${state.createdAt} and the workspace record at ${disk.createdAt} — the store was reset in between. ` +
-        'Reload the state; the change has to be re-decided against the record that exists now.'
+      `refused a write from a previous generation of this record (saveState): the snapshot belongs to generation ` +
+        `${state.gen || '(none recorded)'} and the workspace record to ${disk.gen || '(none recorded)'} — the store ` +
+        'was reset in between. Reload the state; the change has to be re-decided against the record that exists now.'
     );
     e.code = 'ERATCHETSTALE';
     e.expectedStateRev = revOf(state);
