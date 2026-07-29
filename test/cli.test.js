@@ -986,5 +986,144 @@ ok('session confidence names recorded pressure, not correctness', () => {
   assert.ok(/recorded loop pressure, not correctness/.test(conf.scope), 'the scope says what the number is not');
 });
 
+// --- closure derivation (0.8 Closure Gate) ----------------------------------
+
+const lifecycle = require('../src/lifecycle');
+
+ok('fingerprint binds to file bytes, and says so when it cannot', () => {
+  const proj = path.join(tmp, 'fp-fixture');
+  fs.mkdirSync(path.join(proj, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(proj, 'src', 'a.js'), 'one', 'utf8');
+
+  const file = lifecycle.fingerprint(proj, { id: 'a1', path: 'src/a.js', rev: 2 });
+  assert.strictEqual(file.hashScope, 'file');
+  assert.strictEqual(file.rev, 2);
+  assert.strictEqual(file.downgradeReason, '', 'a real file needs no excuse');
+  fs.writeFileSync(path.join(proj, 'src', 'a.js'), 'two', 'utf8');
+  assert.notStrictEqual(lifecycle.fingerprint(proj, { id: 'a1', path: 'src/a.js', rev: 2 }).hash, file.hash,
+    'editing the file changes the identity proof binds to');
+
+  // no path at all → the record IS the artifact
+  const rec = lifecycle.fingerprint(proj, { id: 'a2', kind: 'spec', title: 't', holes: [] });
+  assert.strictEqual(rec.hashScope, 'record');
+  assert.strictEqual(rec.rev, 1, 'a missing rev counts as 1, never 0');
+
+  // the real dogfood value: a fragment-bearing path is not a file
+  const frag = lifecycle.fingerprint(proj, { id: 'a3', path: 'CHANGELOG.md#unreleased', title: 't' });
+  assert.strictEqual(frag.hashScope, 'record');
+  assert.ok(/does not resolve to a file/.test(frag.downgradeReason), 'the downgrade states its reason');
+});
+
+ok('fingerprint refuses to bind outside the project, or to a directory', () => {
+  const proj = path.join(tmp, 'fp-refuse');
+  fs.mkdirSync(path.join(proj, 'sub'), { recursive: true });
+  assert.throws(() => lifecycle.fingerprint(proj, { id: 'x', path: 'sub' }), /not a regular file/);
+  assert.throws(() => lifecycle.fingerprint(proj, { id: 'x', path: '../escape.md' }), /outside the project/);
+  assert.throws(() => lifecycle.fingerprint(proj, { id: 'x', path: path.join(tmp, 'elsewhere.md') }), /outside the project/);
+});
+
+ok('a REVERT on the same binding revokes an older KEEP', () => {
+  const artifact = { id: 'art-1', title: 't', kind: 'spec', holes: [], rev: 1 };
+  const fp = lifecycle.fingerprint(tmp, artifact);
+  const bind = { artifactId: 'art-1', artifactRev: fp.rev, artifactHash: fp.hash };
+  assert.ok(lifecycle.bindingEvent(artifact, [{ ...bind, verdict: 'KEEP' }], fp), 'a KEEP on the binding authorizes');
+  assert.strictEqual(
+    lifecycle.bindingEvent(artifact, [{ ...bind, verdict: 'KEEP' }, { ...bind, verdict: 'REVERT' }], fp),
+    null,
+    'the latest event on the binding wins — a later REVERT revokes the KEEP'
+  );
+  // and it never falls back to path/title matching
+  assert.strictEqual(
+    lifecycle.bindingEvent(artifact, [{ target: 't', verdict: 'KEEP' }], fp), null,
+    'an unbound event is evidence about a file, never authority over a record'
+  );
+  // a stale hash (the artifact was revised after the proof) does not authorize
+  assert.strictEqual(
+    lifecycle.bindingEvent(artifact, [{ ...bind, artifactHash: 'stale', verdict: 'KEEP' }], fp), null
+  );
+});
+
+ok('a bare legacy status:"closed" is uncertified — not closed', () => {
+  assert.strictEqual(lifecycle.isClosed({ status: 'closed' }), false, 'status alone is a claim, not a certificate');
+  assert.strictEqual(lifecycle.isClosed({ status: 'closed', closedBy: 'evo_1', closedRev: 1 }), false, 'no hash, no certificate');
+  assert.strictEqual(
+    lifecycle.isClosed({ status: 'closed', closedBy: 'evo_1', closedRev: 1, closedHash: 'abc' }), true
+  );
+});
+
+ok('closureBlockers lists everything in one fixed order', () => {
+  const artifact = { id: 'art-p', kind: 'probe', title: 'probe: x', holes: ['disposal: pending'], rev: 1 };
+  const st = { artifacts: [artifact], defects: [{ id: 'd1', artifact: 'art-p', severity: 'high', status: 'open' }] };
+  const codes = lifecycle.closureBlockers(st, [], artifact, tmp).map((b) => b.code);
+  assert.deepStrictEqual(codes, ['probe', 'no-bound-proof', 'open-defects', 'holes'], 'fixed order, every blocker named');
+
+  // clean + bound + no defects + no holes → closable
+  const clean = { id: 'art-c', kind: 'spec', title: 't', holes: [], rev: 1 };
+  const fp = lifecycle.fingerprint(tmp, clean);
+  const bound = [{ artifactId: 'art-c', artifactRev: fp.rev, artifactHash: fp.hash, verdict: 'KEEP' }];
+  assert.deepStrictEqual(lifecycle.closureBlockers({ artifacts: [clean], defects: [] }, bound, clean, tmp), []);
+  // holes alone block, and the waiver in the request clears exactly that one
+  const holey = { ...clean, holes: ['TODO'] };
+  const fpH = lifecycle.fingerprint(tmp, holey);
+  const boundH = [{ artifactId: 'art-c', artifactRev: fpH.rev, artifactHash: fpH.hash, verdict: 'KEEP' }];
+  assert.deepStrictEqual(
+    lifecycle.closureBlockers({ artifacts: [holey], defects: [] }, boundH, holey, tmp).map((b) => b.code), ['holes']
+  );
+  assert.deepStrictEqual(
+    lifecycle.closureBlockers({ artifacts: [holey], defects: [] }, boundH, holey, tmp,
+      { waiveHoles: true, owner: 'danny', reason: 'shipping without it' }), []
+  );
+});
+
+ok('workflowClosed refuses to call it closed while an orphan defect is open', () => {
+  const clean = { id: 'art-w', kind: 'spec', title: 't', holes: [], rev: 1, status: 'v1' };
+  const fp = lifecycle.fingerprint(tmp, clean);
+  const closed = { ...clean, status: 'closed', closedBy: 'evo_x', closedRev: fp.rev, closedHash: fp.hash };
+  const events = [{ artifactId: 'art-w', artifactRev: fp.rev, artifactHash: fp.hash, verdict: 'KEEP' }];
+  assert.strictEqual(lifecycle.workflowClosed({ artifacts: [closed], defects: [] }, events, tmp).closed, true);
+  const withOrphan = lifecycle.workflowClosed(
+    { artifacts: [closed], defects: [{ id: 'd-orphan', artifact: '', severity: 'low', status: 'open' }] }, events, tmp
+  );
+  assert.strictEqual(withOrphan.closed, false, 'a legacy orphan defect must not slip workflow closure');
+  assert.ok(withOrphan.blockers.some((b) => b.code === 'unattached-defects'));
+  assert.ok(withOrphan.scope, 'the closure read names its scope');
+});
+
+ok('nextTransition derives one move, in precedence order, with a fixed shape', () => {
+  const shape = (t) => {
+    for (const k of ['label', 'command', 'reason', 'scope']) assert.ok(t[k], `transition always carries ${k}`);
+    return t;
+  };
+  // 1. no objective outranks everything
+  assert.ok(/lock/i.test(shape(lifecycle.nextTransition({}, [], tmp)).command));
+  // 2. an open critical/high defect outranks the artifact
+  const withDefect = shape(lifecycle.nextTransition(
+    { objective: 'o', defects: [{ id: 'd9', severity: 'critical', status: 'open' }] }, [], tmp
+  ));
+  assert.ok(/defect resolve d9/.test(withDefect.command));
+  // 3. a live artifact's first blocker supplies the remedy
+  const art = { id: 'art-n', kind: 'spec', title: 't', holes: [], rev: 1, status: 'v0' };
+  const unproven = shape(lifecycle.nextTransition({ objective: 'o', artifacts: [art] }, [], tmp));
+  assert.ok(/ratchet-evolve verify/.test(unproven.command), 'no bound proof → bind proof');
+  // 4. a closable artifact names close
+  const fp = lifecycle.fingerprint(tmp, art);
+  const bound = [{ artifactId: 'art-n', artifactRev: fp.rev, artifactHash: fp.hash, verdict: 'KEEP' }];
+  assert.strictEqual(
+    shape(lifecycle.nextTransition({ objective: 'o', artifacts: [art] }, bound, tmp)).command,
+    'ratchet artifact close art-n'
+  );
+  // 5. all closed + dirty → checkpoint
+  const closed = { ...art, status: 'closed', closedBy: 'e', closedRev: fp.rev, closedHash: fp.hash };
+  assert.strictEqual(
+    shape(lifecycle.nextTransition({ objective: 'o', artifacts: [closed], dirty: true }, bound, tmp)).command,
+    'ratchet compile done'
+  );
+  // 6. nothing pending is stated, never omitted
+  assert.strictEqual(
+    shape(lifecycle.nextTransition({ objective: 'o', artifacts: [closed], dirty: false }, bound, tmp)).command,
+    'nothing pending'
+  );
+});
+
 fs.rmSync(tmp, { recursive: true, force: true });
 process.stdout.write(`\n${passed} passed\n`);
