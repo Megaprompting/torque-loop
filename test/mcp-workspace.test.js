@@ -68,6 +68,10 @@ function refuses(roots, p, why) {
   return err;
 }
 
+function within(candidate, root) {
+  return candidate === root || candidate.startsWith(root + path.sep);
+}
+
 function symlinkOrFail(target, link, type) {
   let linked = true;
   try {
@@ -92,8 +96,12 @@ ok('W1 a relative path is refused — there is no base to guess from', () => {
 ok('W2 dot-dot out of a root is refused however it is spelled', () => {
   const { root, outside } = world('w2');
   const roots = workspace.createRoots([root]);
-  refuses(roots, path.join(root, '..', 'outside', 'secret.txt'), 'dot-dot traversal');
-  refuses(roots, path.join(root, 'a', '..', '..', 'outside'), 'traversal through a subdir');
+  // Built by concatenation, NOT path.join: join normalizes the dot segments
+  // away before the module ever sees them, which would test nothing.
+  const sep = path.sep;
+  refuses(roots, `${root}${sep}..${sep}outside${sep}secret.txt`, 'dot-dot traversal');
+  refuses(roots, `${root}${sep}a${sep}..${sep}..${sep}outside`, 'traversal through a subdir');
+  refuses(roots, `${root}${sep}.${sep}..${sep}outside`, 'dot-dot behind a dot segment');
   refuses(roots, outside, 'a plain sibling path');
 });
 
@@ -110,9 +118,11 @@ ok('W4 a sibling that merely shares the root\'s name prefix is refused', () => {
   fs.mkdirSync(evil, { recursive: true });
   fs.writeFileSync(path.join(evil, 'x.txt'), 'no', 'utf8');
   const roots = workspace.createRoots([root]);
-  refuses(roots, path.join(evil, 'x.txt'), 'a prefix-sharing sibling');
   assert.ok(evil.startsWith(root), 'the fixture must actually share the string prefix');
-  assert.ok(base);
+  refuses(roots, path.join(evil, 'x.txt'), 'a prefix-sharing sibling');
+  assert.strictEqual(roots.resolve(path.join(root, 'inside.txt')), fs.realpathSync.native(path.join(root, 'inside.txt')),
+    'and the real root must still work — the separator rule is not a blanket refusal');
+  assert.ok(base.length && !within(base, root), 'the fixture parent is genuinely outside the root');
 });
 
 // --- indirect crossings -----------------------------------------------------
@@ -158,8 +168,12 @@ ok('W8 a path inside a root resolves to its canonical form', () => {
   const roots = workspace.createRoots([root]);
   const want = fs.realpathSync.native(path.join(root, 'inside.txt'));
   assert.strictEqual(roots.resolve(path.join(root, 'inside.txt')), want);
-  assert.strictEqual(roots.resolve(path.join(root, '.', 'inside.txt')), want, 'a dot segment is noise, not an escape');
-  assert.strictEqual(roots.resolve(path.join(root, 'sub', '..', 'inside.txt')), want,
+  const sep = path.sep;
+  assert.strictEqual(roots.resolve(`${root}${sep}.${sep}inside.txt`), want, 'a dot segment is noise, not an escape');
+  // The subdirectory must EXIST for this to exercise the dot-dot branch at all;
+  // climbing out of a component that is not there is a different case (W22).
+  fs.mkdirSync(path.join(root, 'sub'), { recursive: true });
+  assert.strictEqual(roots.resolve(`${root}${sep}sub${sep}..${sep}inside.txt`), want,
     'dot-dot that lands back inside is allowed — the destination is what matters');
 });
 
@@ -208,19 +222,82 @@ ok('W17 a link that stays inside the root is FOLLOWED, not refused', () => {
     'a path through an internal directory link must resolve too');
 });
 
-ok('W18 name comparison follows the platform, not the string', () => {
-  const { root } = world('w18');
+ok('W18 name spelling is settled by the filesystem, not by lowercasing', () => {
+  const { base, root } = world('w18');
   const roots = workspace.createRoots([root]);
   const inside = path.join(root, 'inside.txt');
+  // Whatever the platform, an existing path must canonicalize to the ONE name
+  // the filesystem stores — that is what makes exact comparison safe.
+  assert.strictEqual(roots.resolve(inside), fs.realpathSync.native(inside));
   if (process.platform === 'win32') {
-    // Windows opens these as the same file, so containment must agree.
+    // Windows opens these as the same file, so containment must agree — and it
+    // must agree by canonicalizing, not by folding case in JavaScript.
     assert.strictEqual(roots.resolve(inside.toUpperCase()), roots.resolve(inside),
       'a differently-cased path names the same file on Windows');
   } else {
-    // Elsewhere they are different names; the upper-cased one simply does not
-    // exist yet, and must still be judged inside the root rather than refused.
-    assert.strictEqual(roots.resolve(path.join(root, 'INSIDE.TXT')), path.join(root, 'INSIDE.TXT'));
+    // Case-sensitive: a sibling of the root differing only in case is a
+    // DIFFERENT directory, and folding case would hand it over.
+    const twin = path.join(base, 'WORKSPACE');
+    fs.mkdirSync(twin, { recursive: true });
+    fs.writeFileSync(path.join(twin, 'secret.txt'), 'not yours', 'utf8');
+    refuses(roots, path.join(twin, 'secret.txt'), 'a case-variant sibling of the root');
   }
+});
+
+ok('W19 a link resolves before the tail that follows it, in both directions', () => {
+  // The branch neither W9 (no link) nor W17 (no missing tail) reaches.
+  const { root, outside } = world('w19');
+  const roots = workspace.createRoots([root]);
+
+  const out = path.join(root, 'out-door');
+  symlinkOrFail(outside, out, 'junction');
+  refuses(roots, path.join(out, 'new.txt'), 'a not-yet-existing file behind an escaping link');
+
+  const real = path.join(root, 'real');
+  fs.mkdirSync(real, { recursive: true });
+  const inDoor = path.join(root, 'in-door');
+  symlinkOrFail(real, inDoor, 'junction');
+  assert.strictEqual(roots.resolve(path.join(inDoor, 'new.txt')),
+    path.join(fs.realpathSync.native(real), 'new.txt'),
+    'a not-yet-existing file behind an internal link resolves through it');
+});
+
+ok('W20 dot-dot means the parent of where the path really arrived', () => {
+  // path.resolve collapses ".." before links are followed; the OS does not.
+  const { root, outside } = world('w20');
+  const roots = workspace.createRoots([root]);
+  const sep = path.sep;
+
+  const out = path.join(root, 'out-door');
+  symlinkOrFail(outside, out, 'junction');
+  refuses(roots, `${out}${sep}..${sep}secret.txt`, 'dot-dot climbing out of an escaping link');
+
+  const deep = path.join(root, 'a', 'b');
+  fs.mkdirSync(deep, { recursive: true });
+  fs.writeFileSync(path.join(root, 'a', 'target.txt'), 'yours', 'utf8');
+  const inDoor = path.join(root, 'in-door');
+  symlinkOrFail(deep, inDoor, 'junction');
+  assert.strictEqual(roots.resolve(`${inDoor}${sep}..${sep}target.txt`),
+    fs.realpathSync.native(path.join(root, 'a', 'target.txt')),
+    'dot-dot through an internal link lands inside and must be allowed');
+});
+
+ok('W21 a component that cannot be examined is refused, not treated as absent', () => {
+  const { root } = world('w21');
+  const roots = workspace.createRoots([root]);
+  // A file cannot contain further components: this path can never exist, so
+  // returning it as a legal future target would be a lie.
+  refuses(roots, path.join(root, 'inside.txt', 'child.txt'), 'a path descending through a file');
+  refuses(roots, path.join(root, 'inside.txt', '..', '..', 'outside', 'secret.txt'),
+    'a traversal laundered through a file component');
+});
+
+ok('W22 a path that does not exist may not climb past what does not exist', () => {
+  const { root } = world('w22');
+  const roots = workspace.createRoots([root]);
+  const sep = path.sep;
+  refuses(roots, `${root}${sep}absent${sep}..${sep}..${sep}outside${sep}new.txt`,
+    'dot-dot through a missing component');
 });
 
 // --- construction and shape -------------------------------------------------
@@ -237,10 +314,45 @@ ok('W11 a path that is not a usable string is refused', () => {
   for (const bad of ['', null, undefined, 42, {}, []]) {
     refuses(roots, bad, `a non-path value ${JSON.stringify(bad)}`);
   }
-  // Written as an escape on purpose: a raw NUL is invisible in source. Every
-  // syscall truncates at it, so the bytes after it are a lie the filesystem
-  // never sees — the containment check would read one path, the open another.
-  refuses(roots, path.join(root, 'inside.txt') + '\u0000.png', 'a NUL-truncated path');
+  // Written as an escape on purpose: a raw NUL is invisible in source. Node
+  // rejects a NUL in a path with its own ERR_INVALID_ARG_VALUE before any
+  // syscall runs, so this is defence in depth — the point is that a client
+  // gets this boundary's refusal, in its vocabulary, rather than Node's.
+  refuses(roots, path.join(root, 'inside.txt') + '\u0000.png', 'a path carrying a NUL');
+});
+
+ok('W23 a drive-relative Windows path is not "absolute enough" to be a root or a target', () => {
+  const { root } = world('w23');
+  const roots = workspace.createRoots([root]);
+  if (process.platform === 'win32') {
+    // Node calls "\work" absolute, but it means a different place depending on
+    // the process's current drive — a root may not be that.
+    refuses(roots, '\\Windows\\System32', 'a drive-less rooted Windows path');
+    refuses(roots, 'C:relative', 'a drive-relative Windows path');
+    let err = null;
+    try {
+      workspace.createRoots(['\\some\\where']);
+    } catch (e) {
+      err = e;
+    }
+    assert.strictEqual(err && err.code, 'ERATCHETROOT', 'and it may not be configured as a root either');
+  } else {
+    refuses(roots, 'C:\\Windows', 'a Windows-shaped path on POSIX is not absolute here');
+  }
+});
+
+ok('W24 a root that cannot even be described is refused with this module\'s own error', () => {
+  // JSON.stringify throws on a BigInt; the refusal must be ours, not a TypeError
+  // escaping from inside the error message.
+  for (const bad of [1n, Symbol('x'), () => {}]) {
+    let err = null;
+    try {
+      workspace.createRoots([bad]);
+    } catch (e) {
+      err = e;
+    }
+    assert.strictEqual(err && err.code, 'ERATCHETROOT', `construction must name its own refusal for ${String(bad)}`);
+  }
 });
 
 ok('W15 a root that is relative, missing, or not a directory is refused at construction', () => {

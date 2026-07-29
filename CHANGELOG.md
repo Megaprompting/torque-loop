@@ -10,31 +10,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **`src/mcp/workspace.js` — the root allowlist and canonical path containment**
-  (Torque MCP build-order step 2.1). The invariant: **no client-controlled path crosses
-  the configured roots, directly or indirectly.** A string check cannot enforce that,
-  because the filesystem decides what a path means — so containment is judged on a
-  canonical path, every component resolved through the filesystem, never on the text the
-  client sent. Resolution walks the path down rather than calling `realpath` once,
-  because a single call fails with `ENOENT` on a path that does not exist yet and says
-  nothing about the link already traversed. Refused directly: relative paths (with more
-  than one root there is no base to guess from), `..` escapes, unrelated absolute paths,
-  and a sibling that merely shares a root's name prefix (`/srv/work` does not contain
-  `/srv/work-evil`). Refused indirectly: a symlink leaving the root, a symlinked
-  directory partway along, and a **dangling** link whose destination nothing can confirm
-  — an unprovable target is refused, never assumed to stay inside. A NUL is refused
-  before any syscall sees it, since every syscall truncates there and the containment
-  check would read one path while the open used another. Zero roots is a **closed**
-  allowlist: every path is refused, which is the safe direction to fail. Roots are
-  canonicalized at construction and must be absolute, existing directories. Links that
-  stay *inside* a root are followed normally — containment is not achieved by refusing
-  the feature. Name comparison is case-insensitive only where the platform is. Refusals
-  name the boundary without echoing the resolved target, which would answer the question
-  the traversal was asking.
-- **`test/mcp-workspace.test.js` — 18-case containment suite**, written red against an
+  (Torque MCP build-order step 2.1). The invariant, **with its boundary named**: *at the
+  moment `resolve()` returns*, no client-controlled path names a location outside the
+  configured roots, directly or indirectly. A string check cannot establish that, because
+  the filesystem decides what a path means — so containment is judged on a canonical
+  path, every component resolved through the filesystem in order, never on the text the
+  client sent.
+  - **Not provided: safety across time.** A pathname API cannot promise the path still
+    means the same thing when the caller opens it, and Node exposes no `openat`-style
+    primitive to bind a resolution to an opened directory without a dependency. The
+    result is true as of its return; closing that window is the job of the bound
+    workspace handles in the next sub-step. Named here rather than implied away.
+  - Resolution walks component by component rather than calling `realpath` once: a
+    single call fails with `ENOENT` on a path that does not exist yet, and says nothing
+    about a link already traversed. `..` is applied to where the path has *actually*
+    arrived, after any link — `path.resolve` would collapse it lexically first, turning
+    `<root>/link-to-elsewhere/..` into `<root>`, a different directory than the client
+    named. Climbing past a component that does not exist is refused outright, since the
+    filesystem would give that no answer either.
+  - Refused directly: relative and drive-relative paths (Node calls Windows `\work`
+    absolute, but it means a different place depending on the process's current drive),
+    `..` escapes, unrelated absolute paths, and a sibling that merely shares a root's
+    name prefix (`/srv/work` does not contain `/srv/work-evil`).
+  - Refused indirectly: a symlink leaving the root, a symlinked directory partway along,
+    a **dangling** link whose destination nothing can confirm, a component that is a file
+    rather than a directory, and any component that could not be examined at all —
+    unreadable is not absent, so `EACCES` fails closed rather than being treated as a
+    path that does not exist yet.
+  - Name comparison is **exact, never case-folded**: both sides come from
+    `realpath.native`, which answers with the name the filesystem actually stores, so
+    equivalent spellings have already converged. Lowercasing would be worse than useless
+    — JavaScript's case mapping is not the filesystem's, and `"İ".toLowerCase()` is two
+    code points, so distinct directories could be judged the same one.
+  - Zero roots is a **closed** allowlist: every path is refused. Roots must be fully
+    qualified, existing directories, and are canonicalized at construction. Links that
+    stay *inside* a root are followed normally — containment is not achieved by refusing
+    the feature. Refusals name the boundary without echoing the resolved target, which
+    would answer the question the traversal was asking.
+- **`test/mcp-workspace.test.js` — 24-case containment suite**, written red against an
   absent module and wired into `npm test` (the plugin-shape unwired-suite guard was
-  verified red against it first). Includes the positive control that keeps the suite
-  honest: an implementation that refused every symlink would block all the escapes and
-  still be wrong.
+  verified red against it first). An independent Codex review of the first cut returned
+  "do not ship" with 12 findings — 4 breaking containment — and every accepted one was
+  reproduced before its fix. Four were defects in the tests themselves, now corrected:
+  cases that built their `..` paths with `path.join`, which normalizes the dot segments
+  away before the module ever sees them; a case-comparison test that a mutant with case
+  folding disabled still passed; an assertion that could not fail; and a rationale
+  comment that was simply wrong about how Node handles a NUL. The suite keeps the
+  positive controls that stop it passing for the wrong reason: an implementation that
+  refused every symlink, or every `..`, would block all the escapes and still be broken.
 
 - **`src/mcp/rpc.js` — the Torque MCP RPC kernel with era pinning** (CLI-enforced at the
   kernel boundary; Torque MCP 1.0 build-order step 1 of the ratified spec). A connection
