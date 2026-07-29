@@ -821,6 +821,35 @@ ok('H5 a snapshot at an unknown revision is refused, never written blind', () =>
   assert.ok(stateBytes(proj).equals(before), 'and must move zero bytes');
 });
 
+// --- H6: a partial line does not eat its successor ---------------------------
+
+ok('H6 an append after a half-written line keeps both lines separate', () => {
+  const proj = freshProject('h6');
+  const log = journal.logPath(proj);
+  fs.mkdirSync(path.dirname(log), { recursive: true });
+  // A previous append died mid-line. Without quarantine the next event is
+  // concatenated onto the fragment and BOTH vanish behind one unreadable line.
+  fs.writeFileSync(log, '{"id":"evo_partial","targ', 'utf8');
+
+  const e = journal.appendEvent(proj, { target: 'h6', verdict: 'ASK', chosenMutation: 'after the fragment' });
+  const lines = fs.readFileSync(log, 'utf8').split('\n').filter((l) => l.length);
+  assert.strictEqual(lines.length, 2, `the fragment and the new event must be two lines; got ${lines.length}`);
+  const parsed = lines.map((l) => {
+    try {
+      return JSON.parse(l);
+    } catch (_e) {
+      return null;
+    }
+  });
+  assert.strictEqual(parsed[0], null, 'the fragment stays unreadable — it is damaged, not repairable');
+  assert.ok(parsed[1] && parsed[1].id === e.id, 'the new event must survive intact as its own line');
+  assert.deepStrictEqual(
+    journal.readEvents(proj).map((x) => x.id),
+    [e.id],
+    'and must be the one event the reader returns'
+  );
+});
+
 // --- H8: duplicate ids never hybridize ---------------------------------------
 
 ok('H8 a rebase never merges two records that merely share an id', () => {
@@ -937,6 +966,70 @@ ok('M12 a propose-only agent cannot write through saveState or saveLedger', () =
     delete process.env.RATCHET_AGENT;
   }
   assert.ok(stateBytes(proj).equals(before), 'the refused writes must move zero bytes');
+});
+
+// --- M11: proof is validated under the lock that protects the append ---------
+
+ok('M11 a bound event validates its proof under the journal lock, not before it', () => {
+  const proj = freshProject('m11');
+  const lifecycle = require('../src/lifecycle');
+  fs.mkdirSync(path.join(proj, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(proj, 'src', 'thing.js'), 'module.exports = 1;\n', 'utf8');
+  const art = artifacts.addArtifact(proj, { title: 'm11', kind: 'code', path: 'src/thing.js' });
+  const fp = lifecycle.fingerprint(proj, art);
+
+  // Validation binds evidence to an exact revision and hash. Doing that BEFORE
+  // taking the lock leaves a window in which the artifact is revised, closed, or
+  // re-bound — and the append then lands evidence that was true when it was
+  // checked and false when it was written. fingerprint runs only during
+  // validation, so it is the honest place to ask "was the lock held?".
+  const realFingerprint = lifecycle.fingerprint;
+  const seen = [];
+  lifecycle.fingerprint = function (cwd, artifact) {
+    seen.push(fs.existsSync(journalLockDir(proj)));
+    return realFingerprint.call(lifecycle, cwd, artifact);
+  };
+  try {
+    journal.appendEvent(
+      proj,
+      {
+        target: 'src/thing.js',
+        artifactId: art.id,
+        verdict: 'KEEP',
+        verification: { commands: [{ command: 'node -e 0', pass: true }], result: 'pass' },
+        seam: { evidenceType: 'test', testedSeam: 'x', shipSeam: 'x', seamMatch: 'exact', independentFromBuilderMethod: true },
+      },
+      { verifiedHash: fp.hash, verifiedRev: fp.rev }
+    );
+  } finally {
+    lifecycle.fingerprint = realFingerprint;
+  }
+
+  assert.ok(seen.length, 'the append must actually validate the binding');
+  assert.ok(
+    seen.every((locked) => locked),
+    `every validation of a bound event must run under the journal lock — ${seen.filter((l) => !l).length} of ${seen.length} did not`
+  );
+});
+
+// --- M13: one identity, one event --------------------------------------------
+
+ok('M13 a supplied event id that is already on the log is refused', () => {
+  const proj = freshProject('m13');
+  const first = journal.appendEvent(proj, { id: 'evo_hand_1', target: 'm13', verdict: 'ASK' });
+  assert.strictEqual(first.id, 'evo_hand_1', 'an unbound event may still carry a caller id');
+  assert.throws(
+    () => journal.appendEvent(proj, { id: 'evo_hand_1', target: 'm13', verdict: 'REVERT' }),
+    /already on the log/,
+    'but not a second time — one identity names one event'
+  );
+  // The log is shared across this suite's projects (one RATCHET_EVOLVE_LOG), so
+  // count the identity in question, not the file.
+  assert.strictEqual(
+    journal.readEvents(proj).filter((e) => e && e.id === 'evo_hand_1').length,
+    1,
+    'and the refused append writes no line — one identity, one event'
+  );
 });
 
 fs.rmSync(tmp, { recursive: true, force: true });

@@ -16,22 +16,34 @@ function logPath(cwd = process.cwd()) {
   return path.join(cwd, '.ratchet', 'evolve-log.jsonl');
 }
 
+// A malformed line is a LOST EVENT. Dropping it silently means the trail is
+// short by one and every count derived from it is wrong with no sign that it is.
+// Warned once per read (not once per line) so a damaged log is impossible to
+// miss and impossible to drown in.
+let _warnedMalformed = '';
+
 function readEvents(cwd = process.cwd()) {
   const file = logPath(cwd);
   if (!fs.existsSync(file)) return [];
-  return fs
-    .readFileSync(file, 'utf8')
-    .split('\n')
-    .map((l) => l.trim())
-    .filter(Boolean)
-    .map((l) => {
-      try {
-        return JSON.parse(l);
-      } catch (_e) {
-        return null;
-      }
-    })
-    .filter(Boolean);
+  const events = [];
+  let malformed = 0;
+  for (const raw of fs.readFileSync(file, 'utf8').split('\n')) {
+    const line = raw.trim();
+    if (!line) continue;
+    try {
+      events.push(JSON.parse(line));
+    } catch (_e) {
+      malformed++;
+    }
+  }
+  if (malformed && _warnedMalformed !== `${file}:${malformed}`) {
+    _warnedMalformed = `${file}:${malformed}`;
+    process.stderr.write(
+      `[ratchet] ${malformed} unreadable line(s) in ${file} — those events are NOT counted in any verdict, ` +
+        'proof, or closure check. Repair or archive the log before trusting a count from it.\n'
+    );
+  }
+  return events;
 }
 
 function dateStamp(iso) {
@@ -165,26 +177,74 @@ function resolveBinding(cwd, fields, opts) {
   };
 }
 
+// An append that died mid-line leaves the file not ending in a newline, and the
+// NEXT append then concatenates itself onto that fragment: one malformed line
+// where there should be a damaged one and a good one, so the new event is lost
+// too. Terminate the fragment first — it stays malformed and gets counted as
+// such by readEvents, but it stops eating its successors.
+function quarantinePartialLine(file) {
+  let size = 0;
+  try {
+    size = fs.statSync(file).size;
+  } catch (_e) {
+    return; // no file yet
+  }
+  if (!size) return;
+  const fd = fs.openSync(file, 'r');
+  try {
+    const tail = Buffer.alloc(1);
+    fs.readSync(fd, tail, 0, 1, size - 1);
+    if (tail[0] === 0x0a) return;
+  } finally {
+    fs.closeSync(fd);
+  }
+  fs.appendFileSync(file, '\n', 'utf8');
+  process.stderr.write(
+    `[ratchet] ${file} did not end on a line boundary — an append died mid-event. Closed the partial line so ` +
+      'this event is not swallowed by it; the fragment stays on the log as an unreadable line.\n'
+  );
+}
+
 function appendEvent(cwd, fields, opts = {}) {
   const f = fields || {};
-  const binding = String(f.artifactId || '').trim() ? resolveBinding(cwd, f, opts) : null;
-  const event = newEvent(binding ? { ...f, ...binding } : f);
-  // Proof gate: refuse to persist a KEEP without verification evidence. Throws
-  // before any write, so the log never contains an unproven kept mutation.
-  validateKeepGate(event);
   const file = logPath(cwd);
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  // Naming the event and appending it are ONE step. Split, two processes read
-  // the same log, mint the same id, and the second append is a duplicate
-  // identity on a record whose whole job is to be the trail. The lock lives
-  // beside the log, not in the workspace store: the log's path is
-  // caller-selectable (RATCHET_EVOLVE_LOG), so the workspace lock would be the
-  // wrong scope in both directions.
-  require('../state').withFileLock(file, 'evolve append', () => {
-    if (!event.id) event.id = nextId(cwd, event.timestamp);
+  // Make sure the store exists BEFORE taking the journal lock. Validation reads
+  // state, a first read CREATES it, and creating it takes the workspace lock —
+  // and the order is workspace → file, never the reverse. Doing it here keeps
+  // the whole validation below inside the lock without inverting the order.
+  require('../state').loadState(cwd);
+  return require('../state').withFileLock(file, 'evolve append', () => {
+    // Validation happens UNDER the lock, not before it: the artifact can be
+    // revised, closed, or re-bound between a pre-flight check and the append,
+    // and evidence validated against a revision that is no longer current is
+    // exactly the stale proof the binding exists to refuse.
+    const binding = String(f.artifactId || '').trim() ? resolveBinding(cwd, f, opts) : null;
+    const event = newEvent(binding ? { ...f, ...binding } : f);
+    // Proof gate: refuse to persist a KEEP without verification evidence. Throws
+    // before any write, so the log never contains an unproven kept mutation.
+    validateKeepGate(event);
+    // Naming the event and appending it are ONE step. Split, two processes read
+    // the same log, mint the same id, and the second append is a duplicate
+    // identity on a record whose whole job is to be the trail. The lock lives
+    // beside the log, not in the workspace store: the log's path is
+    // caller-selectable (RATCHET_EVOLVE_LOG), so the workspace lock would be the
+    // wrong scope in both directions.
+    if (!event.id) {
+      event.id = nextId(cwd, event.timestamp);
+    } else if (readEvents(cwd).some((e) => e && String(e.id) === String(event.id))) {
+      // REFUSED, not regenerated. A caller that supplies an id is naming a
+      // specific event; quietly renaming it would leave the caller holding an id
+      // that means something else on the log, which is worse than a hard stop.
+      throw new Error(
+        `event id "${event.id}" is already on the log — refusing to append a second event under one identity. ` +
+          'Omit "id" and the CLI mints one.'
+      );
+    }
+    quarantinePartialLine(file);
     fs.appendFileSync(file, JSON.stringify(event) + '\n', 'utf8');
+    return event;
   });
-  return event;
 }
 
 function status(cwd = process.cwd()) {
