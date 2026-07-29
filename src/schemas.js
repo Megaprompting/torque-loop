@@ -17,6 +17,11 @@ function newState(clock) {
   const t = nowIso(clock);
   return {
     version: STATE_VERSION,
+    // Monotonic write counter, incremented by saveState. Dormant in 0.8 —
+    // nothing reads it. It ships now because a lost-update check added later
+    // can only work if the counter already exists in the wild; a state file
+    // written before it started counting can never be retro-numbered.
+    rev: 0,
     createdAt: t,
     updatedAt: t,
     title: '',
@@ -62,7 +67,10 @@ const STATE_COLLECTIONS = {
   history: 'hist',
 };
 
-// Top-level scalar fields that `state set` accepts.
+// Top-level scalar fields that `state set` accepts. `dirty` and `lastCompileAt`
+// are deliberately absent: they are the checkpoint, and a checkpoint you can
+// assert by hand is not a record of anything. `ratchet compile done` is the only
+// transition that moves them.
 const STATE_SCALARS = new Set([
   'title',
   'objective',
@@ -71,8 +79,6 @@ const STATE_SCALARS = new Set([
   'nextAction',
   'nextCommand',
   'confidence',
-  'dirty',
-  'lastCompileAt',
 ]);
 
 const LEDGER_COLLECTIONS = {
@@ -82,6 +88,22 @@ const LEDGER_COLLECTIONS = {
 };
 
 const SEVERITIES = ['critical', 'high', 'medium', 'low', 'info'];
+
+// The ONE rule for what an artifact's holes are. It takes the owning record, not
+// the value, because ABSENCE is the only thing that means zero — and absence is
+// a fact about the object, not about the value's truthiness. `holes: ""`,
+// `null`, `0` and `false` are values somebody wrote, and a value somebody wrote
+// is at least one unexplained hole.
+//
+// It lives here, used by BOTH the artifacts writer and the closure gate, because
+// two copies of this rule is exactly how they came to disagree: the gate counted
+// a falsey hole while the writer erased it, so an artifact could lose a blocker
+// at birth that the gate would have raised had it survived to disk.
+function normalizeHoles(owner) {
+  if (!owner || !Object.prototype.hasOwnProperty.call(owner, 'holes')) return [];
+  const raw = owner.holes;
+  return Array.isArray(raw) ? raw.map((x) => String(x)) : [String(raw)];
+}
 
 // The fog loop's text prefix. One constant, two ends of the lifecycle: the CLI
 // opens a loop with this prefix when `score aperture` raises mapRequired, and
@@ -95,6 +117,28 @@ const PHASES = ['idle', 'lock', 'auction', 'cut', 'build', 'attack', 'patch', 'c
 // for `resolved`. A defect only leaves the terminal set by being reopened.
 const DEFECT_STATUSES = ['open', 'patched', 'reopened', 'resolved', 'waived', 'superseded', 'closed'];
 const DEFECT_TERMINAL_STATUSES = ['resolved', 'closed', 'waived', 'superseded'];
+// `closed` is READ-ONLY: it stays terminal for stores written before 0.3, but it
+// is not a status anything may transition INTO. It was the one terminal status
+// with no proof attached to it, so writing it cleared the drain with no evidence
+// while `resolved` next door demanded --evidence.
+const DEFECT_WRITABLE_STATUSES = DEFECT_STATUSES.filter((s) => s !== 'closed');
+
+// Artifact lifecycle exits. Each is reached by a gated verb (`artifact close`,
+// `retract`) and none may be asserted in an `artifact add` payload — a status
+// that can be typed is not a gate.
+const ARTIFACT_TERMINAL_STATUSES = ['closed', 'retracted', 'superseded'];
+// Fields the CLI writes as the record of a gated transition. A caller that
+// could supply them could forge a closure certificate in a JSON payload.
+const ARTIFACT_RESERVED_FIELDS = [
+  'rev',
+  'closedAt',
+  'closedBy',
+  'closedRev',
+  'closedHash',
+  'holesWaiver',
+  'retracted',
+  'supersededBy',
+];
 
 module.exports = {
   STATE_VERSION,
@@ -106,8 +150,12 @@ module.exports = {
   STATE_SCALARS,
   LEDGER_COLLECTIONS,
   SEVERITIES,
+  normalizeHoles,
   FOG_LOOP_PREFIX,
   PHASES,
   DEFECT_STATUSES,
   DEFECT_TERMINAL_STATUSES,
+  DEFECT_WRITABLE_STATUSES,
+  ARTIFACT_TERMINAL_STATUSES,
+  ARTIFACT_RESERVED_FIELDS,
 };

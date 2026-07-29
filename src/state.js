@@ -20,15 +20,111 @@ function baseDir() {
   return path.join(home, '.ratchet');
 }
 
-function projectSlug(cwd) {
-  const root = cwd || process.cwd();
+function slugFor(root, lowercase) {
   const name = path
     .basename(root)
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '') || 'project';
-  const hash = crypto.createHash('sha1').update(path.resolve(root)).digest('hex').slice(0, 8);
+  const resolved = path.resolve(root);
+  const hash = crypto
+    .createHash('sha1')
+    .update(lowercase ? resolved.toLowerCase() : resolved)
+    .digest('hex')
+    .slice(0, 8);
   return `${name}-${hash}`;
+}
+
+// Recovering the true casing must NOT follow aliases. realpath dereferences:
+// `C:\Users\All Users` comes back as `C:\ProgramData`, so a session run through
+// a junction silently adopts the target's store — and the alias-keyed store it
+// used to write is never migrated or conflict-detected, because nothing computes
+// its slug again. readdir returns the junction's OWN name, so walking segment by
+// segment corrects the casing while leaving the alias its own identity.
+//
+// A segment whose parent is unreadable, or that does not exist yet, keeps its
+// lexical spelling — a store dir is often computed before the project exists.
+const _caseCache = new Map();
+
+function caseExactPath(cwd) {
+  const lexical = path.resolve(cwd || process.cwd());
+  if (process.platform !== 'win32') return lexical;
+  const cached = _caseCache.get(lexical);
+  if (cached) return cached;
+
+  const parsed = path.parse(lexical);
+  // Drive letters are case-insensitive and readdir cannot report their casing,
+  // so canonicalize them; otherwise `c:\x` and `C:\x` fork into two stores.
+  let current = parsed.root.toUpperCase();
+  for (const seg of lexical.slice(parsed.root.length).split(path.sep).filter(Boolean)) {
+    let actual = seg;
+    try {
+      const lower = seg.toLowerCase();
+      const match = fs.readdirSync(current).find((e) => e.toLowerCase() === lower);
+      if (match) actual = match;
+    } catch (_e) {
+      /* unreadable or missing parent — keep the lexical spelling */
+    }
+    current = path.join(current, actual);
+  }
+  // The hook path calls this on every invocation; the walk is one readdir per
+  // segment, so memoize it. A CLI process is short-lived enough that a rename
+  // mid-run is not a case worth invalidating for.
+  _caseCache.set(lexical, current);
+  return current;
+}
+
+// The slug a pre-0.8 store was created under: hashed from the path's TRUE
+// casing, not the caller's. Deriving it from the caller meant a caller who
+// happened to type lowercase produced legacy === normalized, the migration
+// check short-circuited, and the real mixed-case store was stranded behind a
+// fresh empty one — forever, because the trigger depended on a casing the
+// caller no longer supplied.
+function legacySlugFor(cwd) {
+  return slugFor(caseExactPath(cwd), false);
+}
+
+function normalizedSlugFor(cwd) {
+  if (process.platform !== 'win32') return slugFor(cwd || process.cwd(), false);
+  return slugFor(caseExactPath(cwd), true);
+}
+
+// Windows paths are case-insensitive, so `D:\Repo` and `d:\repo` are one
+// project — but hashing the raw casing gave them two separate stores, and a
+// session that spelled the cwd differently silently resumed from an empty one.
+// Normalize by lowercasing before the hash.
+//
+// A store created under the old casing is MIGRATED, once, by moving it to the
+// normalized slug. Merely reading it in place would require this discovery to
+// succeed on every future call, and it does not: spell the cwd in its already-
+// lowercase form and `normalized === legacy`, the discovery never runs, and the
+// old store is stranded while a fresh empty one opens beside it.
+function projectSlug(cwd) {
+  const root = cwd || process.cwd();
+  if (process.platform !== 'win32') return slugFor(root, false);
+  // Both slugs come from the on-disk casing, so the answer no longer depends on
+  // how the caller spelled the path. When the true path is already all-lowercase
+  // the two coincide and there is genuinely nothing to migrate.
+  const normalized = normalizedSlugFor(root);
+  const legacy = legacySlugFor(root);
+  if (normalized === legacy) return normalized;
+
+  const projects = path.join(baseDir(), 'projects');
+  const legacyDir = path.join(projects, legacy);
+  const normalizedDir = path.join(projects, normalized);
+  if (!fs.existsSync(legacyDir)) return normalized;
+
+  // Both exist: two records for one project. Merging is not ours to invent and
+  // picking one silently loses the other, so name both and stop.
+  if (fs.existsSync(normalizedDir)) {
+    throw new Error(
+      `ratchet store conflict — both of these exist for one project:\n  ${legacyDir} (legacy casing)\n  ${normalizedDir} (normalized)\n` +
+        'Merge or delete one by hand — refusing to guess which record is the real one.'
+    );
+  }
+  fs.renameSync(legacyDir, normalizedDir);
+  process.stderr.write(`[ratchet] migrated store ${legacy} → ${normalized} (Windows path casing normalized).\n`);
+  return normalized;
 }
 
 function projectDir(cwd) {
@@ -70,7 +166,10 @@ function writeJson(file, obj) {
 // <file>.corrupt.<timestamp>.json, warn, then let the caller reinitialize.
 function backupCorrupt(file, raw) {
   try {
-    const stamp = schemas.nowIso().replace(/[:.]/g, '-');
+    // The stamp comes from nowIso, which reads RATCHET_NOW — caller-controlled
+    // text landing in a filename. Allowlist it to [0-9A-Za-z-] so no separator,
+    // drive letter, or traversal can steer where the backup is written.
+    const stamp = String(schemas.nowIso()).replace(/[^0-9A-Za-z]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'unstamped';
     const dest = `${file}.corrupt.${stamp}.json`;
     fs.writeFileSync(dest, raw, 'utf8');
     process.stderr.write(
@@ -78,7 +177,7 @@ function backupCorrupt(file, raw) {
     );
     return dest;
   } catch (_e) {
-    return null; // best effort; never block the session over a backup
+    return null; // the caller decides; a failed backup must not become a delete
   }
 }
 
@@ -86,14 +185,31 @@ function readJsonResilient(file) {
   let raw;
   try {
     raw = fs.readFileSync(file, 'utf8');
-  } catch (_e) {
-    return null; // missing / unreadable → caller creates fresh
+  } catch (e) {
+    // ENOENT is the only error that means "there is no record yet". Anything
+    // else — an ACL that denies read but permits write, a lock, EIO — means the
+    // record EXISTS and cannot be seen, and returning null tells the caller to
+    // reinitialize straight over it.
+    if (e && e.code === 'ENOENT') return null;
+    throw new Error(
+      `${path.basename(file)} exists but could not be read (${e && e.code ? e.code : 'unknown error'}) — ` +
+        'refusing to reinitialize over a record that is present but unreadable. Fix access, then re-run.'
+    );
   }
   if (!raw.trim()) return null; // empty file → fresh, no noisy backup
   try {
     return JSON.parse(raw);
   } catch (_e) {
-    backupCorrupt(file, raw);
+    // Returning null tells the caller to reinitialize, which overwrites this
+    // file. Only say that once the bad bytes are safely copied: if the backup
+    // failed, the corrupt file is the ONLY copy of the record and clobbering it
+    // is a silent data loss the tool's whole promise forbids.
+    if (!backupCorrupt(file, raw)) {
+      throw new Error(
+        `${path.basename(file)} is malformed and could not be backed up — refusing to reinitialize over the only copy. ` +
+          'Move or repair the file by hand, then re-run.'
+      );
+    }
     return null;
   }
 }
@@ -102,13 +218,25 @@ function readJsonResilient(file) {
 // State lifecycle.
 // ---------------------------------------------------------------------------
 
-function initProject(cwd, { force = false } = {}) {
+function initProject(cwd, { force = false, resetBy = '', resetReason = '' } = {}) {
   ensureDir(projectDir(cwd));
   const sPath = statePath(cwd);
   const lPath = ledgerPath(cwd);
   let created = false;
   if (force || !fs.existsSync(sPath)) {
-    writeJson(sPath, schemas.newState());
+    const fresh = schemas.newState();
+    // A wipe destroys the only record of why the wipe happened. The tombstone is
+    // the one line that survives it, so the next cold session reads "danny reset
+    // this on 2026-07-29 to start a new run" instead of an unexplained blank.
+    if (resetBy || resetReason) {
+      fresh.history.push({
+        id: makeId('hist'),
+        at: fresh.createdAt,
+        event: 'state.reset',
+        note: `state wiped by ${resetBy || 'unnamed'} — ${resetReason || 'no reason recorded'}`,
+      });
+    }
+    writeJson(sPath, fresh);
     created = true;
   }
   if (force || !fs.existsSync(lPath)) {
@@ -129,6 +257,9 @@ function loadState(cwd) {
 
 function saveState(cwd, state) {
   state.updatedAt = schemas.nowIso();
+  // Lazy migration: a pre-0.8 file has no rev, so it counts as 0 and starts
+  // counting on its next write. Nothing rewrites it just to add the field.
+  state.rev = (Number.isInteger(state.rev) ? state.rev : 0) + 1;
   writeJson(statePath(cwd), state);
   return state;
 }
@@ -159,6 +290,8 @@ function makeId(prefix) {
 module.exports = {
   baseDir,
   projectSlug,
+  normalizedSlugFor,
+  legacySlugFor,
   projectDir,
   statePath,
   ledgerPath,

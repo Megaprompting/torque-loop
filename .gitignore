@@ -1,7 +1,15 @@
 node_modules/
 *.log
 .DS_Store
+.env
+.env.*
 .ratchet/
+.lucid/
 # Local state written during self-tests
 /tmp/
 scratchpad/
+
+# Private strategy / FABLE docs — never publish to the public repo
+reference/PROBLEM-STATEMENT-*.md
+reference/private/
+*.private.md

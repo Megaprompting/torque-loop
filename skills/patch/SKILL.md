@@ -47,13 +47,17 @@ REMAINING DEFECTS: <still-open items, or "none">
 
 ## Serialize
 
-Mark resolved defects and record the patch as forward motion:
+Clear the ORIGINAL defect with the proof that it is fixed. Do not record a second,
+already-resolved defect: a defect cannot be born terminal (the CLI refuses it), and a
+freshly-minted "resolved" record leaves the real one draining forever.
 
 ```
-ratchet defect add '{"severity":"info","summary":"patched: <defect> — retest pass","status":"resolved"}'
+ratchet defect resolve <original-defect-id> --evidence "<the retest result that proves it>"
 ratchet state set phase patch
 ratchet score confidence
 ```
+
+Anything still failing stays open and honest — `ratchet defect list` shows what drains.
 
 Next: if defects remain critical/high, loop back to `/ratchet:attack`. If clear,
 `/ratchet:compile` to serialize the advance.

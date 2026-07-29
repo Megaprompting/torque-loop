@@ -5,6 +5,7 @@ const scoring = require('./scoring');
 const journal = require('./evolve/journal');
 const gitRefs = require('./gitRefs');
 const coldStart = require('./coldStart');
+const lifecycle = require('./lifecycle');
 
 // The receipt: one stable, always-same-shape answer to "what is true, what
 // changed, what was proven, what is at risk, what is safe, and what happens
@@ -58,9 +59,27 @@ function assemble(cwd = process.cwd()) {
   }
   const lastEvent = events.length ? events[events.length - 1] : null;
   const lastKeep = [...events].reverse().find((e) => e && e.verdict === 'KEEP') || null;
-  // Seam is read from the most recent proven KEEP if there is one, else the last
-  // event — a REVERT still carries the seam it was judged on.
-  const seamSource = lastKeep || lastEvent;
+
+  // Whose proof is this? The KEEP bound to the ACTIVE artifact's exact current
+  // revision — not the last KEEP anyone happened to log. A global KEEP that
+  // merely matches by path or title is legacy evidence: it still renders (it is
+  // real information) but it is labelled display-only, because authorizing a
+  // closure on someone else's proof is the whole failure this release closes.
+  const active = lifecycle.activeArtifact(s);
+  let boundKeep = null;
+  if (active) {
+    try {
+      boundKeep = lifecycle.bindingEvent(active, events, lifecycle.fingerprint(cwd, active));
+    } catch (_e) {
+      boundKeep = null; // an unbindable path is not authority either
+    }
+  }
+  const displayKeep = boundKeep || lastKeep;
+  const keepBinding = boundKeep ? 'bound' : displayKeep ? 'legacy-unbound' : 'none';
+  // Seam is read from the bound proof if there is one, else the most recent
+  // proven KEEP, else the last event — a REVERT still carries the seam it was
+  // judged on.
+  const seamSource = boundKeep || lastKeep || lastEvent;
 
   const layers = scoring.scoreConfidenceLayers(s, ledger, events);
 
@@ -118,17 +137,20 @@ function assemble(cwd = process.cwd()) {
     .filter((d) => (d.status === 'resolved' || d.status === 'closed') && d.evidence)
     .map((d) => ({ id: d.id, summary: d.summary, evidence: d.evidence }));
 
-  const keepCard = lastKeep
+  const keepCard = displayKeep
     ? {
-        id: lastKeep.id || '',
-        target: lastKeep.target || '',
-        mutation: lastKeep.chosenMutation || '',
-        mode: lastKeep.mode || '',
-        evidenceType: (lastKeep.seam && lastKeep.seam.evidenceType) || '',
-        result: (lastKeep.verification && lastKeep.verification.result) || '',
-        commands: (lastKeep.verification && lastKeep.verification.commands) || [],
-        manualChecks: (lastKeep.verification && lastKeep.verification.manualChecks) || [],
-        independent: lastKeep.seam ? lastKeep.seam.independentFromBuilderMethod : null,
+        id: displayKeep.id || '',
+        target: displayKeep.target || '',
+        mutation: displayKeep.chosenMutation || '',
+        mode: displayKeep.mode || '',
+        evidenceType: (displayKeep.seam && displayKeep.seam.evidenceType) || '',
+        result: (displayKeep.verification && displayKeep.verification.result) || '',
+        commands: (displayKeep.verification && displayKeep.verification.commands) || [],
+        manualChecks: (displayKeep.verification && displayKeep.verification.manualChecks) || [],
+        independent: displayKeep.seam ? displayKeep.seam.independentFromBuilderMethod : null,
+        binding: keepBinding,
+        artifactId: displayKeep.artifactId || '',
+        artifactRev: displayKeep.artifactRev != null ? displayKeep.artifactRev : null,
       }
     : null;
 
@@ -212,6 +234,11 @@ function assemble(cwd = process.cwd()) {
       keep: keepCard,
       seam,
       shipDecision,
+      // Whether the evidence above can actually authorize closing the active
+      // artifact. A ship decision is a judgment about a seam; this is a fact
+      // about a binding, and only the fact opens the closure gate.
+      canAuthorizeClosure: Boolean(boundKeep),
+      binding: keepBinding,
       resolvedWithEvidence,
     },
     verdict: {
@@ -234,7 +261,8 @@ function assemble(cwd = process.cwd()) {
       retractedArtifacts,
       seamWaivers,
       enforced: [
-        'state reset — requires --force',
+        'state reset — requires --force + --owner + --reason',
+        'artifact close — requires a KEEP bound to this exact revision',
         'defect resolve — requires --evidence',
         'defect waive — requires --owner + --reason',
         'artifact retract — requires --reason',
@@ -261,10 +289,14 @@ function assemble(cwd = process.cwd()) {
             }
           : null,
     },
+    closure: lifecycle.workflowClosed(s, events, cwd),
     next: {
       action: s.nextAction || '',
       command: s.nextCommand || '',
       edge: lastEvent ? lastEvent.nextEdge || '' : '',
+      // Derived, never stored: the recorded next command is what someone typed,
+      // this is what the record owes.
+      transition: lifecycle.nextTransition(s, events, cwd),
     },
     gaps: openLoops.map((l) => ({ text: l.text, status: l.status })),
   };

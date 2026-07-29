@@ -25,8 +25,12 @@ Each iteration:
    and `/ratchet:auction` logic to pick it.)
 2. **Build** the artifact or the fix (`/ratchet:build`).
 3. **Attack** it with the five-voice board (`/ratchet:attack`); record defects.
-4. **Patch** only what failed (`/ratchet:patch`); retest.
-5. **Compile** the advance (`/ratchet:compile`); recompute confidence.
+4. **Patch** only what failed (`/ratchet:patch`); resolve the original defect with evidence.
+5. **Verify** bound to the artifact (`/ratchet:verify`); on green, `ratchet artifact close <id>`.
+6. **Compile** the advance (`/ratchet:compile`); recompute confidence.
+
+The cycle is build → attack → patch → verify → compile. Compiling before verifying
+records an unproven state as if it were an advance.
 
 Report each iteration compactly:
 
@@ -36,16 +40,23 @@ ITERATION n: discovered <gap> → built <thing> → attack <c crit / h high> →
 
 ## Stop condition (all must hold)
 
-Run `ratchet score confidence` and read `loopClear`. Stop only when:
+Run `ratchet score confidence` and read BOTH `loopClear` and the workflow-closure layer
+(`closure.closed`). Stop only when:
 
-- **No unresolved critical or high defect.**
-- **No untested core assumption.**
-- **No missing next action.**
+- **`loopClear` holds** — no unresolved critical/high defect, no untested core assumption,
+  no missing next action.
+- **`workflowClosed.closed` is true** — the active artifact carries a closure certificate
+  and no open defect is unattached.
 - **The artifact is genuinely usable** (passes its 5-point test).
 
-If any fails, run another iteration. Do not stop because the output "looks good" — the CLI
-confidence read is the arbiter, not your impression. Do not loop forever either: if two
-consecutive iterations find nothing new, declare convergence and stop.
+If either read is false, run another iteration. Do not stop because the output "looks
+good" — the CLI reads are the arbiter, not your impression.
+
+There is no convergence escape. If two iterations find nothing new while
+`workflowClosed.closed` is false, you are not converged — you are blocked. Stop with
+`STOP REASON: blocked-needs-human`, name the blocker the closure read printed, and hand it
+over. "Nothing left to try" and "finished" are different states, and only one of them is
+an ending.
 
 ## Output contract
 
@@ -53,7 +64,8 @@ consecutive iterations find nothing new, declare convergence and stop.
 ITERATION LOG:
 - ITERATION 1: ...
 - ITERATION 2: ...
-STOP REASON: loop-clear | converged | blocked-needs-human
+STOP REASON: closed | blocked-needs-human
+WORKFLOW: CLOSED | NOT CLOSED — <blockers, if any>
 FINAL CONFIDENCE: <score>/100 (<band>)
 REMAINING RISK: <what a human should still watch>
 NEXT: <action> → /ratchet:<command>

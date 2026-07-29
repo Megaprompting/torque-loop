@@ -25,6 +25,7 @@ const gitRefs = require('../src/gitRefs');
 const coldStart = require('../src/coldStart');
 const receipt = require('../src/receipt');
 const journal = require('../src/evolve/journal');
+const lifecycle = require('../src/lifecycle');
 const cli = require('../src/cli');
 
 let passed = 0;
@@ -203,7 +204,10 @@ ok('aperture meters loop depth from uncertainty', () => {
   assert.strictEqual(snap.score, 0);
   assert.strictEqual(snap.level, 'A0');
   assert.strictEqual(snap.implement, true);
-  assert.deepStrictEqual(snap.sequence, ['build', 'verify']);
+  // 0.8 contract change (deliberate, not a weakened assertion): every metered
+  // sequence ends on compile, including A0. A snap that never serializes leaves
+  // the work unrecorded, which is the one outcome the loop exists to prevent.
+  assert.deepStrictEqual(snap.sequence, ['build', 'verify', 'compile']);
 
   const mid = scoring.scoreAperture({ ambiguity: 1, terrain: 1, taste: 1, blastRadius: 1, reversibility: 1 });
   assert.strictEqual(mid.score, 5);
@@ -214,6 +218,21 @@ ok('aperture meters loop depth from uncertainty', () => {
   assert.strictEqual(max.level, 'A4');
   assert.strictEqual(max.implement, false, 'A4 must not build before constraints are locked');
   assert.ok(!max.sequence.includes('build'), 'A4 produces options, not code');
+});
+
+ok('every metered sequence ends on compile, and verify follows the last build', () => {
+  // Two invariants, not five hardcoded lists: a sequence that stops before
+  // compile loses the work, and a sequence that builds after its last verify
+  // ships something nothing ever ran.
+  for (const band of scoring.APERTURE_LEVELS) {
+    const seq = band.sequence;
+    assert.strictEqual(seq[seq.length - 1], 'compile', `${band.level} ends on compile (got ${seq.join(' → ')})`);
+    if (seq.includes('build')) {
+      const lastWrite = Math.max(seq.lastIndexOf('build'), seq.lastIndexOf('patch'));
+      const verifyAt = seq.lastIndexOf('verify');
+      assert.ok(verifyAt > lastWrite, `${band.level} verifies after its last build/patch (got ${seq.join(' → ')})`);
+    }
+  }
 });
 
 ok('aperture defaults a missing dimension to neutral, not certain', () => {
@@ -298,6 +317,202 @@ ok('corrupt state.json is backed up, not silently lost', () => {
   assert.ok(backups.length >= 1, 'a corrupt backup exists');
   const raw = fs.readFileSync(path.join(dir, backups[0]), 'utf8');
   assert.ok(raw.includes('this is not valid json'), 'backup preserves the original bad bytes');
+});
+
+// --- store integrity (0.8 Closure Gate) -------------------------------------
+
+ok('state carries a monotonic rev that increments on every write and survives load', () => {
+  // Dormant in 0.8: nothing reads it. It exists so a later version can detect a
+  // lost update without a migration — which is only possible if it starts now.
+  state.initProject(cwd, { force: true });
+  const fresh = state.loadState(cwd);
+  assert.strictEqual(fresh.rev, 0, 'a fresh state opens at rev 0');
+  state.saveState(cwd, fresh);
+  assert.strictEqual(state.loadState(cwd).rev, 1, 'the first write is rev 1');
+  const second = state.loadState(cwd);
+  state.saveState(cwd, second);
+  assert.strictEqual(state.loadState(cwd).rev, 2, 'rev increments across writes and survives a reload');
+  // a legacy (pre-0.8) state file has no rev — it is read as 0, lazily, never migrated
+  const legacy = state.loadState(cwd);
+  delete legacy.rev;
+  state.writeJson(state.statePath(cwd), legacy);
+  assert.strictEqual(state.loadState(cwd).rev, undefined, 'load does not rewrite a legacy file');
+  state.saveState(cwd, state.loadState(cwd));
+  assert.strictEqual(state.loadState(cwd).rev, 1, 'a missing rev counts as 0, so the next write is 1');
+});
+
+ok('a corrupt state file is never clobbered when its backup fails', () => {
+  // The only copy of the record is the corrupt one. If we cannot preserve it,
+  // reinitializing destroys it — so refuse instead.
+  const proj = path.join(tmp, 'corrupt-unbackupable');
+  state.initProject(proj, { force: true });
+  const sp = state.statePath(proj);
+  fs.writeFileSync(sp, '{ broken', 'utf8');
+  const origWrite = fs.writeFileSync;
+  fs.writeFileSync = (file, ...rest) => {
+    if (String(file).includes('.corrupt.')) throw new Error('disk full');
+    return origWrite(file, ...rest);
+  };
+  try {
+    assert.throws(() => state.loadState(proj), /could not be backed up|refusing/i);
+  } finally {
+    fs.writeFileSync = origWrite;
+  }
+  assert.strictEqual(fs.readFileSync(sp, 'utf8'), '{ broken', 'the only copy is still on disk, untouched');
+});
+
+ok('the corrupt-backup filename is sanitized, not taken from the clock verbatim', () => {
+  const proj = path.join(tmp, 'corrupt-stamp');
+  state.initProject(proj, { force: true });
+  fs.writeFileSync(state.statePath(proj), 'nope{', 'utf8');
+  const prevNow = process.env.RATCHET_NOW;
+  process.env.RATCHET_NOW = '../../escape/2026-07-29T00:00:00.000Z';
+  try {
+    state.loadState(proj);
+  } finally {
+    if (prevNow == null) delete process.env.RATCHET_NOW;
+    else process.env.RATCHET_NOW = prevNow;
+  }
+  const backups = fs.readdirSync(path.dirname(state.statePath(proj))).filter((f) => f.includes('.corrupt.'));
+  assert.ok(backups.length >= 1, 'the backup landed');
+  for (const b of backups) {
+    assert.ok(!/[\\/]/.test(b), `backup name has no path separators: ${b}`);
+    assert.ok(/^state\.json\.corrupt\.[0-9A-Za-z-]+\.json$/.test(b), `backup name is allowlisted: ${b}`);
+  }
+});
+
+ok('an unreadable state file is never mistaken for a missing one', () => {
+  // ENOENT means "no state yet" and a fresh one is right. Any OTHER read error —
+  // an ACL that denies read but permits write, a locked file, EIO — means the
+  // record EXISTS and we cannot see it, and reinitializing over it is a silent
+  // wipe of the one thing this tool promises to keep.
+  const proj = path.join(tmp, 'unreadable');
+  state.initProject(proj, { force: true });
+  const sp = state.statePath(proj);
+  const marker = JSON.stringify({ version: 1, objective: 'still here' });
+  fs.writeFileSync(sp, marker, 'utf8');
+
+  const origRead = fs.readFileSync;
+  fs.readFileSync = (file, ...rest) => {
+    if (String(file) === sp) {
+      const e = new Error('permission denied');
+      e.code = 'EACCES';
+      throw e;
+    }
+    return origRead(file, ...rest);
+  };
+  try {
+    assert.throws(() => state.loadState(proj), /EACCES|could not be read|refusing/i);
+  } finally {
+    fs.readFileSync = origRead;
+  }
+  assert.strictEqual(fs.readFileSync(sp, 'utf8'), marker, 'the record survived the failed read');
+  // ENOENT still means a clean start
+  fs.rmSync(sp, { force: true });
+  assert.ok(state.loadState(proj).version, 'a missing file still auto-initializes');
+});
+
+ok('two casings of one Windows path resolve to a single store', () => {
+  // Windows paths are case-insensitive; a slug that hashes the raw casing splits
+  // one project into two stores depending on how the shell spelled the cwd.
+  const upper = path.join(tmp, 'CaseFixture', 'Repo');
+  const lower = path.join(tmp, 'casefixture', 'repo');
+  if (process.platform === 'win32') {
+    assert.strictEqual(state.projectSlug(upper), state.projectSlug(lower), 'one path, one slug');
+  } else {
+    assert.notStrictEqual(state.projectSlug(upper), state.projectSlug(lower), 'case-sensitive platforms keep both');
+  }
+});
+
+ok('a legacy-cased store migrates even when the FIRST call spells the cwd lowercase', () => {
+  if (process.platform !== 'win32') return; // the fallback only exists on win32
+  // The residual stranding: deriving the legacy slug from the CALLER's spelling
+  // means a caller who happens to type the path in lowercase produces
+  // normalized === legacy, the discovery is skipped entirely, and the real
+  // mixed-case store is stranded forever behind a fresh empty one. The casing
+  // has to come from the filesystem, which knows it, not from the caller, who
+  // may not. Ordering matters here: lowercase FIRST is the whole test.
+  const onDisk = path.join(tmp, 'SlugLower', 'Repo'); // created with mixed casing
+  fs.mkdirSync(onDisk, { recursive: true });
+  const spelledLower = onDisk.toLowerCase(); // what the caller supplies
+
+  const projects = path.join(state.baseDir(), 'projects');
+  const legacySlug = state.legacySlugFor(spelledLower);
+  const normalizedSlug = state.normalizedSlugFor(spelledLower);
+  assert.notStrictEqual(
+    legacySlug, normalizedSlug,
+    'the slugs are derived from the on-disk casing, so a lowercase spelling still finds the legacy one'
+  );
+
+  fs.rmSync(path.join(projects, legacySlug), { recursive: true, force: true });
+  fs.rmSync(path.join(projects, normalizedSlug), { recursive: true, force: true });
+  fs.mkdirSync(path.join(projects, legacySlug), { recursive: true });
+  fs.writeFileSync(
+    path.join(projects, legacySlug, 'state.json'),
+    JSON.stringify({ version: 1, objective: 'written under the old casing', artifacts: [], defects: [], history: [] }),
+    'utf8'
+  );
+
+  // the FIRST post-upgrade call uses the lowercase spelling
+  assert.strictEqual(state.projectSlug(spelledLower), normalizedSlug, 'it migrates rather than stranding');
+  assert.ok(!fs.existsSync(path.join(projects, legacySlug)), 'the legacy dir is gone, not left as a decoy');
+  assert.strictEqual(
+    state.loadState(spelledLower).objective, 'written under the old casing', 'and the record came with it'
+  );
+  // and the mixed-case spelling of the same path resolves to that same store
+  assert.strictEqual(state.loadState(onDisk).objective, 'written under the old casing');
+});
+
+ok('a junction cwd keeps its own identity instead of forking into the target store', () => {
+  if (process.platform !== 'win32') return;
+  // Recovering casing via realpath DEREFERENCES aliases: `C:\Users\All Users`
+  // resolves to `C:\ProgramData`, so a session run through a junction silently
+  // adopts the target's store — and the alias-keyed store it used to write is
+  // neither migrated nor conflict-detected, because nothing ever computes its
+  // slug again. Casing must be recovered without following the link.
+  const target = path.join(tmp, 'JunctionTarget', 'Repo');
+  const link = path.join(tmp, 'JunctionAlias');
+  fs.mkdirSync(target, { recursive: true });
+  try {
+    fs.symlinkSync(target, link, 'junction');
+  } catch (e) {
+    process.stdout.write(`      (skipped: junction creation denied — ${e.code})\n`);
+    return;
+  }
+  assert.notStrictEqual(
+    state.projectSlug(link), state.projectSlug(target),
+    'an alias must keep its own store, not silently resolve into the target'
+  );
+  // its identity is the LEXICAL path's, casing-corrected but never dereferenced
+  assert.strictEqual(state.projectSlug(link), state.normalizedSlugFor(link));
+});
+
+ok('case recovery survives a path segment that does not exist', () => {
+  if (process.platform !== 'win32') return;
+  // A store dir is computed before the project dir necessarily exists; an
+  // unreadable or missing segment must fall back to the lexical spelling rather
+  // than throw or silently produce a different identity.
+  const missing = path.join(tmp, 'NoSuchParent', 'NoSuchChild');
+  assert.doesNotThrow(() => state.projectSlug(missing));
+  assert.strictEqual(state.projectSlug(missing), state.projectSlug(missing), 'and it is stable across calls');
+});
+
+ok('two stores for one path is a conflict to name, never a guess to make', () => {
+  if (process.platform !== 'win32') return;
+  const proj = path.join(tmp, 'SlugConflict', 'Repo');
+  const projects = path.join(state.baseDir(), 'projects');
+  const legacySlug = state.legacySlugFor(proj);
+  const normalizedSlug = state.normalizedSlugFor(proj);
+  for (const slug of [legacySlug, normalizedSlug]) {
+    fs.mkdirSync(path.join(projects, slug), { recursive: true });
+    fs.writeFileSync(path.join(projects, slug, 'state.json'), JSON.stringify({ version: 1, objective: slug }), 'utf8');
+  }
+  // Merging is not ours to invent and picking one silently loses the other.
+  assert.throws(() => state.projectSlug(proj), /both|conflict/i);
+  const e = (() => { try { state.projectSlug(proj); } catch (err) { return err; } })();
+  assert.ok(e.message.includes(legacySlug) && e.message.includes(normalizedSlug), 'the refusal names both paths');
+  fs.rmSync(path.join(projects, legacySlug), { recursive: true, force: true });
+  fs.rmSync(path.join(projects, normalizedSlug), { recursive: true, force: true });
 });
 
 ok('corrupt ledger.json is backed up, not silently lost', () => {
@@ -414,8 +629,9 @@ ok('state reset requires explicit authority (--force)', () => {
   state.saveState(cwd, s);
   assert.throws(() => cli.run(['node', 'ratchet', 'state', 'reset']), /irreversible|--force/);
   assert.strictEqual(state.loadState(cwd).objective, 'do not lose me', 'a bare reset must not wipe state');
-  cli.run(['node', 'ratchet', 'state', 'reset', '--force']);
-  assert.strictEqual(state.loadState(cwd).objective, '', 'reset --force wipes state');
+  // 0.8: --force says "I mean it"; --owner/--reason say who meant it and why.
+  cli.run(['node', 'ratchet', 'state', 'reset', '--force', '--owner', 'danny', '--reason', 'fixture reset']);
+  assert.strictEqual(state.loadState(cwd).objective, '', 'an authorized reset --force wipes state');
 });
 
 // --- the receipt: one stable shape, every section always present ------------
@@ -468,7 +684,9 @@ ok('receipt PROOF renders an evidence card for a KEEP, with its seam', () => {
     mode: 'code',
     chosenMutation: 'assemble eight fixed sections',
     verdict: 'KEEP',
-    verification: { commands: ['node test/cli.test.js'], result: 'pass' },
+    // {command, pass} — the shape `ratchet-evolve verify` emits. A bare string
+    // carries no machine verdict, and 0.8's proof gate refuses one.
+    verification: { commands: [{ command: 'node test/cli.test.js', pass: true }], result: 'pass' },
     seam: {
       evidenceType: 'test',
       testedSeam: 'ratchet receipt',
@@ -899,7 +1117,10 @@ ok('probe retraction must state its outcome: disposed or promoted (+ superseded-
     () => cli.run(['node', 'ratchet', 'retract', probe.id, '--reason', 'promoted: kept the fixture']),
     /superseded-by/
   );
-  cli.run(['node', 'ratchet', 'retract', probe.id, '--reason', 'promoted: rebuilt under proof gates', '--superseded-by', 'art-keep-1']);
+  // 0.8: a promotion must point at a REAL, non-probe replacement — "art-keep-1"
+  // used to be an id nobody recorded, which is residue shipping under a label.
+  const keep = artifacts.addArtifact(cwd, { id: 'art-keep-1', kind: 'code', title: 'build-for-keep' });
+  cli.run(['node', 'ratchet', 'retract', probe.id, '--reason', 'promoted: rebuilt under proof gates', '--superseded-by', keep.id]);
   const after = state.loadState(cwd).artifacts.find((a) => a.id === probe.id);
   assert.strictEqual(after.status, 'retracted');
   assert.strictEqual(after.retracted.supersededBy, 'art-keep-1');
@@ -908,6 +1129,1365 @@ ok('probe retraction must state its outcome: disposed or promoted (+ superseded-
 ok('session confidence names recorded pressure, not correctness', () => {
   const conf = scoring.scoreConfidence(state.loadState(cwd));
   assert.ok(/recorded loop pressure, not correctness/.test(conf.scope), 'the scope says what the number is not');
+});
+
+// --- artifact integrity + idempotency (0.8 Closure Gate) --------------------
+
+ok('an artifact cannot be born or revised into a terminal status, or carry a reserved field', () => {
+  state.initProject(cwd, { force: true });
+  for (const status of ['closed', 'retracted', 'superseded']) {
+    assert.throws(() => artifacts.addArtifact(cwd, { title: 'x', status }), /terminal statuses are earned/);
+  }
+  for (const field of ['rev', 'closedAt', 'closedBy', 'closedRev', 'closedHash', 'holesWaiver', 'retracted', 'supersededBy']) {
+    assert.throws(() => artifacts.addArtifact(cwd, { title: 'x', [field]: 'forged' }), /written by the CLI/);
+  }
+  assert.strictEqual(state.loadState(cwd).artifacts.length, 0, 'nothing was written by a refused add');
+});
+
+ok('re-adding the same id revises in place; an identical retry is a true no-op', () => {
+  state.initProject(cwd, { force: true });
+  const first = artifacts.addArtifact(cwd, { id: 'art-fixed', title: 'spec', kind: 'spec', path: '', holes: [] });
+  assert.strictEqual(first.rev, 1, 'birth is rev 1');
+
+  const before = fs.readFileSync(state.statePath(cwd), 'utf8');
+  const retry = artifacts.addArtifact(cwd, { id: 'art-fixed', title: 'spec', kind: 'spec', path: '', holes: [] });
+  assert.strictEqual(retry.rev, 1, 'an identical retry does not bump rev — that would invalidate bound proof');
+  assert.strictEqual(fs.readFileSync(state.statePath(cwd), 'utf8'), before, 'and writes nothing at all');
+
+  const revised = artifacts.addArtifact(cwd, { id: 'art-fixed', title: 'spec v2', kind: 'spec' });
+  assert.strictEqual(revised.rev, 2, 'a real change is a revision');
+  const s = state.loadState(cwd);
+  assert.strictEqual(s.artifacts.filter((a) => a.id === 'art-fixed').length, 1, 'one id, one record');
+  assert.ok(s.history.some((h) => h.event === 'artifact.revised'));
+});
+
+ok('a legacy or falsey-shaped retry is still a no-op', () => {
+  // Birth coerced with falsey defaults (`item.title || 'untitled'`) while the
+  // revision path coerced with String(), so the two disagreed about what the
+  // "same" payload means — and a legacy record with no holes array normalized on
+  // first touch, bumping rev and silently invalidating any proof bound to it.
+  state.initProject(cwd, { force: true });
+  const s = state.loadState(cwd);
+  s.artifacts = [{ id: 'art-legacy', at: '2026-07-01T00:00:00.000Z', kind: 'docs', title: 'old', status: 'v1' }];
+  state.saveState(cwd, s);
+
+  const before = fs.readFileSync(state.statePath(cwd), 'utf8');
+  const same = artifacts.addArtifact(cwd, { id: 'art-legacy', kind: 'docs', title: 'old', status: 'v1' });
+  assert.strictEqual(fs.readFileSync(state.statePath(cwd), 'utf8'), before, 'normalizing a missing legacy holes array writes nothing');
+  assert.strictEqual(same.rev, undefined, 'the legacy record is left exactly as it was');
+  assert.strictEqual(lifecycle.fingerprint(cwd, same).rev, 1, 'and a missing rev still reads as 1, so proof stays bound');
+
+  // falsey-shaped payloads round-trip identically through both paths
+  state.initProject(cwd, { force: true });
+  const born = artifacts.addArtifact(cwd, { id: 'art-falsey', kind: 'spec', title: '', path: '', holes: [] });
+  const mid = fs.readFileSync(state.statePath(cwd), 'utf8');
+  const retried = artifacts.addArtifact(cwd, { id: 'art-falsey', kind: 'spec', title: '', path: '', holes: [] });
+  assert.strictEqual(retried.rev, born.rev, 'an identical falsey-shaped retry does not bump rev');
+  assert.strictEqual(fs.readFileSync(state.statePath(cwd), 'utf8'), mid, 'byte-identical state');
+});
+
+ok('a scalar holes value is a real hole, and repairing it is a real revision', () => {
+  // Canonicalization made holes:"TODO" and holes:["TODO"] compare equal, so the
+  // repair no-opped and the SCALAR survived in the store — where every
+  // Array.isArray guard reads it as ZERO holes. The artifact then closes with an
+  // open hole nobody can see.
+  state.initProject(cwd, { force: true });
+  const s = state.loadState(cwd);
+  s.artifacts = [{ id: 'art-scalar', at: '2026-07-01T00:00:00.000Z', kind: 'spec', title: 'legacy', status: 'v1', holes: 'TODO', rev: 1 }];
+  state.saveState(cwd, s);
+
+  // the closure gate must not be fooled by the shape
+  const scalar = state.loadState(cwd).artifacts[0];
+  const codes = lifecycle.closureBlockers(state.loadState(cwd), [], scalar, cwd).map((b) => b.code);
+  assert.ok(codes.includes('holes'), `a scalar hole still blocks closure, got: ${codes.join(',')}`);
+
+  // EVERY present non-array is at least one hole — including the falsey shapes,
+  // which is where "anything present" quietly stopped being true.
+  for (const shape of ['', null, 0, false]) {
+    state.initProject(cwd, { force: true });
+    const st = state.loadState(cwd);
+    st.artifacts = [{ id: 'art-falsey-hole', at: '2026-07-01T00:00:00.000Z', kind: 'spec', title: 'x', status: 'v1', holes: shape, rev: 1 }];
+    state.saveState(cwd, st);
+    const art = state.loadState(cwd).artifacts[0];
+    const c = lifecycle.closureBlockers(state.loadState(cwd), [], art, cwd).map((b) => b.code);
+    assert.ok(c.includes('holes'), `holes:${JSON.stringify(shape)} is a present value and must block, got: ${c.join(',')}`);
+  }
+  // absence, and only absence, is zero holes
+  state.initProject(cwd, { force: true });
+  const st2 = state.loadState(cwd);
+  st2.artifacts = [{ id: 'art-no-holes', at: '2026-07-01T00:00:00.000Z', kind: 'spec', title: 'x', status: 'v1', rev: 1 }];
+  state.saveState(cwd, st2);
+  const absent = lifecycle.closureBlockers(state.loadState(cwd), [], state.loadState(cwd).artifacts[0], cwd).map((b) => b.code);
+  assert.ok(!absent.includes('holes'), 'an absent holes field is genuinely zero holes');
+
+  // a nested array is also the wrong shape: stringification made [["TODO"]]
+  // compare equal to ["TODO"], so the repair false-no-opped and the nesting stayed
+  state.initProject(cwd, { force: true });
+  const st3 = state.loadState(cwd);
+  st3.artifacts = [{ id: 'art-nested', at: '2026-07-01T00:00:00.000Z', kind: 'spec', title: 'x', status: 'v1', holes: [['TODO']], rev: 1 }];
+  state.saveState(cwd, st3);
+  const flattened = artifacts.addArtifact(cwd, { id: 'art-nested', holes: ['TODO'] });
+  assert.strictEqual(flattened.rev, 2, 'repairing a nested holes array is a real revision');
+  assert.deepStrictEqual(flattened.holes, ['TODO'], 'and the flat shape is what persists');
+  assert.ok(flattened.holes.every((h) => typeof h === 'string'), 'every hole is a string');
+
+  // and repairing the scalar shape is a REVISION, not a silent no-op
+  state.initProject(cwd, { force: true });
+  const s2 = state.loadState(cwd);
+  s2.artifacts = [{ id: 'art-scalar', at: '2026-07-01T00:00:00.000Z', kind: 'spec', title: 'legacy', status: 'v1', holes: 'TODO', rev: 1 }];
+  state.saveState(cwd, s2);
+  const repaired = artifacts.addArtifact(cwd, { id: 'art-scalar', holes: ['TODO'] });
+  assert.strictEqual(repaired.rev, 2, 'normalizing a present non-array holes value is a real revision');
+  assert.deepStrictEqual(repaired.holes, ['TODO'], 'and the array shape is what persists');
+  // once repaired, an identical retry is a no-op again
+  const before = fs.readFileSync(state.statePath(cwd), 'utf8');
+  assert.strictEqual(artifacts.addArtifact(cwd, { id: 'art-scalar', holes: ['TODO'] }).rev, 2);
+  assert.strictEqual(fs.readFileSync(state.statePath(cwd), 'utf8'), before, 'byte-identical after the repair');
+});
+
+ok('artifacts and lifecycle agree on what counts as a hole, shape for shape', () => {
+  // The split-brain: lifecycle counted a falsey-but-present holes value as one
+  // hole while the artifacts-side canonicalization erased it to []. Same record,
+  // two answers — so a new artifact lost its declared hole at BIRTH and the
+  // blocker lifecycle would have raised never had anything to raise it about.
+  // One table, both surfaces, no room for them to drift apart again.
+  const TABLE = [
+    { label: 'absent', payload: {}, holes: [] },
+    { label: 'empty array', payload: { holes: [] }, holes: [] },
+    { label: 'empty string', payload: { holes: '' }, holes: [''] },
+    { label: 'null', payload: { holes: null }, holes: ['null'] },
+    { label: 'zero', payload: { holes: 0 }, holes: ['0'] },
+    { label: 'false', payload: { holes: false }, holes: ['false'] },
+    { label: 'scalar', payload: { holes: 'TODO' }, holes: ['TODO'] },
+    { label: 'flat array', payload: { holes: ['a', 'b'] }, holes: ['a', 'b'] },
+  ];
+  for (const row of TABLE) {
+    state.initProject(cwd, { force: true });
+    const born = artifacts.addArtifact(cwd, { id: 'art-h', kind: 'spec', title: 't', ...row.payload });
+    assert.deepStrictEqual(born.holes, row.holes, `birth persists ${row.label} as ${JSON.stringify(row.holes)}`);
+    const stored = state.loadState(cwd).artifacts[0];
+    assert.deepStrictEqual(stored.holes, row.holes, `${row.label} survives the round trip to disk`);
+    const blocked = lifecycle.closureBlockers(state.loadState(cwd), [], stored, cwd).some((b) => b.code === 'holes');
+    assert.strictEqual(
+      blocked, row.holes.length > 0,
+      `${row.label}: the closure gate and the store must agree on whether it blocks`
+    );
+  }
+});
+
+ok('touching a legacy falsey-shaped record does not silently clear its hole', () => {
+  // The repair path erased it too: an edit that never mentions holes would
+  // canonicalize the stored falsey value to [] and the artifact would become
+  // closable, having lost a blocker nobody chose to waive.
+  for (const shape of ['', null, 0, false]) {
+    state.initProject(cwd, { force: true });
+    const s = state.loadState(cwd);
+    s.artifacts = [{ id: 'art-legacy-hole', at: '2026-07-01T00:00:00.000Z', kind: 'spec', title: 'x', status: 'v1', holes: shape, rev: 1 }];
+    state.saveState(cwd, s);
+
+    const touched = artifacts.addArtifact(cwd, { id: 'art-legacy-hole', title: 'x, retitled' });
+    assert.strictEqual(touched.holes.length, 1, `holes:${JSON.stringify(shape)} survives an unrelated edit`);
+    assert.strictEqual(typeof touched.holes[0], 'string', 'and is repaired into the canonical string shape');
+    const blocked = lifecycle
+      .closureBlockers(state.loadState(cwd), [], state.loadState(cwd).artifacts[0], cwd)
+      .some((b) => b.code === 'holes');
+    assert.ok(blocked, `holes:${JSON.stringify(shape)} still blocks the close after the touch`);
+  }
+});
+
+ok('clearing a lineage link is a revision; only an ABSENT one is idempotent', () => {
+  state.initProject(cwd, { force: true });
+  artifacts.addArtifact(cwd, { id: 'art-lineage', kind: 'spec', title: 'v2', revises: 'art-old' });
+  assert.strictEqual(state.loadState(cwd).artifacts[0].revises, 'art-old');
+
+  // absent → leave it alone (idempotent)
+  const untouched = artifacts.addArtifact(cwd, { id: 'art-lineage', title: 'v2' });
+  assert.strictEqual(untouched.rev, 1, 'omitting revises does not clear it');
+  assert.strictEqual(untouched.revises, 'art-old');
+
+  // explicitly empty → CLEAR it, and that is a real revision
+  const cleared = artifacts.addArtifact(cwd, { id: 'art-lineage', revises: '' });
+  assert.strictEqual(cleared.rev, 2, 'clearing a lineage claim is a revision');
+  assert.ok(!('revises' in cleared), 'the field is gone, not left as an empty string');
+
+  // and the same clear again is a no-op
+  const before = fs.readFileSync(state.statePath(cwd), 'utf8');
+  assert.strictEqual(artifacts.addArtifact(cwd, { id: 'art-lineage', revises: '' }).rev, 2);
+  assert.strictEqual(fs.readFileSync(state.statePath(cwd), 'utf8'), before, 'byte-identical on the repeated clear');
+});
+
+ok('a defect whose artifact cannot be fingerprinted is recorded, never half-attached', () => {
+  // The stamp used to fail silently, leaving the defect attached with
+  // artifactRev:null and artifactHash:'' — an attachment that blocks the
+  // artifact's closure while carrying no evidence of which revision it attacks.
+  const proj = path.join(tmp, 'defect-stamp-fail');
+  fs.rmSync(proj, { recursive: true, force: true });
+  fs.mkdirSync(proj, { recursive: true });
+  state.initProject(proj, { force: true });
+  const s = state.loadState(proj);
+  // a path that refuses to bind at all (escapes the project)
+  s.artifacts = [{ id: 'art-escape', at: '2026-07-01T00:00:00.000Z', kind: 'code', title: 'escapes', status: 'v0', path: '../outside.js', holes: [], rev: 1 }];
+  state.saveState(proj, s);
+
+  const { state: d } = artifacts.addDefect(proj, { severity: 'high', summary: 'found it anyway' }, { alsoLedger: false });
+  assert.strictEqual(d.artifact, '', 'no half-stamped attachment');
+  assert.strictEqual(d.attachedBy, 'error', 'the failure is named, not swallowed');
+  assert.ok(/outside the project/.test(d.attachError), `the reason travels: ${d.attachError}`);
+  assert.strictEqual(state.loadState(proj).defects.length, 1, 'the finding is still recorded — that matters more');
+});
+
+ok('kind is immutable on an update in place', () => {
+  state.initProject(cwd, { force: true });
+  artifacts.addArtifact(cwd, { id: 'art-probe', kind: 'probe', title: 'probe: x' });
+  assert.throws(() => artifacts.addArtifact(cwd, { id: 'art-probe', kind: 'code' }), /immutable/);
+  assert.strictEqual(state.loadState(cwd).artifacts[0].kind, 'probe', 'a probe cannot become closable in place');
+});
+
+ok('an ambiguous id refuses every lifecycle verb, repair-ably', () => {
+  state.initProject(cwd, { force: true });
+  const s = state.loadState(cwd);
+  s.artifacts = [
+    { id: 'dup', kind: 'spec', title: 'one', status: 'v0', holes: [], rev: 1 },
+    { id: 'dup', kind: 'spec', title: 'two', status: 'v0', holes: [], rev: 1 },
+  ];
+  state.saveState(cwd, s);
+  assert.throws(() => artifacts.addArtifact(cwd, { id: 'dup', title: 'three' }), /share the id "dup"/);
+  assert.throws(() => cli.run(['node', 'ratchet', 'retract', 'dup', '--reason', 'x']), /share the id "dup"/);
+});
+
+ok('"revises" is provenance only — the prior artifact stays live', () => {
+  state.initProject(cwd, { force: true });
+  const a = artifacts.addArtifact(cwd, { id: 'art-old', title: 'v1', kind: 'spec' });
+  const b = artifacts.addArtifact(cwd, { id: 'art-new', title: 'v2', kind: 'spec', revises: 'art-old' });
+  assert.strictEqual(b.revises, 'art-old', 'the link is recorded');
+  assert.strictEqual(state.loadState(cwd).artifacts.find((x) => x.id === a.id).status, 'v0', 'no lifecycle side effect');
+});
+
+ok('a promoted probe must name an existing, non-probe replacement', () => {
+  state.initProject(cwd, { force: true });
+  const probe = artifacts.addArtifact(cwd, { kind: 'probe', title: 'probe: promotion gate' });
+  assert.throws(
+    () => cli.run(['node', 'ratchet', 'retract', probe.id, '--reason', 'promoted: x', '--superseded-by', 'art-does-not-exist']),
+    /names no artifact/
+  );
+  const other = artifacts.addArtifact(cwd, { kind: 'probe', title: 'probe: not a replacement' });
+  assert.throws(
+    () => cli.run(['node', 'ratchet', 'retract', probe.id, '--reason', 'promoted: x', '--superseded-by', other.id]),
+    /itself a probe/
+  );
+});
+
+ok('defects attach to exactly one live artifact, or refuse and name the candidates', () => {
+  state.initProject(cwd, { force: true });
+  // ZERO live artifacts → unattached, stated
+  const orphan = artifacts.addDefect(cwd, { severity: 'low', summary: 'no home' });
+  assert.strictEqual(orphan.state.artifact, '');
+  assert.strictEqual(orphan.state.attachedBy, 'none');
+
+  // exactly ONE → auto-attach, stamped with the artifact identity it attacks
+  state.initProject(cwd, { force: true });
+  const only = artifacts.addArtifact(cwd, { title: 'only', kind: 'spec' });
+  const auto = artifacts.addDefect(cwd, { severity: 'high', summary: 'boom' });
+  assert.strictEqual(auto.state.artifact, only.id);
+  assert.strictEqual(auto.state.attachedBy, 'auto');
+  assert.strictEqual(auto.state.artifactRev, 1, 'the defect records which revision it attacks');
+  assert.ok(auto.state.artifactHash, 'and that revision\'s hash');
+
+  // TWO+ → refuse, naming them
+  artifacts.addArtifact(cwd, { title: 'second', kind: 'spec' });
+  assert.throws(() => artifacts.addDefect(cwd, { severity: 'high', summary: 'ambiguous' }), /2 live artifacts/);
+});
+
+ok('a repeat defect report dedups and escalates in place', () => {
+  state.initProject(cwd, { force: true });
+  artifacts.addArtifact(cwd, { title: 'only', kind: 'spec' });
+  const first = artifacts.addDefect(cwd, { severity: 'low', summary: '  Flaky Under Load  ' });
+  const again = artifacts.addDefect(cwd, { severity: 'critical', summary: 'flaky under load' });
+  assert.strictEqual(again.state.id, first.state.id, 'same artifact + same summary = the same defect');
+  assert.strictEqual(state.loadState(cwd).defects.length, 1, 'no duplicate record');
+  assert.strictEqual(again.state.severity, 'critical', 'severity escalates in place');
+  // de-escalation never happens silently
+  artifacts.addDefect(cwd, { severity: 'info', summary: 'flaky under load' });
+  assert.strictEqual(state.loadState(cwd).defects[0].severity, 'critical', 'a milder repeat cannot downgrade it');
+  // a resolved defect is out of the dedup window — a regression is a new record
+  cli.run(['node', 'ratchet', 'defect', 'resolve', first.state.id, '--evidence', 'fixed and verified']);
+  const fresh = artifacts.addDefect(cwd, { severity: 'high', summary: 'flaky under load' });
+  assert.notStrictEqual(fresh.state.id, first.state.id, 'a terminal defect does not absorb a fresh report');
+});
+
+ok('a defect cannot be born terminal', () => {
+  state.initProject(cwd, { force: true });
+  for (const status of ['resolved', 'waived', 'superseded', 'closed']) {
+    assert.throws(() => artifacts.addDefect(cwd, { summary: 'x', status }), /cannot be born/);
+  }
+});
+
+ok('the defect transition engine enforces its own proof, not just the CLI', () => {
+  state.initProject(cwd, { force: true });
+  artifacts.addArtifact(cwd, { title: 'only', kind: 'spec' });
+  const { state: d } = artifacts.addDefect(cwd, { severity: 'high', summary: 'engine gate' });
+  // Called directly — bypassing cmdDefect's own checks entirely.
+  assert.throws(() => artifacts.transitionDefect(cwd, d.id, 'resolved', {}), /no proof/i);
+  assert.throws(() => artifacts.transitionDefect(cwd, d.id, 'waived', { owner: 'danny' }), /reason/i);
+  assert.throws(() => artifacts.transitionDefect(cwd, d.id, 'waived', { reason: 'x' }), /owner/i);
+  assert.throws(() => artifacts.transitionDefect(cwd, d.id, 'reopened', {}), /reason/i);
+  assert.throws(() => artifacts.transitionDefect(cwd, d.id, 'superseded', {}), /by/i);
+  // 'closed' is the pre-0.3 alias for resolved and is TERMINAL to the scorer, so
+  // transitioning into it with no evidence cleared the drain with no proof at
+  // all — the one unguarded door in an otherwise gated set.
+  assert.throws(() => artifacts.transitionDefect(cwd, d.id, 'closed', {}), /resolve|waive|supersede/i);
+  assert.throws(() => artifacts.transitionDefect(cwd, d.id, 'closed', { evidence: 'even with proof' }), /resolve|waive|supersede/i);
+  assert.throws(() => cli.run(['node', 'ratchet', 'defect', 'closed', d.id]), /usage|resolve/i);
+  assert.strictEqual(state.loadState(cwd).defects.find((x) => x.id === d.id).status, 'open', 'nothing leaked through');
+});
+
+ok('a legacy "closed" defect still reads as terminal, it just cannot be written', () => {
+  // Read-only alias: stores written before 0.3 carry status:'closed' and must
+  // keep scoring as terminal. Only the WRITE path is closed.
+  const legacy = { id: 'd-legacy', severity: 'critical', summary: 'old', status: 'closed' };
+  assert.strictEqual(scoring.isDefectOpen(legacy), false, 'a legacy closed defect does not drain');
+});
+
+ok('init --force is the same irreversible wipe as state reset, and gated the same', () => {
+  state.initProject(cwd, { force: true });
+  const s = state.loadState(cwd);
+  s.objective = 'do not lose me through the other door';
+  state.saveState(cwd, s);
+
+  assert.throws(() => cli.run(['node', 'ratchet', 'init', '--force']), /owner/);
+  assert.throws(() => cli.run(['node', 'ratchet', 'init', '--force', '--owner', 'danny']), /reason/);
+  assert.strictEqual(
+    state.loadState(cwd).objective, 'do not lose me through the other door',
+    'an unauthorized init --force must not wipe what state reset --force refuses to wipe'
+  );
+
+  cli.run(['node', 'ratchet', 'init', '--force', '--owner', 'danny', '--reason', 'fresh run']);
+  const after = state.loadState(cwd);
+  assert.strictEqual(after.objective, '');
+  const tomb = (after.history || []).find((h) => h.event === 'state.reset');
+  assert.ok(tomb && /danny/.test(tomb.note) && /fresh run/.test(tomb.note), 'the same tombstone, through either door');
+  // plain init still just ensures the dir exists
+  assert.doesNotThrow(() => cli.run(['node', 'ratchet', 'init']));
+});
+
+// --- write-boundary gates (0.8 Closure Gate) --------------------------------
+
+ok('the checkpoint scalars cannot be set by hand — compile done is the only transition', () => {
+  state.initProject(cwd, { force: true });
+  assert.throws(() => cli.run(['node', 'ratchet', 'state', 'set', 'dirty', 'false']), /not a settable scalar/);
+  assert.throws(() => cli.run(['node', 'ratchet', 'state', 'set', 'lastCompileAt', '2026-01-01']), /not a settable scalar/);
+  cli.run(['node', 'ratchet', 'touch', 'README.md']);
+  assert.strictEqual(state.loadState(cwd).dirty, true, 'a bypass would have cleared this silently');
+});
+
+ok('state reset --force names who reset and why, and leaves a tombstone', () => {
+  state.initProject(cwd, { force: true });
+  const s = state.loadState(cwd);
+  s.objective = 'do not lose me quietly';
+  state.saveState(cwd, s);
+  assert.throws(() => cli.run(['node', 'ratchet', 'state', 'reset', '--force']), /owner/);
+  assert.throws(() => cli.run(['node', 'ratchet', 'state', 'reset', '--force', '--owner', 'danny']), /reason/);
+  assert.strictEqual(state.loadState(cwd).objective, 'do not lose me quietly', 'an unauthorized reset changes nothing');
+
+  cli.run(['node', 'ratchet', 'state', 'reset', '--force', '--owner', 'danny', '--reason', 'starting a new run']);
+  const after = state.loadState(cwd);
+  assert.strictEqual(after.objective, '', 'the authorized reset wiped state');
+  const tomb = (after.history || []).find((h) => h.event === 'state.reset');
+  assert.ok(tomb, 'the fresh state opens with a tombstone, not a blank slate');
+  assert.ok(/danny/.test(tomb.note) && /new run/.test(tomb.note), 'the tombstone names who and why');
+});
+
+ok('state append forces birth status and dedups on text', () => {
+  state.initProject(cwd, { force: true });
+  cli.run(['node', 'ratchet', 'state', 'append', 'assumptions', '{"text":"the seam is stable"}']);
+  assert.strictEqual(state.loadState(cwd).assumptions[0].status, 'untested');
+  // an assumption born "tested" is an untested assumption wearing a badge
+  assert.throws(
+    () => cli.run(['node', 'ratchet', 'state', 'append', 'assumptions', '{"text":"x","status":"tested"}']),
+    /born/
+  );
+  // dedup on trimmed text
+  cli.run(['node', 'ratchet', 'state', 'append', 'assumptions', '{"text":"  the seam is stable  "}']);
+  assert.strictEqual(state.loadState(cwd).assumptions.length, 1, 'the same assumption is one drain, not two');
+
+  cli.run(['node', 'ratchet', 'state', 'append', 'openLoops', '{"text":"decide the store shape"}']);
+  assert.strictEqual(state.loadState(cwd).openLoops[0].status, 'open');
+  assert.throws(
+    () => cli.run(['node', 'ratchet', 'state', 'append', 'openLoops', '{"text":"y","status":"closed"}']),
+    /born/
+  );
+  cli.run(['node', 'ratchet', 'state', 'append', 'openLoops', '{"text":"decide the store shape"}']);
+  assert.strictEqual(state.loadState(cwd).openLoops.length, 1);
+});
+
+ok('state append cannot mint artifacts or defects behind their gates', () => {
+  state.initProject(cwd, { force: true });
+  assert.throws(
+    () => cli.run(['node', 'ratchet', 'state', 'append', 'artifacts', '{"title":"forged","status":"closed"}']),
+    /ratchet artifact add/
+  );
+  assert.throws(
+    () => cli.run(['node', 'ratchet', 'state', 'append', 'defects', '{"summary":"forged","status":"resolved"}']),
+    /ratchet defect add/
+  );
+  const s = state.loadState(cwd);
+  assert.strictEqual(s.artifacts.length, 0);
+  assert.strictEqual(s.defects.length, 0);
+});
+
+ok('the ledger defect mirror is written by transitions, not by hand', () => {
+  state.initProject(cwd, { force: true });
+  artifacts.addArtifact(cwd, { title: 'only', kind: 'spec' });
+  const { state: d } = artifacts.addDefect(cwd, { severity: 'high', summary: 'mirror gate' });
+  assert.throws(
+    () => cli.run(['node', 'ratchet', 'ledger', 'update', 'defects', `{"id":"${d.ledgerId}","status":"resolved"}`]),
+    /status/
+  );
+  assert.strictEqual(state.loadLedger(cwd).defects.find((x) => x.id === d.ledgerId).status, 'open', 'the mirror held');
+  // the internal transition sync path still works
+  cli.run(['node', 'ratchet', 'defect', 'resolve', d.id, '--evidence', 'fixed and re-run']);
+  assert.strictEqual(state.loadLedger(cwd).defects.find((x) => x.id === d.ledgerId).status, 'resolved');
+  // non-status ledger writes are untouched
+  assert.doesNotThrow(() => cli.run(['node', 'ratchet', 'ledger', 'update', 'features', '{"name":"router"}']));
+});
+
+// --- proof binding (0.8 Closure Gate) ---------------------------------------
+
+
+const evolveVerify = require('../src/evolve/verify');
+
+// A project with a real file on disk, an artifact pointing at it, and a helper
+// that hands back the fingerprint the CLI would compute.
+function boundFixture(name, { kind = 'code', file = 'src/thing.js', body = 'one' } = {}) {
+  const proj = path.join(tmp, name);
+  fs.rmSync(proj, { recursive: true, force: true });
+  fs.mkdirSync(path.join(proj, path.dirname(file)), { recursive: true });
+  fs.writeFileSync(path.join(proj, file), body, 'utf8');
+  state.initProject(proj, { force: true });
+  const art = artifacts.addArtifact(proj, { title: 'thing', kind, path: file });
+  return { proj, art, fp: lifecycle.fingerprint(proj, art), file: path.join(proj, file) };
+}
+
+function keepFields(art, over) {
+  return {
+    target: 'src/thing.js',
+    artifactId: art.id,
+    verdict: 'KEEP',
+    verification: { commands: [{ command: 'node -e 0', pass: true }], result: 'pass' },
+    seam: { evidenceType: 'test', testedSeam: 'x', shipSeam: 'x', seamMatch: 'exact', independentFromBuilderMethod: true },
+    ...over,
+  };
+}
+
+ok('a bound append stamps the identity itself and refuses a caller-supplied one', () => {
+  const { proj, art, fp } = boundFixture('bind-stamp');
+  const e = journal.appendEvent(proj, keepFields(art), { verifiedHash: fp.hash, verifiedRev: fp.rev });
+  assert.strictEqual(e.artifactId, art.id);
+  assert.strictEqual(e.artifactRev, fp.rev, 'the CLI computed the rev');
+  assert.strictEqual(e.artifactHash, fp.hash, 'the CLI computed the hash');
+  assert.strictEqual(e.hashScope, 'file');
+  assert.strictEqual(e.source, 'evolve');
+
+  for (const forged of [{ artifactRev: 99 }, { artifactHash: 'deadbeef' }]) {
+    assert.throws(
+      () => journal.appendEvent(proj, keepFields(art, forged), { verifiedHash: fp.hash, verifiedRev: fp.rev }),
+      /computed by the CLI, not supplied/
+    );
+  }
+  // and a bound event cannot carry a hand-picked id
+  assert.throws(
+    () => journal.appendEvent(proj, keepFields(art, { id: 'evo_hand_written' }), { verifiedHash: fp.hash, verifiedRev: fp.rev }),
+    /machine/i
+  );
+});
+
+ok('a code artifact cannot be bound through mode:"docs" to dodge the seam gate', () => {
+  const { proj, art, fp } = boundFixture('bind-mode');
+  // docs mode skips the seam gate entirely — so the mode must be derived, not claimed.
+  assert.throws(
+    () => journal.appendEvent(proj, keepFields(art, { mode: 'docs', seam: {} }), { verifiedHash: fp.hash, verifiedRev: fp.rev }),
+    /mode/i
+  );
+  // derived from the bound artifact, the seam gate bites
+  assert.throws(
+    () => journal.appendEvent(proj, keepFields(art, { seam: {} }), { verifiedHash: fp.hash, verifiedRev: fp.rev }),
+    /seam/i
+  );
+  const e = journal.appendEvent(proj, keepFields(art), { verifiedHash: fp.hash, verifiedRev: fp.rev });
+  assert.strictEqual(e.mode, 'code', 'mode is derived from the artifact it binds to');
+});
+
+ok('binding refuses a stale verification — edit the file, the proof is void', () => {
+  const { proj, art, fp, file } = boundFixture('bind-stale');
+  assert.throws(() => journal.appendEvent(proj, keepFields(art)), /verifiedHash/);
+  fs.writeFileSync(file, 'edited after the harness ran', 'utf8');
+  assert.throws(
+    () => journal.appendEvent(proj, keepFields(art), { verifiedHash: fp.hash, verifiedRev: fp.rev }),
+    /file changed after verification/
+  );
+  // re-verify and it lands
+  const fresh = lifecycle.fingerprint(proj, art);
+  assert.ok(journal.appendEvent(proj, keepFields(art), { verifiedHash: fresh.hash, verifiedRev: fresh.rev }));
+});
+
+ok('binding refuses evidence gathered against an older revision', () => {
+  // The metadata-only revision: the FILE never changes, so verifiedHash still
+  // matches — but the artifact moved to rev 2 and the rev-1 evidence would be
+  // stamped onto it. The hash alone cannot see this; the rev has to be checked.
+  const { proj, art, fp } = boundFixture('bind-stale-rev');
+  artifacts.addArtifact(proj, { id: art.id, title: 'thing, retitled' });
+  const revised = state.loadState(proj).artifacts.find((a) => a.id === art.id);
+  assert.strictEqual(revised.rev, 2, 'a metadata-only revision still bumps rev');
+  assert.strictEqual(lifecycle.fingerprint(proj, revised).hash, fp.hash, 'and the file hash is unchanged');
+
+  assert.throws(
+    () => journal.appendEvent(proj, keepFields(revised), { verifiedHash: fp.hash, verifiedRev: 1 }),
+    /rev|re-verify/i
+  );
+  // a bound append must state the rev it verified at all
+  assert.throws(
+    () => journal.appendEvent(proj, keepFields(revised), { verifiedHash: fp.hash }),
+    /verifiedRev/
+  );
+  // re-verify against the current revision and it lands
+  const fresh = lifecycle.fingerprint(proj, revised);
+  const e = journal.appendEvent(proj, keepFields(revised), { verifiedHash: fresh.hash, verifiedRev: fresh.rev });
+  assert.strictEqual(e.artifactRev, 2);
+});
+
+ok('a bound event cannot claim its own provenance', () => {
+  const { proj, art, fp } = boundFixture('bind-source');
+  // Refusing only a DIFFERENT value is the weaker gate: the forgery that matters
+  // supplies the RIGHT-looking value, so the field must be refused if present at
+  // all. The CLI always stamps it.
+  for (const forged of ['forged', 'evolve', '', null, 0]) {
+    assert.throws(
+      () => journal.appendEvent(proj, keepFields(art, { source: forged }), { verifiedHash: fp.hash, verifiedRev: fp.rev }),
+      /source/i,
+      `source: ${JSON.stringify(forged)} must be refused`
+    );
+  }
+  const e = journal.appendEvent(proj, keepFields(art), { verifiedHash: fp.hash, verifiedRev: fp.rev });
+  assert.strictEqual(e.source, 'evolve', 'the CLI stamps provenance on a bound event');
+});
+
+ok('binding refuses a missing or terminal artifact', () => {
+  const { proj, art, fp } = boundFixture('bind-terminal');
+  assert.throws(
+    () => journal.appendEvent(proj, keepFields({ id: 'art-nope' }), { verifiedHash: fp.hash, verifiedRev: fp.rev }),
+    /no artifact/
+  );
+  artifacts.retractArtifact(proj, art.id, { reason: 'obsolete' });
+  assert.throws(() => journal.appendEvent(proj, keepFields(art), { verifiedHash: fp.hash, verifiedRev: fp.rev }), /retracted|left the lifecycle/);
+});
+
+ok('a v0.7 event stays valid and permanently unbound', () => {
+  const { proj } = boundFixture('bind-legacy');
+  const e = journal.appendEvent(proj, { target: 'legacy.md', verdict: 'ASK' });
+  assert.strictEqual(e.artifactId, '', 'the binding fields exist and are empty, never omitted');
+  assert.strictEqual(e.artifactRev, null);
+  assert.strictEqual(e.hashScope, '');
+});
+
+ok('verify --artifact emits the fingerprint and refuses a target that moved under it', () => {
+  const { proj, art, fp, file } = boundFixture('verify-bound');
+  const v = evolveVerify.verify({ target: 'src/thing.js', testCommand: 'node -e 0', mode: 'code', cwd: proj, artifact: art });
+  assert.strictEqual(v.result, 'pass');
+  assert.strictEqual(v.artifactId, art.id);
+  assert.strictEqual(v.verifiedHash, fp.hash, 'the caller gets exactly what log append will demand');
+  assert.strictEqual(v.verifiedRev, fp.rev);
+  assert.strictEqual(v.hashScope, 'file');
+
+  // a harness that mutates its own target proves nothing about either version
+  const mutator = path.join(proj, 'mutate.js');
+  fs.writeFileSync(mutator, `require('fs').writeFileSync(${JSON.stringify(file)}, 'moved', 'utf8');`, 'utf8');
+  assert.throws(
+    () => evolveVerify.verify({ target: 'src/thing.js', testCommand: `node ${JSON.stringify(mutator)}`, mode: 'code', cwd: proj, artifact: art }),
+    /changed during verification/
+  );
+});
+
+ok('an unbound verify still returns the fixed shape, with the binding stated empty', () => {
+  const v = evolveVerify.verify({ target: 't', mode: 'prompt' });
+  assert.strictEqual(v.artifactId, '');
+  assert.strictEqual(v.verifiedHash, '');
+  assert.strictEqual(v.verifiedRev, null);
+  assert.strictEqual(v.hashScope, '');
+});
+
+// --- artifact close + loop/assumption transitions (0.8 Closure Gate) --------
+
+// Run a body with the process rooted in `proj` and the evolve journal scoped to
+// it, so `cli.run` (which always reads process.cwd()) works on the fixture.
+function inProject(proj, body) {
+  const prevCwd = process.cwd();
+  const prevLog = process.env.RATCHET_EVOLVE_LOG;
+  process.env.RATCHET_EVOLVE_LOG = path.join(proj, 'evolve-log.jsonl');
+  process.chdir(proj);
+  try {
+    return body();
+  } finally {
+    process.chdir(prevCwd);
+    process.env.RATCHET_EVOLVE_LOG = prevLog;
+  }
+}
+
+function say(fn) {
+  const chunks = [];
+  const orig = process.stdout.write;
+  process.stdout.write = (str) => { chunks.push(String(str)); return true; };
+  try {
+    fn();
+  } finally {
+    process.stdout.write = orig;
+  }
+  return chunks.join('');
+}
+
+ok('artifact close refuses every blocker at once, in one fixed order', () => {
+  const { proj, art } = boundFixture('close-blockers', { kind: 'probe', file: 'src/p.js' });
+  inProject(proj, () => {
+    artifacts.addArtifact(proj, { id: art.id, holes: ['unanswered: does it double-fire?'] });
+    artifacts.addDefect(proj, { severity: 'high', summary: 'still red', artifact: art.id });
+    try {
+      cli.run(['node', 'ratchet', 'artifact', 'close', art.id]);
+      assert.fail('a probe with defects, holes and no proof must not close');
+    } catch (e) {
+      const codes = (e.message.match(/\[([a-z-]+)\]/g) || []).map((m) => m.slice(1, -1));
+      assert.deepStrictEqual(codes, ['probe', 'no-bound-proof', 'open-defects', 'holes'], e.message);
+      assert.ok(/a probe never closes/.test(e.message), 'the probe refusal keeps its house voice');
+      assert.ok(/Checkpoint is not closure/.test(e.message), 'the no-proof refusal names the slogan');
+    }
+  });
+});
+
+ok('artifact close is earned by bound proof, then idempotent', () => {
+  const { proj, art } = boundFixture('close-happy', { kind: 'code', file: 'src/thing.js' });
+  inProject(proj, () => {
+    // no proof yet
+    assert.throws(() => cli.run(['node', 'ratchet', 'artifact', 'close', art.id]), /no KEEP proof bound/);
+    const v = evolveVerify.verify({ target: 'src/thing.js', testCommand: 'node -e 0', mode: 'code', cwd: proj, artifact: art });
+    journal.appendEvent(proj, keepFields(art), { verifiedHash: v.verifiedHash, verifiedRev: v.verifiedRev });
+
+    const first = say(() => cli.run(['node', 'ratchet', 'artifact', 'close', art.id]));
+    assert.ok(/closed — rev 1/.test(first), first);
+    const closed = state.loadState(proj).artifacts.find((a) => a.id === art.id);
+    assert.strictEqual(closed.status, 'closed');
+    assert.strictEqual(closed.closedRev, v.verifiedRev);
+    assert.strictEqual(closed.closedHash, v.verifiedHash);
+    assert.ok(closed.closedBy, 'the certificate names the proof that authorized it');
+    assert.ok(closed.closedAt);
+    assert.strictEqual(state.loadState(proj).dirty, true);
+    assert.ok(state.loadState(proj).history.some((h) => h.event === 'artifact.closed'));
+
+    // a second close is a no-op, not an error — re-running a serialize block is free
+    const again = say(() => cli.run(['node', 'ratchet', 'artifact', 'close', art.id]));
+    assert.ok(/already closed/.test(again), again);
+    // and the closed record cannot be edited away
+    assert.throws(() => artifacts.addArtifact(proj, { id: art.id, title: 'rewrite history' }), /historical fact/);
+  });
+});
+
+ok('revising an artifact invalidates the proof bound to its old revision', () => {
+  const { proj, art } = boundFixture('close-revised', { kind: 'code', file: 'src/thing.js' });
+  inProject(proj, () => {
+    const v = evolveVerify.verify({ target: 'src/thing.js', testCommand: 'node -e 0', mode: 'code', cwd: proj, artifact: art });
+    journal.appendEvent(proj, keepFields(art), { verifiedHash: v.verifiedHash, verifiedRev: v.verifiedRev });
+    // rev 1 is closable...
+    assert.deepStrictEqual(
+      lifecycle.closureBlockers(state.loadState(proj), journal.readEvents(proj),
+        state.loadState(proj).artifacts.find((a) => a.id === art.id), proj), []
+    );
+    // ...and revising it is not
+    artifacts.addArtifact(proj, { id: art.id, title: 'thing, revised' });
+    assert.throws(() => cli.run(['node', 'ratchet', 'artifact', 'close', art.id]), /rev 2/);
+  });
+});
+
+ok('a record-scope close must be authorized by name', () => {
+  const proj = path.join(tmp, 'close-record');
+  fs.rmSync(proj, { recursive: true, force: true });
+  fs.mkdirSync(proj, { recursive: true });
+  state.initProject(proj, { force: true });
+  // the real dogfood shape: a path that is not a file
+  const art = artifacts.addArtifact(proj, { title: 'release note', kind: 'docs', path: 'CHANGELOG.md#unreleased' });
+  inProject(proj, () => {
+    const fp = lifecycle.fingerprint(proj, art);
+    assert.strictEqual(fp.hashScope, 'record');
+    journal.appendEvent(proj, {
+      target: 'CHANGELOG.md', artifactId: art.id, verdict: 'KEEP',
+      verification: { manualChecks: ['read end to end against the diff'], result: 'manual' },
+    }, { verifiedHash: fp.hash, verifiedRev: fp.rev });
+    assert.throws(() => cli.run(['node', 'ratchet', 'artifact', 'close', art.id]), /record-scope/);
+    cli.run(['node', 'ratchet', 'artifact', 'close', art.id, '--owner', 'danny', '--reason', 'no file ships; the record is the artifact']);
+    assert.strictEqual(state.loadState(proj).artifacts.find((a) => a.id === art.id).status, 'closed');
+  });
+});
+
+ok('holes block a close until they are filled or waived by a named owner', () => {
+  const { proj, art } = boundFixture('close-holes', { kind: 'code', file: 'src/thing.js' });
+  inProject(proj, () => {
+    artifacts.addArtifact(proj, { id: art.id, holes: ['no rollback path'] });
+    const live = state.loadState(proj).artifacts.find((a) => a.id === art.id);
+    const v = evolveVerify.verify({ target: 'src/thing.js', testCommand: 'node -e 0', mode: 'code', cwd: proj, artifact: live });
+    journal.appendEvent(proj, keepFields(live), { verifiedHash: v.verifiedHash, verifiedRev: v.verifiedRev });
+    assert.throws(() => cli.run(['node', 'ratchet', 'artifact', 'close', art.id]), /open hole/);
+    assert.throws(() => cli.run(['node', 'ratchet', 'artifact', 'close', art.id, '--waive-holes']), /open hole/);
+    cli.run(['node', 'ratchet', 'artifact', 'close', art.id, '--waive-holes', '--owner', 'danny', '--reason', 'rollback lands next release']);
+    const closed = state.loadState(proj).artifacts.find((a) => a.id === art.id);
+    assert.strictEqual(closed.status, 'closed');
+    assert.deepStrictEqual(closed.holesWaiver, { by: 'danny', reason: 'rollback lands next release' });
+  });
+});
+
+ok('loops close with evidence; parking stops the nagging but keeps the drain', () => {
+  state.initProject(cwd, { force: true });
+  cli.run(['node', 'ratchet', 'state', 'append', 'openLoops', '{"text":"pick the store shape"}']);
+  const loopId = state.loadState(cwd).openLoops[0].id;
+  assert.throws(() => cli.run(['node', 'ratchet', 'state', 'close', 'openLoops', loopId]), /evidence/);
+  const drained = scoring.scoreConfidence(state.loadState(cwd)).penalties.some((p) => /open loop/.test(p.reason));
+  assert.ok(drained, 'an open loop drains');
+
+  // park: named owner + a trigger that brings it back, and it STILL drains
+  cli.run(['node', 'ratchet', 'state', 'append', 'openLoops', '{"text":"decide the v0.9 rot check"}']);
+  const parkId = state.loadState(cwd).openLoops[1].id;
+  assert.throws(() => cli.run(['node', 'ratchet', 'state', 'close', 'openLoops', parkId, '--park']), /owner/);
+  assert.throws(
+    () => cli.run(['node', 'ratchet', 'state', 'close', 'openLoops', parkId, '--park', '--owner', 'danny']),
+    /revisit-trigger/
+  );
+  cli.run(['node', 'ratchet', 'state', 'close', 'openLoops', parkId, '--park', '--owner', 'danny', '--revisit-trigger', 'first rot report']);
+  const parked = state.loadState(cwd).openLoops.find((l) => l.id === parkId);
+  assert.strictEqual(parked.status, 'parked');
+  assert.strictEqual(parked.owner, 'danny');
+  assert.strictEqual(parked.revisitTrigger, 'first rot report');
+  assert.ok(
+    scoring.scoreConfidence(state.loadState(cwd)).penalties.some((p) => /2 open loop/.test(p.reason)),
+    'a parked question is an unanswered question with an owner — it still drains'
+  );
+
+  cli.run(['node', 'ratchet', 'state', 'close', 'openLoops', loopId, '--evidence', 'chose one store; decision recorded']);
+  const closedLoop = state.loadState(cwd).openLoops.find((l) => l.id === loopId);
+  assert.strictEqual(closedLoop.status, 'closed');
+  assert.ok(/chose one store/.test(closedLoop.evidence));
+  assert.ok(
+    scoring.scoreConfidence(state.loadState(cwd)).penalties.some((p) => /1 open loop/.test(p.reason)),
+    'a closed loop stops draining'
+  );
+});
+
+ok('assumptions end proven or dead, never just "done"', () => {
+  state.initProject(cwd, { force: true });
+  cli.run(['node', 'ratchet', 'state', 'append', 'assumptions', '{"text":"the seam is stable","killTest":"call it 100x"}']);
+  const id = state.loadState(cwd).assumptions[0].id;
+  assert.throws(() => cli.run(['node', 'ratchet', 'state', 'close', 'assumptions', id]), /tested\|killed/);
+  assert.throws(
+    () => cli.run(['node', 'ratchet', 'state', 'close', 'assumptions', id, '--outcome', 'tested']),
+    /evidence/
+  );
+  cli.run(['node', 'ratchet', 'state', 'close', 'assumptions', id, '--outcome', 'killed', '--evidence', 'failed on call 12']);
+  assert.strictEqual(state.loadState(cwd).assumptions[0].status, 'killed');
+  // other collections are refused, and pointed at their own verb
+  assert.throws(() => cli.run(['node', 'ratchet', 'state', 'close', 'defects', 'x', '--evidence', 'y']), /ratchet defect resolve/);
+  assert.throws(() => cli.run(['node', 'ratchet', 'state', 'close', 'artifacts', 'x', '--evidence', 'y']), /ratchet artifact close/);
+});
+
+ok('the fog auto-close names its authority and its evidence', () => {
+  state.initProject(cwd, { force: true });
+  cli.run(['node', 'ratchet', 'score', 'aperture', '{"ambiguity":2,"terrain":2,"taste":2,"blastRadius":1,"reversibility":1}']);
+  const map = artifacts.addArtifact(cwd, { kind: 'unknown-map', title: 'unknowns map: closure', holes: ['Q1 OPEN'] });
+  const fog = state.loadState(cwd).openLoops.filter((l) => /^fog:/.test(l.text));
+  assert.ok(fog.length >= 1);
+  for (const l of fog) {
+    assert.strictEqual(l.status, 'closed');
+    assert.strictEqual(l.closedBy, map.id, 'the close names which map answered it');
+    assert.ok(/unknown-map/.test(l.evidence), 'and states the evidence, not just the flag flip');
+  }
+});
+
+ok('end to end through the real binaries: build → bound verify → close → compile', () => {
+  // The in-process version below shares module state with the test. This one
+  // spawns bin/ratchet and bin/ratchet-evolve as the user does, carrying
+  // verifiedHash AND verifiedRev between two separate processes — the seam where
+  // a JSON contract between the two CLIs would actually break.
+  const { spawnSync } = require('child_process');
+  const root = path.resolve(__dirname, '..');
+  const proj = path.join(tmp, 'e2e-spawned');
+  fs.rmSync(proj, { recursive: true, force: true });
+  fs.mkdirSync(path.join(proj, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(proj, 'src', 'shipped.js'), 'module.exports = 1;\n', 'utf8');
+
+  const env = {
+    ...process.env,
+    RATCHET_DATA_DIR: path.join(proj, '.data'),
+    RATCHET_EVOLVE_LOG: path.join(proj, '.ratchet', 'evolve-log.jsonl'),
+  };
+  delete env.RATCHET_AGENT;
+  const run = (bin, ...argv) => {
+    const r = spawnSync(process.execPath, [path.join(root, 'bin', bin), ...argv], {
+      cwd: proj, env, encoding: 'utf8',
+    });
+    return { code: r.status, out: (r.stdout || '') + (r.stderr || '') };
+  };
+
+  assert.strictEqual(run('ratchet', 'state', 'set', 'objective', 'ship it').code, 0);
+  assert.strictEqual(
+    run('ratchet', 'artifact', 'add', '{"id":"art-e2e","title":"shipped","kind":"code","path":"src/shipped.js"}').code, 0
+  );
+
+  // close is refused before proof exists
+  const early = run('ratchet', 'artifact', 'close', 'art-e2e');
+  assert.strictEqual(early.code, 1, early.out);
+  assert.ok(/no proof → no close/.test(early.out), early.out);
+
+  // bound verify, across the process boundary
+  const v = run('ratchet-evolve', 'verify', 'src/shipped.js', '--artifact', 'art-e2e', '--test', 'node -e 0', '--json');
+  assert.strictEqual(v.code, 0, v.out);
+  const verified = JSON.parse(v.out);
+  assert.strictEqual(verified.hashScope, 'file');
+  assert.strictEqual(verified.verifiedRev, 1);
+
+  const appended = run('ratchet-evolve', 'log', 'append', JSON.stringify({
+    target: 'src/shipped.js', artifactId: 'art-e2e', verdict: 'KEEP', chosenMutation: 'ship it',
+    verifiedHash: verified.verifiedHash, verifiedRev: verified.verifiedRev,
+    verification: { commands: verified.commands, result: verified.result },
+    seam: { evidenceType: 'test', testedSeam: 'node -e 0', shipSeam: 'node -e 0', seamMatch: 'exact', independentFromBuilderMethod: true },
+  }));
+  assert.strictEqual(appended.code, 0, appended.out);
+
+  const closed = run('ratchet', 'artifact', 'close', 'art-e2e');
+  assert.strictEqual(closed.code, 0, closed.out);
+  assert.ok(/closed — rev 1/.test(closed.out), closed.out);
+  // idempotent through the binary too
+  assert.strictEqual(run('ratchet', 'artifact', 'close', 'art-e2e').code, 0);
+
+  const compiled = run('ratchet', 'compile', 'done', '--json');
+  assert.strictEqual(compiled.code, 0, compiled.out);
+  const summary = JSON.parse(compiled.out);
+  assert.strictEqual(summary.checkpointed, true);
+  assert.strictEqual(summary.closed, true, `the workflow is CLOSED through the real CLI: ${compiled.out}`);
+});
+
+ok('end to end: build → bound verify → close → compile actually reaches CLOSED', () => {
+  const proj = path.join(tmp, 'e2e-closed');
+  fs.rmSync(proj, { recursive: true, force: true });
+  fs.mkdirSync(path.join(proj, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(proj, 'src', 'shipped.js'), 'module.exports = 1;\n', 'utf8');
+  state.initProject(proj, { force: true });
+
+  inProject(proj, () => {
+    cli.run(['node', 'ratchet', 'state', 'set', 'objective', 'ship the closure gate']);
+    // BUILD
+    cli.run(['node', 'ratchet', 'artifact', 'add', '{"title":"shipped","kind":"code","path":"src/shipped.js"}']);
+    const art = state.loadState(proj).artifacts[0];
+    const events = () => journal.readEvents(proj);
+    assert.strictEqual(lifecycle.workflowClosed(state.loadState(proj), events(), proj).closed, false, 'a fresh build is not closed');
+    assert.ok(/ratchet-evolve verify/.test(lifecycle.nextTransition(state.loadState(proj), events(), proj).command));
+
+    // VERIFY, bound
+    const v = evolveVerify.verify({ target: 'src/shipped.js', testCommand: 'node -e 0', mode: 'code', cwd: proj, artifact: art });
+    journal.appendEvent(proj, {
+      target: 'src/shipped.js', artifactId: art.id, verdict: 'KEEP',
+      chosenMutation: 'ship it', verification: v,
+      seam: { evidenceType: 'test', testedSeam: 'node -e 0', shipSeam: 'node -e 0', seamMatch: 'exact', independentFromBuilderMethod: true },
+    }, { verifiedHash: v.verifiedHash, verifiedRev: v.verifiedRev });
+
+    // the loop now names close, not compile
+    assert.strictEqual(
+      lifecycle.nextTransition(state.loadState(proj), events(), proj).command, `ratchet artifact close ${art.id}`
+    );
+    // and a checkpoint here does NOT make it closed
+    cli.run(['node', 'ratchet', 'compile', 'done']);
+    assert.strictEqual(lifecycle.workflowClosed(state.loadState(proj), events(), proj).closed, false,
+      'checkpoint is not closure');
+
+    // CLOSE
+    cli.run(['node', 'ratchet', 'artifact', 'close', art.id]);
+    const closure = lifecycle.workflowClosed(state.loadState(proj), events(), proj);
+    assert.strictEqual(closure.closed, true, `expected CLOSED, blocked by: ${closure.blockers.map((b) => b.code).join(', ')}`);
+    assert.deepStrictEqual(closure.blockers, []);
+
+    // COMPILE — the last checkpoint after a real closure
+    assert.strictEqual(lifecycle.nextTransition(state.loadState(proj), events(), proj).command, 'ratchet compile done');
+    cli.run(['node', 'ratchet', 'compile', 'done']);
+    assert.strictEqual(lifecycle.nextTransition(state.loadState(proj), events(), proj).command, 'nothing pending');
+  });
+});
+
+// --- one derivation, four surfaces (0.8 Closure Gate) -----------------------
+
+ok('all four surfaces read the SAME nextTransition, not four lookalike strings', () => {
+  // No string-matching theatre: swap the derivation for a sentinel and demand
+  // the sentinel itself appears everywhere. A surface that computed its own
+  // answer would print its own answer instead.
+  const proj = path.join(tmp, 'sentinel');
+  fs.rmSync(proj, { recursive: true, force: true });
+  fs.mkdirSync(proj, { recursive: true });
+  state.initProject(proj, { force: true });
+
+  const real = lifecycle.nextTransition;
+  lifecycle.nextTransition = () => ({
+    label: 'SENTINEL-LABEL-9f31', command: 'SENTINEL-COMMAND-9f31', reason: 'injected', scope: 'injected',
+  });
+  try {
+    inProject(proj, () => {
+      const r = receipt.assemble(proj);
+      assert.strictEqual(r.next.transition.command, 'SENTINEL-COMMAND-9f31', 'receipt.assemble derives it');
+      assert.ok(/SENTINEL-COMMAND-9f31/.test(md.receipt(r)), 'and renders it');
+      assert.ok(/SENTINEL-COMMAND-9f31/.test(md.stateSummary(state.loadState(proj))), 'md.stateSummary derives it');
+
+      const compiled = say(() => cli.run(['node', 'ratchet', 'compile', 'done']));
+      assert.ok(/SENTINEL-COMMAND-9f31/.test(compiled), `compile done prints it — got: ${compiled}`);
+
+      const errs = [];
+      const origErr = process.stderr.write;
+      process.stderr.write = (str) => { errs.push(String(str)); return true; };
+      try {
+        cli.run(['node', 'ratchet', 'touch', 'x.md']);
+        cli.run(['node', 'ratchet', 'hook', 'stop-check']);
+      } finally {
+        process.stderr.write = origErr;
+      }
+      assert.ok(/SENTINEL-COMMAND-9f31/.test(errs.join('')), `stop-check prints it — got: ${errs.join('')}`);
+    });
+  } finally {
+    lifecycle.nextTransition = real;
+  }
+});
+
+ok('compile done says CHECKPOINTED, NOT CLOSED — and names what closing needs', () => {
+  const proj = path.join(tmp, 'checkpoint-voice');
+  fs.rmSync(proj, { recursive: true, force: true });
+  fs.mkdirSync(proj, { recursive: true });
+  state.initProject(proj, { force: true });
+  inProject(proj, () => {
+    const text = say(() => cli.run(['node', 'ratchet', 'compile', 'done']));
+    assert.ok(/CHECKPOINTED, NOT CLOSED — state serialized/.test(text), text);
+    assert.ok(/NEXT REQUIRED TRANSITION: .+ -> .+/.test(text), text);
+
+    const json = JSON.parse(say(() => cli.run(['node', 'ratchet', 'compile', 'done', '--json'])));
+    assert.strictEqual(json.checkpointed, true);
+    assert.strictEqual(json.closed, false, 'a checkpoint on an unclosed workflow says so');
+    for (const k of ['label', 'command', 'reason', 'scope']) assert.ok(json.next[k], `next.${k} present`);
+  });
+});
+
+ok('stop-check refuses to imply closure when it cannot read the state', () => {
+  const proj = path.join(tmp, 'stop-check-blind');
+  fs.rmSync(proj, { recursive: true, force: true });
+  fs.mkdirSync(proj, { recursive: true });
+  state.initProject(proj, { force: true });
+  const real = lifecycle.nextTransition;
+  lifecycle.nextTransition = () => { throw new Error('unreadable'); };
+  const errs = [];
+  const origErr = process.stderr.write;
+  process.stderr.write = (str) => { errs.push(String(str)); return true; };
+  try {
+    inProject(proj, () => {
+      assert.doesNotThrow(() => cli.run(['node', 'ratchet', 'hook', 'stop-check']), 'a hook never breaks the session');
+    });
+  } finally {
+    process.stderr.write = origErr;
+    lifecycle.nextTransition = real;
+  }
+  assert.ok(/closure state unreadable — do not claim closed/.test(errs.join('')), errs.join(''));
+});
+
+ok('confidence renders a fourth layer: workflow closure and its blockers', () => {
+  const proj = path.join(tmp, 'fourth-layer');
+  fs.rmSync(proj, { recursive: true, force: true });
+  fs.mkdirSync(proj, { recursive: true });
+  state.initProject(proj, { force: true });
+  inProject(proj, () => {
+    const text = say(() => cli.run(['node', 'ratchet', 'score', 'confidence']));
+    assert.ok(/Workflow closure/.test(text), text);
+    assert.ok(/not closed|NOT CLOSED/i.test(text), 'an unclosed workflow says so, never omits it');
+    assert.ok(/Scope:/.test(text.split('Workflow closure')[1] || ''), 'the fourth layer names its scope too');
+  });
+});
+
+// --- the receipt binds its proof (0.8 Closure Gate) --------------------------
+
+ok('receipt PROOF uses the ACTIVE artifact\'s bound event, and labels legacy evidence', () => {
+  const { proj, art } = boundFixture('receipt-bound', { kind: 'code', file: 'src/thing.js' });
+  inProject(proj, () => {
+    // A KEEP that matches by path but is bound to nothing: display only.
+    journal.appendEvent(proj, {
+      target: 'src/thing.js', mode: 'code', verdict: 'KEEP', chosenMutation: 'legacy shaped',
+      verification: { commands: [{ command: 'node -e 0', pass: true }], result: 'pass' },
+      seam: { evidenceType: 'test', testedSeam: 'x', shipSeam: 'x', seamMatch: 'exact', independentFromBuilderMethod: true },
+    });
+    let r = receipt.assemble(proj);
+    assert.ok(r.proof.keep, 'legacy evidence still renders');
+    assert.strictEqual(r.proof.keep.binding, 'legacy-unbound');
+    assert.strictEqual(r.proof.canAuthorizeClosure, false);
+    assert.ok(/legacy unbound evidence — display only, cannot authorize closure/.test(md.receipt(r)), md.receipt(r));
+
+    // now bind proof to the artifact itself
+    const v = evolveVerify.verify({ target: 'src/thing.js', testCommand: 'node -e 0', mode: 'code', cwd: proj, artifact: art });
+    journal.appendEvent(proj, keepFields(art, { chosenMutation: 'bound' }), { verifiedHash: v.verifiedHash, verifiedRev: v.verifiedRev });
+    r = receipt.assemble(proj);
+    assert.strictEqual(r.proof.keep.binding, 'bound');
+    assert.strictEqual(r.proof.keep.mutation, 'bound', 'the bound event wins over the last global KEEP');
+    assert.strictEqual(r.proof.canAuthorizeClosure, true);
+    assert.strictEqual(r.proof.shipDecision, 'justified');
+    assert.ok(!/legacy unbound evidence/.test(md.receipt(r)));
+  });
+});
+
+// --- closure derivation (0.8 Closure Gate) ----------------------------------
+
+ok('fingerprint binds to file bytes, and says so when it cannot', () => {
+  const proj = path.join(tmp, 'fp-fixture');
+  fs.mkdirSync(path.join(proj, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(proj, 'src', 'a.js'), 'one', 'utf8');
+
+  const file = lifecycle.fingerprint(proj, { id: 'a1', path: 'src/a.js', rev: 2 });
+  assert.strictEqual(file.hashScope, 'file');
+  assert.strictEqual(file.rev, 2);
+  assert.strictEqual(file.downgradeReason, '', 'a real file needs no excuse');
+  fs.writeFileSync(path.join(proj, 'src', 'a.js'), 'two', 'utf8');
+  assert.notStrictEqual(lifecycle.fingerprint(proj, { id: 'a1', path: 'src/a.js', rev: 2 }).hash, file.hash,
+    'editing the file changes the identity proof binds to');
+
+  // no path at all → the record IS the artifact
+  const rec = lifecycle.fingerprint(proj, { id: 'a2', kind: 'spec', title: 't', holes: [] });
+  assert.strictEqual(rec.hashScope, 'record');
+  assert.strictEqual(rec.rev, 1, 'a missing rev counts as 1, never 0');
+
+  // the real dogfood value: a fragment-bearing path is not a file
+  const frag = lifecycle.fingerprint(proj, { id: 'a3', path: 'CHANGELOG.md#unreleased', title: 't' });
+  assert.strictEqual(frag.hashScope, 'record');
+  assert.ok(/does not resolve to a file/.test(frag.downgradeReason), 'the downgrade states its reason');
+});
+
+ok('fingerprint refuses to bind outside the project, or to a directory', () => {
+  const proj = path.join(tmp, 'fp-refuse');
+  fs.mkdirSync(path.join(proj, 'sub'), { recursive: true });
+  assert.throws(() => lifecycle.fingerprint(proj, { id: 'x', path: 'sub' }), /not a regular file/);
+  assert.throws(() => lifecycle.fingerprint(proj, { id: 'x', path: '../escape.md' }), /outside the project/);
+  assert.throws(() => lifecycle.fingerprint(proj, { id: 'x', path: path.join(tmp, 'elsewhere.md') }), /outside the project/);
+});
+
+ok('a REVERT on the same binding revokes an older KEEP', () => {
+  const artifact = { id: 'art-1', title: 't', kind: 'spec', holes: [], rev: 1 };
+  const fp = lifecycle.fingerprint(tmp, artifact);
+  const bind = { artifactId: 'art-1', artifactRev: fp.rev, artifactHash: fp.hash, hashScope: fp.hashScope };
+  assert.ok(lifecycle.bindingEvent(artifact, [{ ...bind, verdict: 'KEEP' }], fp), 'a KEEP on the binding authorizes');
+  assert.strictEqual(
+    lifecycle.bindingEvent(artifact, [{ ...bind, verdict: 'KEEP' }, { ...bind, verdict: 'REVERT' }], fp),
+    null,
+    'the latest event on the binding wins — a later REVERT revokes the KEEP'
+  );
+  // and it never falls back to path/title matching
+  assert.strictEqual(
+    lifecycle.bindingEvent(artifact, [{ target: 't', verdict: 'KEEP' }], fp), null,
+    'an unbound event is evidence about a file, never authority over a record'
+  );
+  // a stale hash (the artifact was revised after the proof) does not authorize
+  assert.strictEqual(
+    lifecycle.bindingEvent(artifact, [{ ...bind, artifactHash: 'stale', verdict: 'KEEP' }], fp), null
+  );
+  // a proof gathered at a DIFFERENT scope does not authorize this one, even on an
+  // identical hash — record-scope evidence is a claim about a record.
+  assert.strictEqual(
+    lifecycle.bindingEvent(artifact, [{ ...bind, hashScope: 'file', verdict: 'KEEP' }], fp), null,
+    'the scope the proof was gathered at is part of the binding'
+  );
+});
+
+ok('a file whose bytes equal the record preimage cannot inherit the record proof', () => {
+  // The collision: record scope hashes `record:<kind>\n<title>\n<holes>`. A file
+  // containing exactly those bytes hashes identically — so without a scope check
+  // an old docs/manual KEEP would close a new .js file, skipping both the code
+  // seam gate and the record-scope owner gate. rev never moves, because the path
+  // resolving from "not a file" to "a file" is not a revision.
+  const proj = path.join(tmp, 'scope-collision');
+  fs.rmSync(proj, { recursive: true, force: true });
+  fs.mkdirSync(proj, { recursive: true });
+  const artifact = { id: 'art-collide', kind: 'docs', title: 'T', holes: [], rev: 1, path: 'anchor.md#frag' };
+
+  const asRecord = lifecycle.fingerprint(proj, artifact);
+  assert.strictEqual(asRecord.hashScope, 'record');
+  const proof = [{ artifactId: 'art-collide', artifactRev: 1, artifactHash: asRecord.hash, hashScope: 'record', verdict: 'KEEP' }];
+  assert.ok(lifecycle.bindingEvent(artifact, proof, asRecord), 'the record proof authorizes the record');
+
+  // now the path becomes a real file whose bytes ARE the record preimage
+  fs.writeFileSync(path.join(proj, 'anchor.md#frag'), 'record:docs\nT\n[]', 'utf8');
+  const asFile = lifecycle.fingerprint(proj, artifact);
+  assert.strictEqual(asFile.hashScope, 'file', 'the path now resolves to a file');
+  assert.strictEqual(asFile.hash, asRecord.hash, 'the hashes collide — this is the whole point');
+  assert.strictEqual(asFile.rev, asRecord.rev, 'and the revision never moved');
+  assert.strictEqual(
+    lifecycle.bindingEvent(artifact, proof, asFile), null,
+    'record-scope proof must not authorize a file-scope identity on a colliding hash'
+  );
+});
+
+ok('the fingerprint hashes bytes, not a lossy text decode', () => {
+  const proj = path.join(tmp, 'fp-bytes');
+  fs.rmSync(proj, { recursive: true, force: true });
+  fs.mkdirSync(proj, { recursive: true });
+  // Two files differing only in invalid-UTF8 bytes. Decoding to a string maps
+  // both to U+FFFD, so a text hash calls two different files identical — and a
+  // KEEP bound to one authorizes closing the other.
+  fs.writeFileSync(path.join(proj, 'a.bin'), Buffer.from([0x80]));
+  fs.writeFileSync(path.join(proj, 'b.bin'), Buffer.from([0x81]));
+  const a = lifecycle.fingerprint(proj, { id: 'x', path: 'a.bin' });
+  const b = lifecycle.fingerprint(proj, { id: 'x', path: 'b.bin' });
+  assert.notStrictEqual(a.hash, b.hash, 'different bytes are a different identity');
+
+  // and CRLF is byte-preserved and stable across reads, as it was before
+  fs.writeFileSync(path.join(proj, 'crlf.txt'), Buffer.from('one\r\ntwo\r\n', 'utf8'));
+  const c1 = lifecycle.fingerprint(proj, { id: 'x', path: 'crlf.txt' });
+  const c2 = lifecycle.fingerprint(proj, { id: 'x', path: 'crlf.txt' });
+  assert.strictEqual(c1.hash, c2.hash, 'a CRLF file hashes stably');
+  // an ASCII file hashes the same under bytes as it did under utf8 — no existing
+  // text binding is invalidated by the switch
+  fs.writeFileSync(path.join(proj, 'ascii.txt'), 'plain\n', 'utf8');
+  const ascii = lifecycle.fingerprint(proj, { id: 'x', path: 'ascii.txt' });
+  assert.strictEqual(
+    ascii.hash, require('crypto').createHash('sha256').update('plain\n').digest('hex'),
+    'valid UTF-8 hashes identically either way'
+  );
+});
+
+ok('a bare legacy status:"closed" is uncertified — not closed', () => {
+  assert.strictEqual(lifecycle.isClosed({ status: 'closed' }), false, 'status alone is a claim, not a certificate');
+  assert.strictEqual(lifecycle.isClosed({ status: 'closed', closedBy: 'evo_1', closedRev: 1 }), false, 'no hash, no certificate');
+  assert.strictEqual(
+    lifecycle.isClosed({ status: 'closed', closedBy: 'evo_1', closedRev: 1, closedHash: 'abc' }), true
+  );
+});
+
+ok('closureBlockers lists everything in one fixed order', () => {
+  const artifact = { id: 'art-p', kind: 'probe', title: 'probe: x', holes: ['disposal: pending'], rev: 1 };
+  const st = { artifacts: [artifact], defects: [{ id: 'd1', artifact: 'art-p', severity: 'high', status: 'open' }] };
+  const codes = lifecycle.closureBlockers(st, [], artifact, tmp).map((b) => b.code);
+  assert.deepStrictEqual(codes, ['probe', 'no-bound-proof', 'open-defects', 'holes'], 'fixed order, every blocker named');
+
+  // clean + bound + no defects + no holes → closable
+  const clean = { id: 'art-c', kind: 'spec', title: 't', holes: [], rev: 1 };
+  const fp = lifecycle.fingerprint(tmp, clean);
+  const bound = [{ artifactId: 'art-c', artifactRev: fp.rev, artifactHash: fp.hash, hashScope: fp.hashScope, verdict: 'KEEP' }];
+  assert.deepStrictEqual(lifecycle.closureBlockers({ artifacts: [clean], defects: [] }, bound, clean, tmp), []);
+  // holes alone block, and the waiver in the request clears exactly that one
+  const holey = { ...clean, holes: ['TODO'] };
+  const fpH = lifecycle.fingerprint(tmp, holey);
+  const boundH = [{ artifactId: 'art-c', artifactRev: fpH.rev, artifactHash: fpH.hash, hashScope: fpH.hashScope, verdict: 'KEEP' }];
+  assert.deepStrictEqual(
+    lifecycle.closureBlockers({ artifacts: [holey], defects: [] }, boundH, holey, tmp).map((b) => b.code), ['holes']
+  );
+  assert.deepStrictEqual(
+    lifecycle.closureBlockers({ artifacts: [holey], defects: [] }, boundH, holey, tmp,
+      { waiveHoles: true, owner: 'danny', reason: 'shipping without it' }), []
+  );
+});
+
+ok('workflowClosed will not close a workflow that still has live work', () => {
+  // The false positive: close B, then build A. `activeArtifact` picked the most
+  // recent record — which was still B — so the workflow read CLOSED while
+  // nextTransition was simultaneously demanding A's verification. The two
+  // surfaces contradicted each other, and the optimistic one is the dangerous one.
+  const closedFp = lifecycle.fingerprint(tmp, { id: 'art-B', kind: 'spec', title: 'B', holes: [], rev: 1 });
+  const B = {
+    id: 'art-B', kind: 'spec', title: 'B', holes: [], rev: 1,
+    status: 'closed', closedBy: 'evo_b', closedRev: closedFp.rev, closedHash: closedFp.hash,
+  };
+  const A = { id: 'art-A', kind: 'spec', title: 'A', holes: [], rev: 1, status: 'v0' };
+  const events = [{ artifactId: 'art-B', artifactRev: closedFp.rev, artifactHash: closedFp.hash, hashScope: closedFp.hashScope, verdict: 'KEEP' }];
+
+  // B closed first, A built after it — and also the reverse order, since "most
+  // recent record" must not be what decides.
+  for (const artifactsList of [[B, A], [A, B]]) {
+    const r = lifecycle.workflowClosed({ artifacts: artifactsList, defects: [] }, events, tmp);
+    assert.strictEqual(r.closed, false, `live work remains (order ${artifactsList.map((x) => x.id).join(',')})`);
+    assert.strictEqual(r.artifact.id, 'art-A', 'the closure read names the artifact that is still live');
+    assert.ok(r.blockers.some((b) => b.code === 'no-bound-proof'));
+  }
+
+  // and it agrees with nextTransition rather than contradicting it
+  const t = lifecycle.nextTransition({ objective: 'o', artifacts: [B, A] }, events, tmp);
+  assert.ok(/--artifact art-A/.test(t.command), `both surfaces name art-A, got: ${t.command}`);
+});
+
+ok('a defect attached to the certified artifact still blocks closure', () => {
+  // Once nothing live remains, the certified artifact is the workflow — and an
+  // open defect explicitly attached to it was being ignored, because the
+  // certified branch stopped looking at defects entirely.
+  const fp = lifecycle.fingerprint(tmp, { id: 'art-C', kind: 'spec', title: 'C', holes: [], rev: 1 });
+  const C = {
+    id: 'art-C', kind: 'spec', title: 'C', holes: [], rev: 1,
+    status: 'closed', closedBy: 'evo_c', closedRev: fp.rev, closedHash: fp.hash,
+  };
+  const events = [{ artifactId: 'art-C', artifactRev: fp.rev, artifactHash: fp.hash, hashScope: fp.hashScope, verdict: 'KEEP' }];
+  assert.strictEqual(lifecycle.workflowClosed({ artifacts: [C], defects: [] }, events, tmp).closed, true);
+
+  const withDefect = lifecycle.workflowClosed(
+    { artifacts: [C], defects: [{ id: 'd-on-closed', artifact: 'art-C', severity: 'high', status: 'open' }] }, events, tmp
+  );
+  assert.strictEqual(withDefect.closed, false, 'an open defect on the closed artifact is still open work');
+  assert.ok(withDefect.blockers.some((b) => b.code === 'open-defects'), withDefect.blockers.map((b) => b.code).join(','));
+});
+
+ok('workflowClosed refuses to call it closed while an orphan defect is open', () => {
+  const clean = { id: 'art-w', kind: 'spec', title: 't', holes: [], rev: 1, status: 'v1' };
+  const fp = lifecycle.fingerprint(tmp, clean);
+  const closed = { ...clean, status: 'closed', closedBy: 'evo_x', closedRev: fp.rev, closedHash: fp.hash };
+  const events = [{ artifactId: 'art-w', artifactRev: fp.rev, artifactHash: fp.hash, hashScope: fp.hashScope, verdict: 'KEEP' }];
+  assert.strictEqual(lifecycle.workflowClosed({ artifacts: [closed], defects: [] }, events, tmp).closed, true);
+  const withOrphan = lifecycle.workflowClosed(
+    { artifacts: [closed], defects: [{ id: 'd-orphan', artifact: '', severity: 'low', status: 'open' }] }, events, tmp
+  );
+  assert.strictEqual(withOrphan.closed, false, 'a legacy orphan defect must not slip workflow closure');
+  assert.ok(withOrphan.blockers.some((b) => b.code === 'unattached-defects'));
+  assert.ok(withOrphan.scope, 'the closure read names its scope');
+});
+
+ok('nextTransition derives one move, in precedence order, with a fixed shape', () => {
+  const shape = (t) => {
+    for (const k of ['label', 'command', 'reason', 'scope']) assert.ok(t[k], `transition always carries ${k}`);
+    return t;
+  };
+  // 1. no objective outranks everything
+  assert.ok(/lock/i.test(shape(lifecycle.nextTransition({}, [], tmp)).command));
+  // 2. an open critical/high defect outranks the artifact
+  const withDefect = shape(lifecycle.nextTransition(
+    { objective: 'o', defects: [{ id: 'd9', severity: 'critical', status: 'open' }] }, [], tmp
+  ));
+  assert.ok(/defect resolve d9/.test(withDefect.command));
+  // 3. a live artifact's first blocker supplies the remedy
+  const art = { id: 'art-n', kind: 'spec', title: 't', holes: [], rev: 1, status: 'v0' };
+  const unproven = shape(lifecycle.nextTransition({ objective: 'o', artifacts: [art] }, [], tmp));
+  assert.ok(/ratchet-evolve verify/.test(unproven.command), 'no bound proof → bind proof');
+  // 4. a closable artifact names close
+  const fp = lifecycle.fingerprint(tmp, art);
+  const bound = [{ artifactId: 'art-n', artifactRev: fp.rev, artifactHash: fp.hash, hashScope: fp.hashScope, verdict: 'KEEP' }];
+  assert.strictEqual(
+    shape(lifecycle.nextTransition({ objective: 'o', artifacts: [art] }, bound, tmp)).command,
+    'ratchet artifact close art-n'
+  );
+  // 5. all closed + dirty → checkpoint
+  const closed = { ...art, status: 'closed', closedBy: 'e', closedRev: fp.rev, closedHash: fp.hash };
+  assert.strictEqual(
+    shape(lifecycle.nextTransition({ objective: 'o', artifacts: [closed], dirty: true }, bound, tmp)).command,
+    'ratchet compile done'
+  );
+  // 6. nothing pending is stated, never omitted
+  assert.strictEqual(
+    shape(lifecycle.nextTransition({ objective: 'o', artifacts: [closed], dirty: false }, bound, tmp)).command,
+    'nothing pending'
+  );
+});
+
+// --- migration: a real v0.7 store, untouched (0.8 Closure Gate) -------------
+
+ok('a v0.7 store loads, scores, renders, and accepts every new verb without corruption', () => {
+  // Mirrors the shapes the live dogfood store actually carries: free-text
+  // statuses, a bare status:"closed", duplicate ids, an unattached open defect,
+  // a fragment-bearing path, unbound events, and no rev fields anywhere.
+  // Migration is additive and lazy: STATE_VERSION stays 1, no script runs.
+  const proj = path.join(tmp, 'v07-store');
+  fs.rmSync(proj, { recursive: true, force: true });
+  fs.mkdirSync(path.join(proj, '.ratchet'), { recursive: true });
+  state.initProject(proj, { force: true });
+
+  const legacy = state.loadState(proj);
+  delete legacy.rev;
+  legacy.objective = 'finish the 0.7 run';
+  legacy.nextAction = 'write the release memory';
+  legacy.nextCommand = '/ratchet:compile';
+  legacy.artifacts = [
+    { id: 'art-dup', at: '2026-07-01T00:00:00.000Z', kind: 'docs', title: 'first', status: 'v1', holes: [] },
+    { id: 'art-dup', at: '2026-07-01T00:00:01.000Z', kind: 'docs', title: 'second', status: 'v1', holes: [] },
+    { id: 'art-bare-closed', at: '2026-07-02T00:00:00.000Z', kind: 'code', title: 'done thing', status: 'closed', holes: [] },
+    { id: 'art-frag', at: '2026-07-03T00:00:00.000Z', kind: 'docs', title: 'release note', status: 'shipped v3', path: 'CHANGELOG.md#unreleased' },
+  ];
+  legacy.defects = [
+    { id: 'def-orphan', at: '2026-07-02T00:00:00.000Z', severity: 'medium', summary: 'nobody attached me', status: 'open', artifact: '' },
+  ];
+  legacy.assumptions = [{ id: 'asm-1', text: 'the seam holds', status: 'untested' }];
+  legacy.openLoops = [{ id: 'loop-1', text: 'decide the release name', status: 'open' }];
+  state.writeJson(state.statePath(proj), legacy);
+
+  const evolveLog = path.join(proj, 'evolve-log.jsonl');
+  fs.writeFileSync(evolveLog, JSON.stringify({
+    id: 'evo_2026_07_03_001', target: 'CHANGELOG.md', mode: 'docs', verdict: 'KEEP',
+    verification: { commands: [], manualChecks: ['read end to end'], result: 'manual' },
+    seam: { seamMatch: 'exact' },
+  }) + '\n', 'utf8');
+
+  inProject(proj, () => {
+    const s = state.loadState(proj);
+    assert.strictEqual(s.rev, undefined, 'load does not migrate the file');
+    const events = journal.readEvents(proj);
+    assert.strictEqual(events.length, 1);
+    assert.strictEqual(events[0].artifactId, undefined, 'a v0.7 event has no binding and never gains one');
+
+    // it SCORES
+    const layers = scoring.scoreConfidenceLayers(s, state.loadLedger(proj), events);
+    for (const l of ['artifact', 'session', 'ledger']) assert.ok(layers[l].scope, `${l} layer still scoped`);
+    // it RENDERS — every surface, no throw
+    assert.ok(/Ratchet state/.test(md.stateSummary(s)));
+    const r = receipt.assemble(proj);
+    assert.ok(/Ratchet receipt/.test(md.receipt(r)));
+    assert.ok(/Confidence/.test(md.confidenceLayers(layers, lifecycle.workflowClosed(s, events, proj))));
+    assert.doesNotThrow(() => md.fullExport(s, state.loadLedger(proj)));
+
+    // the fragment path downgrades to record scope, with the reason stated
+    const frag = lifecycle.fingerprint(proj, s.artifacts.find((a) => a.id === 'art-frag'));
+    assert.strictEqual(frag.hashScope, 'record');
+    assert.ok(/does not resolve to a file/.test(frag.downgradeReason));
+
+    // the bare "closed" is UNCERTIFIED: it runs the full gate, not the no-op
+    const bare = s.artifacts.find((a) => a.id === 'art-bare-closed');
+    assert.strictEqual(lifecycle.isClosed(bare), false);
+    assert.throws(() => cli.run(['node', 'ratchet', 'artifact', 'close', 'art-bare-closed']), /no KEEP proof bound/);
+
+    // the duplicate id refuses every lifecycle verb, repair-ably
+    assert.throws(() => cli.run(['node', 'ratchet', 'artifact', 'close', 'art-dup']), /share the id/);
+    assert.throws(() => cli.run(['node', 'ratchet', 'retract', 'art-dup', '--reason', 'x']), /share the id/);
+
+    // the unattached defect blocks WORKFLOW closure but not this artifact's close
+    const closure = lifecycle.workflowClosed(s, events, proj);
+    assert.strictEqual(closure.closed, false);
+    assert.ok(closure.blockers.some((b) => b.code === 'unattached-defects'));
+    const fragBlockers = lifecycle.closureBlockers(s, events, s.artifacts.find((a) => a.id === 'art-frag'), proj);
+    assert.ok(!fragBlockers.some((b) => b.code === 'unattached-defects'), 'an orphan defect is not this artifact\'s blocker');
+
+    // and a migrated artifact can actually be PROVEN and CLOSED — "accepts every
+    // new verb" is only true if the whole closure path runs on a v0.7 record.
+    fs.mkdirSync(path.join(proj, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(proj, 'src', 'migrated.js'), 'module.exports = 7;\n', 'utf8');
+    cli.run(['node', 'ratchet', 'artifact', 'add', '{"id":"art-frag","path":"src/migrated.js"}']);
+    const migrated = state.loadState(proj).artifacts.find((a) => a.id === 'art-frag');
+    assert.strictEqual(migrated.rev, 2, 'a legacy record with no rev revises to 2');
+    const mv = evolveVerify.verify({ target: 'src/migrated.js', testCommand: 'node -e 0', mode: 'auto', cwd: proj, artifact: migrated });
+    assert.strictEqual(mv.hashScope, 'file', 'the fragment path was replaced by a real file');
+    journal.appendEvent(proj, {
+      target: 'src/migrated.js', artifactId: 'art-frag', verdict: 'KEEP', chosenMutation: 'proved a migrated record',
+      verification: { commands: mv.commands, result: mv.result },
+      seam: { evidenceType: 'test', testedSeam: 'node -e 0', shipSeam: 'node -e 0', seamMatch: 'exact', independentFromBuilderMethod: true },
+    }, { verifiedHash: mv.verifiedHash, verifiedRev: mv.verifiedRev });
+    cli.run(['node', 'ratchet', 'artifact', 'close', 'art-frag']);
+    const nowClosed = state.loadState(proj).artifacts.find((a) => a.id === 'art-frag');
+    assert.strictEqual(lifecycle.isClosed(nowClosed), true, 'a v0.7 record earns a real closure certificate');
+    assert.strictEqual(nowClosed.closedRev, 2);
+
+    // and every OTHER new verb works on the old store
+    cli.run(['node', 'ratchet', 'state', 'close', 'openLoops', 'loop-1', '--evidence', 'named it Closure Gate']);
+    cli.run(['node', 'ratchet', 'state', 'close', 'assumptions', 'asm-1', '--outcome', 'tested', '--evidence', 'held for 0.7']);
+    cli.run(['node', 'ratchet', 'defect', 'resolve', 'def-orphan', '--evidence', 'attached and fixed']);
+    say(() => cli.run(['node', 'ratchet', 'compile', 'done']));
+
+    const after = state.loadState(proj);
+    assert.strictEqual(after.openLoops[0].status, 'closed');
+    assert.strictEqual(after.assumptions[0].status, 'tested');
+    assert.strictEqual(after.defects[0].status, 'resolved');
+    assert.strictEqual(after.artifacts.length, 4, 'no artifact was lost or duplicated');
+    assert.ok(Number.isInteger(after.rev) && after.rev >= 1, 'rev started counting on the first write, lazily');
+    assert.strictEqual(after.version, 1, 'STATE_VERSION did not move');
+  });
 });
 
 fs.rmSync(tmp, { recursive: true, force: true });

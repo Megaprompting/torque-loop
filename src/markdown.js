@@ -2,6 +2,17 @@
 
 const scoring = require('./scoring');
 const ledgerMod = require('./ledger');
+const lifecycle = require('./lifecycle');
+
+// The journal read lives here, not in lifecycle: lifecycle stays pure (events
+// are always passed in) so it can be exercised without a filesystem.
+function safeEvents(cwd) {
+  try {
+    return require('./evolve/journal').readEvents(cwd);
+  } catch (_e) {
+    return [];
+  }
+}
 
 // All human/agent-facing rendering lives here so the CLI stays a thin router.
 // Output is Markdown because it is injected straight into skill prompts.
@@ -15,7 +26,7 @@ function bullets(items, fmt) {
   return items.map((x) => `- ${fmt(x)}`).join('\n');
 }
 
-function stateSummary(state) {
+function stateSummary(state, { events = null, cwd = process.cwd() } = {}) {
   const conf = scoring.scoreConfidence(state);
   const openDefects = (state.defects || []).filter(scoring.isDefectOpen);
   const openLoops = (state.openLoops || []).filter((l) => l.status !== 'closed');
@@ -42,6 +53,11 @@ function stateSummary(state) {
   lines.push(`- **Last decision:** ${lastDecision ? lastDecision.choice : '—'}`);
   lines.push(`- **Next action:** ${dash(state.nextAction)}`);
   lines.push(`- **Next command:** ${dash(state.nextCommand)}`);
+  // The recorded next command is what someone typed; the required transition is
+  // what the record actually owes. Both are shown, because when they disagree
+  // the disagreement IS the finding.
+  const t = lifecycle.nextTransition(state, events || safeEvents(cwd), cwd);
+  lines.push(`- **Next required transition:** ${t.label} → \`${t.command}\``);
   if (stale) lines.push(`- ⚠️ **Stale:** work changed since last compile — run \`/ratchet:compile\`.`);
   // The confidence figure above is scoped to recorded state, not code
   // correctness — say so, so the summary never reads as a ship-readiness claim.
@@ -104,9 +120,9 @@ function confidence(state) {
 // Three-layer confidence. Rendered as three independently-scoped scores so a
 // verified artifact never reads as "blocked" because of unrelated ledger debt —
 // the exact gaslighting a single blunt score used to produce.
-function confidenceLayers(layers) {
+function confidenceLayers(layers, closure) {
   const o = [];
-  o.push('### Confidence — three layers, each scoped');
+  o.push('### Confidence — three scored layers + the closure read');
   o.push('');
   const render = (title, c) => {
     if (!c) return;
@@ -123,7 +139,20 @@ function confidenceLayers(layers) {
   render('Artifact confidence', layers.artifact);
   render('Session confidence', layers.session);
   render('Ledger health', layers.ledger);
+  // The fourth layer is not a score, and that is the point: closure is a yes/no
+  // fact with named blockers, never a number that can read "high enough".
+  o.push(`**Workflow closure: ${closure ? (closure.closed ? 'CLOSED' : 'NOT CLOSED') : '— not evaluated in this read'}**`);
+  if (closure) {
+    if (closure.scope) o.push(`_Scope: ${closure.scope}._`);
+    if (closure.blockers && closure.blockers.length) {
+      for (const b of closure.blockers) o.push(`- [${b.code}] ${b.message}`);
+    } else {
+      o.push('- no blockers recorded');
+    }
+  }
+  o.push('');
   o.push('_The layers are independent: a verified patch stays high on artifact confidence even when ledger health is low._');
+  o.push('_A high score is not a closure. Checkpoint is not closure; no proof → no close._');
   return o.join('\n');
 }
 
@@ -314,8 +343,15 @@ function receipt(r) {
     o.push(
       `  - evidence: ${em(k.evidenceType)} · result: ${em(k.result)}${k.independent === false ? ' · ⚠ not independent' : ''}`
     );
-    if (k.commands && k.commands.length) o.push(`  - commands: ${k.commands.map((c) => `\`${c}\``).join(', ')}`);
+    if (k.commands && k.commands.length) {
+      o.push(`  - commands: ${k.commands.map((c) => `\`${typeof c === 'string' ? c : c.command || 'unnamed'}\``).join(', ')}`);
+    }
     if (k.manualChecks && k.manualChecks.length) o.push(`  - checks: ${k.manualChecks.join('; ')}`);
+    if (k.binding === 'bound') {
+      o.push(`  - bound to \`${em(k.artifactId)}\` rev ${em(k.artifactRev)} — this proof can authorize closing it`);
+    } else {
+      o.push('  - ⚠ legacy unbound evidence — display only, cannot authorize closure');
+    }
   } else {
     o.push('- — no proven KEEP on record');
   }
@@ -418,13 +454,26 @@ function receipt(r) {
   }
   o.push('');
 
-  // 8 — NEXT: the single next move.
+  // 8 — NEXT: the single next move. The required transition is derived from the
+  // record; the recorded action/command is what a human last typed. Both show,
+  // because when they disagree the disagreement is the finding.
   o.push('**NEXT**');
+  const closure = r.closure || { closed: false, blockers: [] };
+  o.push(`- Workflow: ${closure.closed ? 'CLOSED' : 'NOT CLOSED'}`);
+  if (!closure.closed) {
+    const bl = (closure.blockers || []).slice(0, 3);
+    for (const b of bl) o.push(`  - [${em(b.code)}] ${em(b.message)}`);
+    if ((closure.blockers || []).length > bl.length) {
+      o.push(`  - … and ${closure.blockers.length - bl.length} more blocker(s)`);
+    }
+  }
+  const t = r.next.transition;
+  if (t) o.push(`- Required transition: ${em(t.label)} → \`${em(t.command)}\``);
   if (r.next.action || r.next.command) {
     o.push(`- Action: ${em(r.next.action)}`);
     o.push(`- Command: ${em(r.next.command)}`);
   } else {
-    o.push('- — undefined (a cold session has no first move; run `/ratchet:lock` or `/ratchet:ignite`)');
+    o.push('- Recorded action/command: — none (a cold session has no first move)');
   }
   if (r.next.edge) o.push(`- Next edge: ${r.next.edge}`);
 

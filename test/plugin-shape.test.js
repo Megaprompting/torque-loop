@@ -80,6 +80,30 @@ ok('hooks/hooks.json exists and parses', () => {
   assert.ok(hooks.hooks, 'hooks.json has a hooks map');
 });
 
+ok('every hooks.json command resolves to a real CLI hook subcommand', () => {
+  // cmdHook's default: returns silently (hooks must never break a session), so a
+  // renamed or misspelled subcommand in hooks.json would no-op forever in every
+  // installed copy. This is the only tripwire for that drift.
+  const hooks = readJson('hooks/hooks.json');
+  const wired = [];
+  for (const entries of Object.values(hooks.hooks)) {
+    for (const entry of entries) {
+      for (const h of entry.hooks || []) {
+        const m = /bin\/ratchet"?\s+hook\s+([a-z][a-z-]*)/.exec(h.command || '');
+        assert.ok(m, `hook command is a ratchet hook invocation: ${h.command}`);
+        wired.push(m[1]);
+      }
+    }
+  }
+  assert.ok(wired.length >= 3, 'hooks.json wires at least session-start, post-edit, stop-check');
+  const body = /function cmdHook[\s\S]*?\r?\n\}/.exec(read('src/cli.js'));
+  assert.ok(body, 'src/cli.js defines cmdHook');
+  const handled = new Set(Array.from(body[0].matchAll(/case '([^']+)':/g), (m) => m[1]));
+  for (const sub of wired) {
+    assert.ok(handled.has(sub), `hooks.json wires "hook ${sub}" but cmdHook does not handle it (silent no-op)`);
+  }
+});
+
 ok('every bin target from package.json exists', () => {
   for (const [name, rel] of Object.entries(pkg.bin || {})) {
     assert.ok(exists(rel), `bin ${name} -> ${rel} exists`);
@@ -132,6 +156,19 @@ ok('README command list matches the skill folders', () => {
   }
 });
 
+ok('README version examples match package.json (readouts must not drift)', () => {
+  // The project's whole claim is state/readout trust — a README that shows a
+  // stale `ratchet --version` output is the exact poison the receipt hunts.
+  // Any `-> ratchet <semver>` example in the README is a version surface.
+  const readme = read('README.md');
+  const hits = readme.match(/->\s*ratchet\s+\d+\.\d+\.\d+/g) || [];
+  assert.ok(hits.length >= 1, 'README shows a ratchet --version example');
+  for (const hit of hits) {
+    const v = hit.match(/(\d+\.\d+\.\d+)/)[1];
+    assert.strictEqual(v, pkg.version, `README version example "${hit.trim()}" matches package.json`);
+  }
+});
+
 ok('README does not mention removed command names', () => {
   const readme = read('README.md');
   assert.ok(!readme.includes('/ratchet:ratchet-evolve'), 'no stale /ratchet:ratchet-evolve in README');
@@ -168,6 +205,111 @@ ok('the probe primitive threads map → build → handoff with a disposal rule',
   assert.ok(/probe/i.test(read('skills/handoff/SKILL.md')), 'handoff surfaces probe outcomes');
   assert.ok(/probe/i.test(read('reference/PROMPTS.md')), 'the prompt source of truth knows the probe closure');
   assert.ok(/probe/i.test(read('templates/unknowns-map.md')), 'the map template offers probe as a closure');
+});
+
+// --- the closure gate reaches the prose too (0.8) ---------------------------
+// Every one of these is prompt-level guidance. The CLI enforcement lives in
+// src/lifecycle.js + the close verbs; these guards only stop the prose from
+// drifting back to teaching the loop that a checkpoint is an ending.
+
+ok('the canonical path forces verify, and the prompt catalog knows closure', () => {
+  const prompts = read('reference/PROMPTS.md');
+  const canonical = /\*\*The path every prompt forces:\*\*[^\r\n]*/.exec(prompts);
+  assert.ok(canonical, 'PROMPTS.md states the canonical path');
+  // Order is the claim, not the vocabulary: verify has to sit AFTER patch and
+  // BEFORE serialize, or the path still teaches serializing an unproven change.
+  assert.ok(
+    /patch[^\r\n]*→[^\r\n]*verify[^\r\n]*→[^\r\n]*serialize/.test(canonical[0]),
+    `the canonical path runs patch → verify → serialize: ${canonical[0]}`
+  );
+  assert.ok(/artifact close|no proof → no close/i.test(prompts), 'the prompt source of truth knows the closure gate');
+});
+
+ok('ignite carries a verify step and the current A0–A4 table', () => {
+  const ignite = read('skills/ignite/SKILL.md');
+  assert.ok(/verify/i.test(ignite), 'ignite runs a verify step');
+  for (const level of ['A0', 'A1', 'A2', 'A3', 'A4']) {
+    assert.ok(new RegExp(`\\b${level}\\b`).test(ignite), `ignite's aperture table lists ${level}`);
+  }
+  // the table must match the shipped sequences, not a remembered older set
+  const scoring = require('../src/scoring');
+  for (const band of scoring.APERTURE_LEVELS) {
+    const row = new RegExp(`\\|\\s*${band.level}\\b[^\\r\\n]*`).exec(ignite);
+    assert.ok(row, `ignite has a table row for ${band.level}`);
+    // In ORDER — a row listing the right steps in the wrong order is exactly the
+    // drift this guard exists to catch (e.g. compile before verify).
+    let cursor = 0;
+    for (const step of band.sequence) {
+      const at = row[0].indexOf(step, cursor);
+      assert.ok(at >= 0, `${band.level} row names "${step}" in sequence order (row: ${row[0].trim()})`);
+      cursor = at + step.length;
+    }
+  }
+});
+
+ok('loop cycles through verify and cannot stop on a score alone', () => {
+  const loop = read('skills/loop/SKILL.md');
+  assert.ok(/build\s*→\s*attack\s*→\s*patch\s*→\s*verify\s*→\s*compile/.test(loop), 'the cycle runs verify before compile');
+  assert.ok(/workflowClosed|workflow closure/i.test(loop), 'the stop condition reads workflow closure, not just loopClear');
+  assert.ok(/loopClear/.test(loop), 'and still reads loopClear');
+  assert.ok(
+    !/declare convergence and stop/.test(loop),
+    'the "converged" escape is gone: converging on an unclosed workflow is stopping early'
+  );
+});
+
+ok('patch resolves the ORIGINAL defect instead of birthing a resolved one', () => {
+  const patch = read('skills/patch/SKILL.md');
+  assert.ok(/ratchet defect resolve [^\r\n]*--evidence/.test(patch), 'patch serializes with defect resolve --evidence');
+  assert.ok(
+    !/defect add[^\r\n]*"status"\s*:\s*"(resolved|closed|waived|superseded)"/.test(patch),
+    'no born-resolved defect example — a defect cannot be born terminal'
+  );
+});
+
+ok('attack and verify name the artifact they are about', () => {
+  // The DEFECT ADD payload is what has to carry it — the field mentioned in prose
+  // somewhere else on the page is not what a caller copies.
+  for (const rel of ['skills/attack/SKILL.md', 'skills/verify/SKILL.md']) {
+    const text = read(rel);
+    const add = /ratchet defect add[^\r\n]*/.exec(text);
+    assert.ok(add, `${rel} shows a defect add example`);
+    assert.ok(/"artifact"\s*:\s*"<id>"/.test(add[0]), `${rel} defect add payload names "artifact":"<id>": ${add[0]}`);
+  }
+});
+
+ok('verify binds its run and closes on green', () => {
+  const verify = read('skills/verify/SKILL.md');
+  assert.ok(/ratchet-evolve verify [^\r\n]*--artifact/.test(verify), 'verify runs bound to an artifact');
+  // Not "the words appear somewhere": the log append EXAMPLE must carry both
+  // fields, because a caller copies that block. The hash alone cannot see a
+  // metadata-only revision, so the rev has to travel with it.
+  const append = /ratchet-evolve log append[\s\S]*?```/.exec(verify);
+  assert.ok(append, 'verify shows a log append example');
+  assert.ok(/verifiedHash/.test(append[0]), 'the log append example carries verifiedHash');
+  assert.ok(/verifiedRev/.test(append[0]), 'the log append example carries verifiedRev');
+  // On the GREEN path specifically. `artifact close` sitting under the red-path
+  // instructions would teach closing on a failed run — the opposite of the gate.
+  const green = verify.split(/On GREEN/i)[1] || '';
+  assert.ok(green, 'verify separates the green path');
+  assert.ok(/ratchet artifact close/.test(green), 'a green bound run ends by closing the artifact');
+});
+
+ok('compile teaches CHECKPOINT, not CLOSED', () => {
+  const compile = read('skills/compile/SKILL.md');
+  assert.ok(/CHECKPOINT/.test(compile), 'compile calls itself a checkpoint');
+  assert.ok(/not closure|NOT CLOSED/i.test(compile), 'and says out loud that it is not closure');
+  assert.ok(/ratchet artifact close/.test(compile), 'and names the verb that does close');
+  assert.ok(
+    !/defect add[^\r\n]*"status"\s*:\s*"(resolved|closed|waived|superseded)"/.test(compile),
+    'no terminal-status defect-add example'
+  );
+});
+
+ok('handoff checkpoints through compile done, never the scalar bypass', () => {
+  const handoff = read('skills/handoff/SKILL.md');
+  assert.ok(/ratchet compile done/.test(handoff), 'handoff uses compile done');
+  assert.ok(!/state set (dirty|lastCompileAt)/.test(handoff), 'and not the removed scalar bypass');
 });
 
 process.stdout.write(`\n${passed} passed\n`);

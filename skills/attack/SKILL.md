@@ -60,9 +60,13 @@ UNPROVEN CLAIMS:
 Record every real defect (one call each) so confidence reflects reality:
 
 ```
-ratchet defect add '{"severity":"critical","summary":"..."}'
+ratchet defect add '{"severity":"critical","summary":"...","artifact":"<id>"}'
 ratchet state set phase attack
 ```
+
+Name the artifact the defect attacks. With exactly one live artifact the CLI attaches it
+for you; with two or more it refuses rather than guess, because attaching to the wrong one
+blocks the innocent artifact's closure and lets the guilty one close clean.
 
 If nothing critical or high survived a genuine attack, say so plainly — that is a real
 result. Next: `/ratchet:patch` to fix exactly what failed.

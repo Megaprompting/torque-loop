@@ -280,12 +280,17 @@ function scoreConfidenceLayers(state, ledger, events = []) {
 
 const APERTURE_DIMENSIONS = ['ambiguity', 'terrain', 'taste', 'blastRadius', 'reversibility'];
 
+// Two invariants hold across every band, and a test pins both: the sequence ENDS
+// on compile (work that is never serialized is work the next session cannot
+// resume), and any sequence that builds VERIFIES after its last build/patch
+// (otherwise the last edit ships unrun). A0 gained compile and A3 gained verify
+// on exactly those grounds; A4 ends on compile because a decision is an artifact.
 const APERTURE_LEVELS = [
-  { max: 2, level: 'A0', name: 'Snap', implement: true, sequence: ['build', 'verify'] },
+  { max: 2, level: 'A0', name: 'Snap', implement: true, sequence: ['build', 'verify', 'compile'] },
   { max: 4, level: 'A1', name: 'Narrow', implement: true, sequence: ['lock', 'build', 'verify', 'compile'] },
   { max: 6, level: 'A2', name: 'Working', implement: true, sequence: ['lock', 'cut', 'build', 'attack', 'patch', 'verify', 'compile'] },
-  { max: 8, level: 'A3', name: 'Wide', implement: true, sequence: ['lock', 'map', 'auction', 'cut', 'decide', 'build', 'attack', 'patch', 'compile'] },
-  { max: 10, level: 'A4', name: 'Max', implement: false, sequence: ['lock', 'map', 'cut', 'decide'] },
+  { max: 8, level: 'A3', name: 'Wide', implement: true, sequence: ['lock', 'map', 'auction', 'cut', 'decide', 'build', 'attack', 'patch', 'verify', 'compile'] },
+  { max: 10, level: 'A4', name: 'Max', implement: false, sequence: ['lock', 'map', 'cut', 'decide', 'compile'] },
 ];
 
 // A missing dimension defaults to 1 (neutral), never 0 — treating unknown
