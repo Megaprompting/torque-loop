@@ -1,6 +1,6 @@
 {
   "name": "torque-loop",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Torque Loop evolves ambiguous work into shipped, tested, serialized artifacts through evidence-gated loops.",
   "author": {
     "name": "Danny Gillespie",

@@ -5,7 +5,9 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — Closure Gate
+## [Unreleased]
+
+## [0.8.0] - 2026-07-29 — Closure Gate
 
 0.7 gated the fog. It left the loop able to *stop* but not to *finish*: `compile done`
 serialized the record and every surface treated that as an ending, so a session could
@@ -543,7 +545,8 @@ Initial public release.
 - Single-plugin marketplace manifest so the repo installs directly as a Claude Code plugin.
 - Zero-dependency smoke test suites for the state engine and the evolution helpers.
 
-[Unreleased]: https://github.com/TheLucidTech/torque-loop/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/TheLucidTech/torque-loop/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/TheLucidTech/torque-loop/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/TheLucidTech/torque-loop/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/TheLucidTech/torque-loop/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/TheLucidTech/torque-loop/compare/v0.4.0...v0.5.0
