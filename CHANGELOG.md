@@ -41,13 +41,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   kernel accepted but JSON cannot carry (BigInt, cycles) answers `-32603` on the wire,
   and every protocol judgment defers to the kernel. No `bin/` entry point yet — exposing
   `ratchet-mcp` is a public-surface decision parked for Danny (open loop).
-- **`test/mcp-rpc.test.js` — 38-case contract suite**, wired into `npm test` (the
-  plugin-shape unwired-suite guard was verified red against it first). An independent
-  Codex review of the first cut returned 15 findings and the verdict "one era does NOT
-  hold"; 12 reproduced red and were fixed, one was ruled design (the discover exemption
-  above), one was a test that could not fail (strengthened to assert eras), and one —
-  remedies on standard JSON-RPC refusals — was applied where a remedy exists
-  (`reconnect`) and declined for wire-level errors whose reason is the remedy.
+- **`test/mcp-rpc.test.js` — 49-case contract suite**, wired into `npm test` (the
+  plugin-shape unwired-suite guard was verified red against it first). Two independent
+  Codex review rounds, every accepted finding reproduced red before its fix. Round 1
+  (15 findings, verdict "one era does NOT hold"): 12 fixed, one ruled design (the
+  discover exemption above), one an unfalsifiable test (strengthened), one — remedies on
+  standard JSON-RPC refusals — applied where a remedy exists (`reconnect`) and declined
+  for wire-level errors whose reason is the remedy. Round 2 (2 high / 7 medium / 5 low):
+  an initialize wearing the modern `_meta` marker proves both eras and now refuses
+  unpinned; an incomplete legacy handshake (missing `capabilities`/`clientInfo`) pins
+  nothing; a result smuggling `toJSON` is `-32603` (it would rewrite the wire shape
+  after decoration); decoration spreads instead of `Object.assign` so an own `__proto__`
+  key neither pollutes nor suppresses `resultType`; `clientCapabilities` must be a map,
+  not an array; no refusal path echoes an unusable id (objects, non-finite numbers →
+  `id: null`); dropped notifications are countable (`dropped()`) so tests can tell
+  acceptance from silent rejection; the unpinned era refusal says "no era yet", not
+  "the null era"; and stdio splits lines as bytes — invalid UTF-8 is a named `-32700`
+  (a legitimate U+FFFD still round-trips), a split-CRLF exact-cap line survives, and no
+  decoder state escapes the cap.
 
 ## [0.9.0] - 2026-07-29 — Concurrency Gate
 

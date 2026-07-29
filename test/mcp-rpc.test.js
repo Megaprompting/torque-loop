@@ -55,6 +55,10 @@ function modernMeta(version) {
   };
 }
 
+function legacyInit() {
+  return { protocolVersion: LEGACY, capabilities: {}, clientInfo: { name: 'test-client', version: '0' } };
+}
+
 // --- envelope ---------------------------------------------------------------
 
 ok('unparseable input answers -32700 with a null id', () => {
@@ -175,15 +179,15 @@ ok('an unknown requested legacy version is answered with our newest legacy versi
 
 ok('a second initialize on the same connection is refused by name', () => {
   const conn = kernel().createConnection();
-  conn.handleMessage({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: LEGACY } });
-  const res = conn.handleMessage({ jsonrpc: '2.0', id: 2, method: 'initialize', params: { protocolVersion: LEGACY } });
+  conn.handleMessage({ jsonrpc: '2.0', id: 1, method: 'initialize', params: legacyInit() });
+  const res = conn.handleMessage({ jsonrpc: '2.0', id: 2, method: 'initialize', params: legacyInit() });
   assert.strictEqual(res.error.code, -32600);
   assert.match(res.error.message, /already/i);
 });
 
 ok('notifications/initialized is accepted silently on a legacy connection', () => {
   const conn = kernel().createConnection();
-  conn.handleMessage({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: LEGACY } });
+  conn.handleMessage({ jsonrpc: '2.0', id: 1, method: 'initialize', params: legacyInit() });
   const res = conn.handleMessage({ jsonrpc: '2.0', method: 'notifications/initialized' });
   assert.strictEqual(res, null, 'a notification produces no response');
 });
@@ -193,7 +197,7 @@ ok('notifications/initialized is accepted silently on a legacy connection', () =
 ok('initialize after server/discover is refused — eras never mix', () => {
   const conn = kernel().createConnection();
   conn.handleMessage({ jsonrpc: '2.0', id: 1, method: 'server/discover' });
-  const res = conn.handleMessage({ jsonrpc: '2.0', id: 2, method: 'initialize', params: { protocolVersion: LEGACY } });
+  const res = conn.handleMessage({ jsonrpc: '2.0', id: 2, method: 'initialize', params: legacyInit() });
   assert.strictEqual(res.error.code, rpc.ERR_ERA_PINNED);
   assert.match(res.error.message, /modern/);
   assert.match(res.error.message, /reconnect/i, 'the refusal must hand the client its remedy');
@@ -201,7 +205,7 @@ ok('initialize after server/discover is refused — eras never mix', () => {
 
 ok('server/discover after initialize is refused — eras never mix', () => {
   const conn = kernel().createConnection();
-  conn.handleMessage({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: LEGACY } });
+  conn.handleMessage({ jsonrpc: '2.0', id: 1, method: 'initialize', params: legacyInit() });
   const res = conn.handleMessage({ jsonrpc: '2.0', id: 2, method: 'server/discover' });
   assert.strictEqual(res.error.code, rpc.ERR_ERA_PINNED);
   assert.match(res.error.message, /legacy/);
@@ -211,7 +215,7 @@ ok('a method that only exists in the other era is an era refusal, not a -32601',
   const conn = kernel({
     'modern/only': { eras: ['modern'], handler: () => ({}) },
   }).createConnection();
-  conn.handleMessage({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: LEGACY } });
+  conn.handleMessage({ jsonrpc: '2.0', id: 1, method: 'initialize', params: legacyInit() });
   const res = conn.handleMessage({ jsonrpc: '2.0', id: 2, method: 'modern/only', params: {} });
   assert.strictEqual(res.error.code, rpc.ERR_ERA_PINNED, 'the method exists — pretending it does not would misname the boundary');
   assert.match(res.error.message, /legacy/);
@@ -229,7 +233,7 @@ ok('an era refusal executes zero handler code', () => {
   const conn = kernel({
     'modern/only': { eras: ['modern'], handler: () => { ran++; return {}; } },
   }).createConnection();
-  conn.handleMessage({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: LEGACY } });
+  conn.handleMessage({ jsonrpc: '2.0', id: 1, method: 'initialize', params: legacyInit() });
   conn.handleMessage({ jsonrpc: '2.0', id: 2, method: 'modern/only', params: {} });
   assert.strictEqual(ran, 0);
 });
@@ -339,28 +343,30 @@ ok('stdio adapter refuses a line past the cap instead of buffering it forever', 
 // question is circular. The earlier discover tests codify the ruling.
 
 ok('C1 a legacy connection refuses a request carrying the modern protocol marker', () => {
+  let ran = 0;
   const conn = kernel({
-    'dual/method': { eras: ['modern', 'legacy'], handler: () => ({ ran: true }) },
+    'dual/method': { eras: ['modern', 'legacy'], handler: () => { ran++; return { ran: true }; } },
   }).createConnection();
-  conn.handleMessage({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: LEGACY } });
+  conn.handleMessage({ jsonrpc: '2.0', id: 1, method: 'initialize', params: legacyInit() });
   const res = conn.handleMessage({
     jsonrpc: '2.0', id: 2, method: 'dual/method', params: { _meta: modernMeta() },
   });
   assert.strictEqual(res.error && res.error.code, rpc.ERR_ERA_PINNED,
     'a modern-marked request executing under legacy IS a mixed connection');
   assert.match(res.error.message, /legacy/);
+  assert.strictEqual(ran, 0, 'the refusal must precede the handler, not follow it');
 });
 
 ok('C3 a notification-shaped handshake pins nothing — silently poisoning the era is worse than dropping', () => {
   const a = kernel().createConnection();
-  a.handleMessage({ jsonrpc: '2.0', method: 'initialize', params: { protocolVersion: LEGACY } });
+  a.handleMessage({ jsonrpc: '2.0', method: 'initialize', params: legacyInit() });
   assert.strictEqual(a.era(), null, 'an initialize with no id cannot complete a handshake');
   const discover = a.handleMessage({ jsonrpc: '2.0', id: 1, method: 'server/discover' });
   assert.strictEqual(discover.error, undefined, 'the connection must still be free to pin modern');
   const b = kernel().createConnection();
   b.handleMessage({ jsonrpc: '2.0', method: 'server/discover' });
   assert.strictEqual(b.era(), null, 'a discover with no id pins nothing either');
-  const init = b.handleMessage({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: LEGACY } });
+  const init = b.handleMessage({ jsonrpc: '2.0', id: 1, method: 'initialize', params: legacyInit() });
   assert.strictEqual(init.error, undefined, 'the connection must still be free to pin legacy');
 });
 
@@ -451,7 +457,7 @@ ok('C10 initialize with null or shapeless params refuses -32602 and pins nothing
   const bad = conn.handleMessage({ jsonrpc: '2.0', id: 1, method: 'initialize', params: null });
   assert.strictEqual(bad.error.code, -32602);
   assert.strictEqual(conn.era(), null, 'a refused handshake must not pin');
-  const good = conn.handleMessage({ jsonrpc: '2.0', id: 2, method: 'initialize', params: { protocolVersion: LEGACY } });
+  const good = conn.handleMessage({ jsonrpc: '2.0', id: 2, method: 'initialize', params: legacyInit() });
   assert.strictEqual(good.error, undefined, 'the connection is still free to initialize properly');
 });
 
@@ -478,7 +484,7 @@ ok('C12 version re-proof comes before method resolution — a wrong version neve
 
 ok('C14 notifications/initialized moves no era, anywhere', () => {
   const legacy = kernel().createConnection();
-  legacy.handleMessage({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: LEGACY } });
+  legacy.handleMessage({ jsonrpc: '2.0', id: 1, method: 'initialize', params: legacyInit() });
   assert.strictEqual(legacy.handleMessage({ jsonrpc: '2.0', method: 'notifications/initialized' }), null);
   assert.strictEqual(legacy.era(), 'legacy');
   const modern = kernel().createConnection();
@@ -492,9 +498,134 @@ ok('C14 notifications/initialized moves no era, anywhere', () => {
 
 ok('C15 the second-initialize refusal hands the client its remedy', () => {
   const conn = kernel().createConnection();
-  conn.handleMessage({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: LEGACY } });
-  const res = conn.handleMessage({ jsonrpc: '2.0', id: 2, method: 'initialize', params: { protocolVersion: LEGACY } });
+  conn.handleMessage({ jsonrpc: '2.0', id: 1, method: 'initialize', params: legacyInit() });
+  const res = conn.handleMessage({ jsonrpc: '2.0', id: 2, method: 'initialize', params: legacyInit() });
   assert.match(res.error.message, /reconnect/i);
+});
+
+// --- Codex attack round 2 (2026-07-29) — one falsifier per accepted finding --
+// Round-2 rulings, standing: remedies stay off wire-level standard errors
+// (the reason IS the remedy there), and server/discover stays version-exempt.
+
+ok('D1 an initialize that also wears the modern marker proves both eras — refused, unpinned', () => {
+  const conn = kernel().createConnection();
+  const params = legacyInit();
+  params._meta = modernMeta();
+  const res = conn.handleMessage({ jsonrpc: '2.0', id: 1, method: 'initialize', params });
+  assert.strictEqual(res.error && res.error.code, -32600, 'an ambiguous envelope is invalid, not negotiable');
+  assert.match(res.error.message, /both eras/i);
+  assert.strictEqual(conn.era(), null, 'ambiguity must not pin');
+  const retry = conn.handleMessage({ jsonrpc: '2.0', id: 2, method: 'initialize', params: legacyInit() });
+  assert.strictEqual(retry.error, undefined, 'an unambiguous retry still works');
+});
+
+ok('D2 a result smuggling toJSON is a -32603 — the wire shape is the kernel\'s to guarantee', () => {
+  const conn = kernel({
+    'sneak/json': { eras: ['modern'], handler: () => ({ ok: true, toJSON() { return 42; } }) },
+  }).createConnection();
+  const res = conn.handleMessage({ jsonrpc: '2.0', id: 1, method: 'sneak/json', params: { _meta: modernMeta() } });
+  assert.strictEqual(res.error && res.error.code, -32603,
+    'a toJSON result would erase resultType and _meta after decoration');
+});
+
+ok('D3 initialize without capabilities or clientInfo is an incomplete handshake — refused, unpinned', () => {
+  for (const params of [
+    { protocolVersion: LEGACY },
+    { protocolVersion: LEGACY, capabilities: {} },
+    { protocolVersion: LEGACY, clientInfo: { name: 'c', version: '1' } },
+    { protocolVersion: LEGACY, capabilities: [], clientInfo: { name: 'c', version: '1' } },
+  ]) {
+    const conn = kernel().createConnection();
+    const res = conn.handleMessage({ jsonrpc: '2.0', id: 1, method: 'initialize', params });
+    assert.strictEqual(res.error && res.error.code, -32602, `must refuse: ${JSON.stringify(params)}`);
+    assert.strictEqual(conn.era(), null);
+  }
+});
+
+ok('D4 an own __proto__ key in a result neither pollutes nor suppresses decoration', () => {
+  const conn = kernel({
+    'proto/own': { eras: ['modern'], handler: () => JSON.parse('{"__proto__":{"resultType":"spoof"},"ok":true}') },
+  }).createConnection();
+  const res = conn.handleMessage({ jsonrpc: '2.0', id: 1, method: 'proto/own', params: { _meta: modernMeta() } });
+  assert.strictEqual(res.result.ok, true);
+  assert.strictEqual(res.result.resultType, 'complete', 'an inherited resultType must not suppress decoration');
+  assert.strictEqual(({}).resultType, undefined, 'Object.prototype must stay unpolluted');
+});
+
+ok('D5 clientCapabilities must be a capability map, not an array', () => {
+  const conn = kernel({
+    'echo/params': { eras: ['modern'], handler: () => ({}) },
+  }).createConnection();
+  const meta = modernMeta();
+  meta[META + 'clientCapabilities'] = [];
+  const res = conn.handleMessage({ jsonrpc: '2.0', id: 1, method: 'echo/params', params: { _meta: meta } });
+  assert.strictEqual(res.error && res.error.code, -32602);
+  assert.strictEqual(conn.era(), null);
+});
+
+ok('D6 a malformed envelope never echoes an unusable id', () => {
+  const conn = kernel().createConnection();
+  const res = conn.handleMessage({ jsonrpc: '1.0', id: { bad: 1 }, method: 'server/discover' });
+  assert.strictEqual(res.error.code, -32600);
+  assert.strictEqual(res.id, null, 'an object id in an invalid envelope must not round-trip');
+});
+
+ok('D9 a non-finite numeric id cannot be echoed faithfully — refused', () => {
+  const conn = kernel().createConnection();
+  const res = conn.handleMessage('{"jsonrpc":"2.0","id":1e400,"method":"server/discover"}');
+  assert.strictEqual(res.error.code, -32600);
+  assert.strictEqual(res.id, null);
+});
+
+ok('D10 dropped notifications are countable — acceptance and rejection are different facts', () => {
+  const legacy = kernel().createConnection();
+  legacy.handleMessage({ jsonrpc: '2.0', id: 1, method: 'initialize', params: legacyInit() });
+  legacy.handleMessage({ jsonrpc: '2.0', method: 'notifications/initialized' });
+  assert.strictEqual(legacy.dropped(), 0, 'a legitimate legacy notification is accepted, not dropped');
+  const modern = kernel().createConnection();
+  modern.handleMessage({ jsonrpc: '2.0', id: 1, method: 'server/discover' });
+  modern.handleMessage({ jsonrpc: '2.0', method: 'notifications/initialized' });
+  assert.strictEqual(modern.dropped(), 1, 'the same notification on modern is a counted drop');
+});
+
+ok('D12 an era refusal on an unpinned connection says unpinned, not "the null era"', () => {
+  const conn = kernel().createConnection();
+  const res = conn.handleMessage({ jsonrpc: '2.0', id: 1, method: 'notifications/initialized' });
+  assert.strictEqual(res.error && res.error.code, rpc.ERR_ERA_PINNED);
+  assert.doesNotMatch(res.error.message, /null era/, 'the refusal must not name an era that does not exist');
+  assert.match(res.error.message, /no era|not pinned/i);
+});
+
+ok('D7 an exact-cap line survives its CRLF being split across chunks', () => {
+  const input = new PassThrough();
+  const output = new PassThrough();
+  const lines = [];
+  output.on('data', (chunk) => lines.push(...String(chunk).split('\n').filter((l) => l.length)));
+  const wire = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'server/discover' });
+  stdio.attach(kernel(), { input, output, maxLineBytes: Buffer.byteLength(wire) });
+  input.write(wire + '\r'); // the \r is framing, not content — even before its \n arrives
+  input.write('\n');
+  const res = JSON.parse(lines[0]);
+  assert.strictEqual(res.error, undefined, 'a trailing \\r awaiting its \\n must not count against the cap');
+  assert.strictEqual(res.id, 1);
+});
+
+ok('D8 invalid UTF-8 is a named refusal, and a legitimate U+FFFD still passes', () => {
+  const input = new PassThrough();
+  const output = new PassThrough();
+  const lines = [];
+  output.on('data', (chunk) => lines.push(...String(chunk).split('\n').filter((l) => l.length)));
+  stdio.attach(kernel({
+    'echo/text': { eras: ['modern'], handler: (params) => ({ text: params.text }) },
+  }), { input, output });
+  const good = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'echo/text', params: { text: 'A�B', _meta: modernMeta() } });
+  const bad = Buffer.concat([Buffer.from('{"jsonrpc":"2.0","id":2,"method":"server/discover","x":"A'), Buffer.from([0xff]), Buffer.from('B"}\n')]);
+  input.write(Buffer.from(good + '\n'));
+  input.write(bad);
+  const parsed = lines.map((l) => JSON.parse(l));
+  assert.strictEqual(parsed[0].result.text, 'A�B', 'a real replacement character is legitimate data');
+  assert.strictEqual(parsed[1].error.code, -32700, 'a byte that is not UTF-8 is not silently rewritten');
+  assert.match(parsed[1].error.message, /UTF-8/);
 });
 
 process.stdout.write(`\n${passed} passed, ${failures.length} failed\n`);

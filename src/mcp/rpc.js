@@ -52,6 +52,7 @@ function createKernel({ serverInfo, capabilities, methods }) {
 
   function createConnection() {
     let era = null;
+    let dropped = 0; // notifications refused with no channel to say so — countable, not invisible
 
     function requireModernVersion(msg) {
       const meta = (msg.params && msg.params._meta) || {};
@@ -65,16 +66,23 @@ function createKernel({ serverInfo, capabilities, methods }) {
         );
       }
       const clientCaps = meta[META + 'clientCapabilities'];
-      if (typeof clientCaps !== 'object' || clientCaps === null) {
+      if (typeof clientCaps !== 'object' || clientCaps === null || Array.isArray(clientCaps)) {
         throw rpcError(
           ERR_INVALID_PARAMS,
-          `modern requests carry ${META}clientCapabilities (an object) in _meta on every request`
+          `modern requests carry ${META}clientCapabilities (a capability map, not an array) in _meta on every request`
         );
       }
       return meta;
     }
 
     function eraRefusal(method) {
+      if (era === null) {
+        return rpcError(
+          ERR_ERA_PINNED,
+          `this connection has no era yet and ${method} needs one — ` +
+            `knock with server/discover (modern) or initialize (legacy) first`
+        );
+      }
       return rpcError(
         ERR_ERA_PINNED,
         `this connection is pinned to the ${era} era and ${method} belongs to the other one — ` +
@@ -92,8 +100,19 @@ function createKernel({ serverInfo, capabilities, methods }) {
           throw rpcError(ERR_INVALID_REQUEST, 'initialize already ran on this connection — reconnect to start a new session');
         }
         const params = msg.params;
-        if (typeof params !== 'object' || params === null || Array.isArray(params) || typeof params.protocolVersion !== 'string') {
-          throw rpcError(ERR_INVALID_PARAMS, 'initialize params carry a protocolVersion string (plus capabilities and clientInfo)');
+        // An initialize that also wears the modern marker proves both eras at
+        // once; ambiguity is refused unpinned, never resolved by guessing.
+        if (params && params._meta && params._meta[META + 'protocolVersion'] !== undefined) {
+          throw rpcError(ERR_INVALID_REQUEST,
+            'this request proves both eras — a legacy initialize cannot carry the modern protocol marker');
+        }
+        const shaped = params && typeof params === 'object' && !Array.isArray(params) &&
+          typeof params.protocolVersion === 'string' &&
+          typeof params.capabilities === 'object' && params.capabilities !== null && !Array.isArray(params.capabilities) &&
+          typeof params.clientInfo === 'object' && params.clientInfo !== null && !Array.isArray(params.clientInfo);
+        if (!shaped) {
+          throw rpcError(ERR_INVALID_PARAMS,
+            'initialize params carry protocolVersion (string), capabilities (object), and clientInfo (object) — an incomplete handshake pins nothing');
         }
         era = 'legacy'; // pinned only after the handshake proves its shape
         return {
@@ -157,19 +176,24 @@ function createKernel({ serverInfo, capabilities, methods }) {
       if (Array.isArray(msg)) {
         return errorResponse(null, ERR_INVALID_REQUEST, 'batch requests were removed from MCP; send one message per line');
       }
+      // An id is echoable only as a string, a finite number, or null — anything
+      // else answers as null on EVERY refusal path, so a malformed envelope can
+      // never round-trip an object id (an invalid response in its own right).
+      const idEchoable = msg && typeof msg === 'object' && (
+        typeof msg.id === 'string' || (typeof msg.id === 'number' && Number.isFinite(msg.id)) || msg.id === null
+      );
       if (!msg || typeof msg !== 'object' || msg.jsonrpc !== JSONRPC || typeof msg.method !== 'string') {
-        return errorResponse(msg && msg.id, ERR_INVALID_REQUEST, 'not a JSON-RPC 2.0 request');
+        return errorResponse(idEchoable ? msg.id : null, ERR_INVALID_REQUEST, 'not a JSON-RPC 2.0 request');
       }
-      if (msg.id !== undefined && msg.id !== null && typeof msg.id !== 'string' && typeof msg.id !== 'number') {
-        // An unusable id cannot be echoed, so the answer carries null — and the
-        // request is never dispatched.
-        return errorResponse(null, ERR_INVALID_REQUEST, 'a JSON-RPC id is a string, a number, or null');
+      if (msg.id !== undefined && !idEchoable) {
+        return errorResponse(null, ERR_INVALID_REQUEST, 'a JSON-RPC id is a string, a finite number, or null');
       }
 
       const isNotification = msg.id === undefined;
       if (isNotification && (msg.method === 'initialize' || msg.method === 'server/discover')) {
         // A handshake needs an answer to exist; a notification-shaped one can
         // only pin an era silently, which poisons the connection. Dropped.
+        dropped++;
         return null;
       }
 
@@ -184,26 +208,38 @@ function createKernel({ serverInfo, capabilities, methods }) {
           if (typeof result !== 'object' || result === null || Array.isArray(result)) {
             throw rpcError(ERR_INTERNAL, `handler for ${msg.method} returned a non-object result`);
           }
+          // A toJSON would rewrite the wire shape AFTER decoration, silently
+          // erasing resultType and _meta — the wire shape is the kernel's to
+          // guarantee, so a result that reserves the right to change it is bad.
+          if (typeof result.toJSON === 'function') {
+            throw rpcError(ERR_INTERNAL, `handler for ${msg.method} returned a result carrying toJSON`);
+          }
           if (era === 'modern') {
             // Modern results always name themselves: resultType is required by
             // the protocol, and serverInfo travels in _meta because there is no
-            // handshake left to have said it once. Decoration works on a copy —
-            // the handler's object may be frozen or shared across requests.
-            result = Object.assign({}, result);
+            // handshake left to have said it once. Decoration works on a spread
+            // copy: the handler's object may be frozen or shared, and spread
+            // DEFINES an own "__proto__" key where Object.assign would have
+            // ASSIGNED it — mutating the copy's prototype and letting an
+            // inherited resultType suppress decoration.
+            result = { ...result };
             if (result.resultType === undefined) result.resultType = 'complete';
-            result._meta = Object.assign({}, result._meta, { [META + 'serverInfo']: info });
+            result._meta = { ...result._meta, [META + 'serverInfo']: info };
           }
           response = { jsonrpc: JSONRPC, id: msg.id, result };
         }
       } catch (e) {
-        if (isNotification) return null; // no channel to answer on — drop, never crash
+        if (isNotification) {
+          dropped++; // no channel to answer on — drop, never crash, but count
+          return null;
+        }
         const rpc = e && e.rpc ? e.rpc : { code: ERR_INTERNAL, message: 'internal error' };
         return errorResponse(msg.id, rpc.code, rpc.message, rpc.data);
       }
       return isNotification ? null : response;
     }
 
-    return { handleMessage, era: () => era };
+    return { handleMessage, era: () => era, dropped: () => dropped };
   }
 
   return { createConnection };

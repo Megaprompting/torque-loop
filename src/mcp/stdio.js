@@ -4,16 +4,17 @@
 // per attach, one message per line, answers on the output stream, diagnostics
 // belong on stderr (the 2026-07-28 revision deprecated protocol logging).
 // The adapter owns framing only — every protocol judgment lives in the kernel.
-
-const { StringDecoder } = require('string_decoder');
+//
+// Lines are split as BYTES and decoded per complete line: decoding the stream
+// eagerly corrupts multi-byte characters cut at a chunk boundary, and hides
+// invalid UTF-8 behind silent replacement characters. A decoded line is valid
+// only if it re-encodes to the same bytes — which still admits a legitimate
+// U+FFFD, because its honest bytes round-trip.
 
 function attach(kernel, { input, output, maxLineBytes }) {
   const conn = kernel.createConnection();
   const cap = maxLineBytes || 8 * 1024 * 1024; // an honest message fits; a lineless stream must not own our memory
-  // A Buffer cut mid-codepoint would corrupt multi-byte characters under a
-  // bare String(chunk); the decoder holds the partial bytes until they finish.
-  const decoder = new StringDecoder('utf8');
-  let buffer = '';
+  let buffer = Buffer.alloc(0);
   let overflowing = false;
 
   function refuse(message) {
@@ -36,28 +37,40 @@ function attach(kernel, { input, output, maxLineBytes }) {
   }
 
   input.on('data', (chunk) => {
-    buffer += typeof chunk === 'string' ? chunk : decoder.write(chunk);
+    const bytes = typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : chunk;
+    buffer = buffer.length ? Buffer.concat([buffer, bytes]) : bytes;
     let nl;
-    while ((nl = buffer.indexOf('\n')) !== -1) {
-      const line = buffer.slice(0, nl).replace(/\r$/, '');
-      buffer = buffer.slice(nl + 1);
+    while ((nl = buffer.indexOf(0x0a)) !== -1) {
+      let line = buffer.subarray(0, nl);
+      buffer = buffer.subarray(nl + 1);
       if (overflowing) { overflowing = false; continue; } // this newline ends the already-refused line
+      if (line.length && line[line.length - 1] === 0x0d) line = line.subarray(0, line.length - 1);
       if (!line.length) continue;
-      if (Buffer.byteLength(line) > cap) {
+      if (line.length > cap) {
         // The cap is per LINE, not per stall: a complete oversized line is as
         // refused as one that never ends.
         refuse(`line exceeds ${cap} bytes`);
         continue;
       }
-      const res = conn.handleMessage(line);
+      const text = line.toString('utf8');
+      if (!Buffer.from(text, 'utf8').equals(line)) {
+        refuse('line is not valid UTF-8');
+        continue;
+      }
+      const res = conn.handleMessage(text);
       if (res !== null) answer(res);
     }
     if (overflowing) {
-      buffer = ''; // still inside the refused line — discard until its newline arrives
-    } else if (Buffer.byteLength(buffer) > cap) {
+      buffer = Buffer.alloc(0); // still inside the refused line — discard until its newline arrives
+      return;
+    }
+    // A trailing \r may be half of a CRLF whose \n is in the next chunk — it is
+    // framing, not content, so it does not count against the cap.
+    const pending = buffer.length && buffer[buffer.length - 1] === 0x0d ? buffer.length - 1 : buffer.length;
+    if (pending > cap) {
       overflowing = true;
       refuse(`line exceeds ${cap} bytes without a newline`);
-      buffer = '';
+      buffer = Buffer.alloc(0);
     }
   });
 
