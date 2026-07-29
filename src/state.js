@@ -330,29 +330,86 @@ function ownerCardPath(lockDir) {
   return path.join(lockDir, 'owner.json');
 }
 
+// Clock skew between two machines writing one store is real; a card a few
+// seconds ahead is not evidence of anything. Beyond that it is not a clock.
+const FUTURE_SKEW_MS = 5000;
+
 function lockOwner(lockDir) {
-  const card = readJson(ownerCardPath(lockDir));
-  let at = card ? Date.parse(card.at) : NaN;
-  if (!Number.isFinite(at)) {
+  let raw = '';
+  try {
+    raw = fs.readFileSync(ownerCardPath(lockDir), 'utf8');
+  } catch (_e) {
+    raw = '';
+  }
+  let card = null;
+  try {
+    card = raw.trim() ? JSON.parse(raw) : null;
+  } catch (_e) {
+    card = null;
+  }
+  const stamped = card ? Date.parse(card.at) : NaN;
+  let ageMs;
+  // `believable` gates LIVENESS, not age: a holding whose clock cannot be
+  // believed is one whose pid claim cannot be believed either.
+  let believable = true;
+  if (!Number.isFinite(stamped)) {
     // No card, or an unreadable one: either a lock caught mid-acquisition or one
     // made by hand. Age it by the directory rather than assuming the worst —
     // assuming stale here is exactly how a live writer gets its lock stolen.
+    believable = false;
     try {
-      at = fs.statSync(lockDir).mtimeMs;
+      ageMs = Math.max(0, Date.now() - fs.statSync(lockDir).mtimeMs);
     } catch (_e) {
-      at = Date.now();
+      ageMs = 0;
     }
+  } else if (stamped > Date.now() + FUTURE_SKEW_MS) {
+    // Age used to be clamped at 0 here, which turned one bad timestamp into a
+    // permanently unbreakable lock: forever under soft-stale, forever protected.
+    // An unbelievable clock makes the holding UNPROVABLE, not sacred.
+    believable = false;
+    ageMs = Infinity;
+  } else {
+    ageMs = Math.max(0, Date.now() - stamped);
   }
   return {
     // The token is what actually identifies a HOLDING: pid + host can be
-    // recycled, a token cannot. Release and stale-break both compare it.
+    // recycled, a token cannot. Release and stale-break both compare it — and
+    // where a card carries no token, `raw` is compared instead, because no card
+    // shape is exempt from verification.
     token: card ? String(card.token || '') : '',
     pid: card ? Number(card.pid) : NaN,
     host: card ? String(card.host || '') : '',
     action: (card && card.action) || 'unknown',
-    ageMs: Math.max(0, Date.now() - at),
+    ageMs,
+    believable,
+    raw,
     card,
   };
+}
+
+// Is this the same holding we judged? Token when there is one, whole card when
+// there is not. A conditional check is not a check: a tokenless judgment that
+// skipped verification could carry off a live successor.
+function sameHolding(judged, found) {
+  return judged.token ? found.token === judged.token : found.raw === judged.raw;
+}
+
+// Everything an operator needs to resolve a wedge, in the refusal itself. A
+// provably-live local owner is NEVER auto-broken, so the operator IS the recovery
+// path for a wedged holder (or for a pid the OS has recycled into an unrelated
+// live process) — a message that does not hand over the remedy strands them.
+function lockRefusal(lockDir, owner) {
+  const age = owner.ageMs === Infinity ? 'an unbelievable age (card stamped in the future)' : `${Math.round(owner.ageMs / 1000)}s`;
+  const e = new Error(
+    `could not acquire the ratchet lock at ${lockDir} — held by pid ${owner.pid} on host ${owner.host || 'unknown'} ` +
+      `(action: ${owner.action}), held for ${age}. Wait for that command to finish. If that process is not a ratchet ` +
+      `writer (it exited, or the OS reused its pid), delete the lock directory by hand to release it: ${lockDir}`
+  );
+  e.code = 'ERATCHETLOCK';
+  e.lockDir = lockDir;
+  e.ownerPid = owner.pid;
+  e.ownerHost = owner.host;
+  return e;
 }
 
 // A lock whose owner is PROVABLY ALIVE on this host is never broken — not at
@@ -366,12 +423,13 @@ function staleVerdict(owner) {
   const soft = envMs('RATCHET_LOCK_STALE_MS', 5000);
   const hard = envMs('RATCHET_LOCK_HARD_STALE_MS', 120000);
   if (owner.ageMs < soft) return '';
-  const local = owner.host === os.hostname() && Number.isInteger(owner.pid);
+  const local = owner.believable && owner.host === os.hostname() && Number.isInteger(owner.pid);
   if (local && pidAlive(owner.pid)) return ''; // alive on this host — never broken
   if (local) return 'the owning process is gone';
-  // Foreign host or unreadable card: liveness is unknowable from here, so only
-  // sheer age can settle it.
+  // Foreign host, unreadable card, or a clock that cannot be believed: liveness
+  // is unknowable from here, so only sheer age can settle it.
   if (owner.ageMs < hard) return '';
+  if (owner.card && !owner.believable) return 'the owner card is stamped in the future — its clock cannot be believed';
   return owner.host ? `owner is on another host (${owner.host}) and unreachable` : 'the owner card is unreadable';
 }
 
@@ -390,7 +448,7 @@ function breakIfStale(lockDir) {
     return false; // somebody else won the break, or the owner released it first
   }
   const moved = lockOwner(doomed);
-  if (owner.token && moved.token !== owner.token) {
+  if (!sameHolding(owner, moved)) {
     // We judged one holding stale and moved a different one. Put it back if the
     // slot is still free; if it is not, a third holding is already there and
     // undoing would be a second theft — name the incident instead.
@@ -404,9 +462,13 @@ function breakIfStale(lockDir) {
       /* fall through to the loud path */
     }
     process.stderr.write(
-      `[ratchet] ABORTED a stale-lock break at ${lockDir}: judged token ${owner.token.slice(0, 8)} stale but moved ` +
-        `token ${(moved.token || 'none').slice(0, 8)} (pid ${moved.pid}). ` +
-        (restored ? 'Restored it — no lock was destroyed.' : `COULD NOT RESTORE: a live holding is at ${doomed}, inspect it by hand.`) +
+      `[ratchet] ABORTED a stale-lock break at ${lockDir}: judged ${owner.token ? `token ${owner.token.slice(0, 8)}` : 'a tokenless card'} ` +
+        `stale but moved ${moved.token ? `token ${moved.token.slice(0, 8)}` : 'a different card'} (pid ${moved.pid}). ` +
+        (restored
+          ? 'Restored it — no lock was destroyed.'
+          : `COULD NOT RESTORE: a holding is stranded at ${doomed} and its owner still believes it holds the lock. ` +
+            'Not acquiring in this pass; every commit re-verifies ownership, so the stranded owner will refuse rather ' +
+            'than double-write. Inspect by hand.') +
         '\n'
     );
     return restored; // restored → retry the acquire loop; not restored → do not spin on it
@@ -462,15 +524,7 @@ function acquireLock(lockDir, action) {
       return { dir: lockDir, token, action: action || 'mutation' };
     }
     if (breakIfStale(lockDir)) continue;
-    if (Date.now() >= deadline) {
-      const owner = lockOwner(lockDir);
-      const e = new Error(
-        `could not acquire the ratchet lock at ${lockDir} — held by pid ${owner.pid} (${owner.action}) for ` +
-          `${Math.round(owner.ageMs / 1000)}s. Wait for that command to finish, or delete the directory if the process is gone.`
-      );
-      e.code = 'ERATCHETLOCK';
-      throw e;
-    }
+    if (Date.now() >= deadline) throw lockRefusal(lockDir, lockOwner(lockDir));
     sleepSync(wait);
     wait = Math.min(wait * 2, 50);
   }
@@ -552,7 +606,7 @@ function withWorkspaceLock(cwd, action, fn) {
   }
   assertLockOrder(action);
   const handle = acquireLock(path.join(dir, LOCK_DIR_NAME), action);
-  _scope = { dir, action, state: null };
+  _scope = { dir, action, state: null, handle };
   try {
     return fn();
   } finally {
@@ -561,17 +615,48 @@ function withWorkspaceLock(cwd, action, fn) {
   }
 }
 
+// Defense in depth for the last instant before a canonical publish. Every
+// residual hole in the lock protocol — a break that stranded a live holding, an
+// ABA steal, a writer that bypassed the lock entirely — ends in the same state:
+// two processes each believing they hold one lock. Re-reading the owner card
+// immediately before the write turns every one of those into a LOSER-SIDE
+// REFUSAL that writes nothing, instead of a silent double write nobody detects.
+function assertStillOwner(cwd, what) {
+  const dir = projectDir(cwd);
+  if (!_scope || _scope.dir !== dir || !_scope.handle) return;
+  const owner = lockOwner(_scope.handle.dir);
+  if (owner.token === _scope.handle.token) return;
+  const e = new Error(
+    `refusing to publish ${what}: this process no longer owns the ratchet lock at ${_scope.handle.dir}. ` +
+      `It now holds ${owner.token ? `token ${owner.token.slice(0, 8)} (pid ${owner.pid}, ${owner.action})` : 'no readable owner card'}, ` +
+      `not ours (${_scope.handle.token.slice(0, 8)}). Our holding was broken or removed mid-transaction — nothing was written. Re-run.`
+  );
+  e.code = 'ERATCHETLOCKLOST';
+  throw e;
+}
+
 // The lock has to name the same FILE for every caller, and two callers can spell
-// one file differently (a symlinked directory, Windows path casing). Resolving
-// the parent directory is cheap and fixes both. It does NOT fix hard links: two
-// names for one inode in two different directories resolve to two lock keys, and
-// no dependency-free way to key a lock by inode exists. Named, not silently
-// assumed away — see the CHANGELOG boundary list.
+// one file differently. Resolving only the PARENT left the final component as
+// typed, so a symlinked FILE was two names, two lock keys, and no exclusion at
+// all between two processes appending to one log. Resolve the file itself when it
+// exists; fall back to the resolved parent plus the basename when it does not
+// (a lock is often taken to create the thing it protects).
+//
+// It does NOT fix hard links: two names for one inode are two paths no matter
+// how they are resolved, and keying a lock by inode is not buildable
+// dependency-free. It does not fix Windows path CASING either — realpath returns
+// the spelling it was given there. Both are named in the CHANGELOG boundary list
+// rather than assumed away.
 function fileLockDir(file) {
+  try {
+    return `${fs.realpathSync(file)}${LOCK_DIR_NAME}`;
+  } catch (_e) {
+    /* the file does not exist yet */
+  }
   try {
     return path.join(fs.realpathSync(path.dirname(file)), `${path.basename(file)}${LOCK_DIR_NAME}`);
   } catch (_e) {
-    return `${file}${LOCK_DIR_NAME}`; // parent does not exist yet — lexical is all there is
+    return `${file}${LOCK_DIR_NAME}`; // parent does not exist either — lexical is all there is
   }
 }
 
@@ -616,19 +701,17 @@ function createJsonExclusive(file, obj) {
     } catch (e) {
       if (e && e.code === 'EEXIST') return false; // somebody else created it first
       if (e && (e.code === 'EPERM' || e.code === 'ENOSYS' || e.code === 'EXDEV' || e.code === 'EOPNOTSUPP')) {
-        // No hard links on this filesystem. 'wx' still refuses an existing file;
-        // it just cannot publish the bytes in one step.
-        let fd;
-        try {
-          fd = fs.openSync(file, 'wx');
-          fs.writeFileSync(fd, data, 'utf8');
-          return true;
-        } catch (e2) {
-          if (e2 && e2.code === 'EEXIST') return false;
-          throw e2;
-        } finally {
-          if (fd !== undefined) fs.closeSync(fd);
-        }
+        // No hard links on this filesystem. The obvious fallback — an exclusive
+        // 'wx' open of the canonical path — writes the record IN PLACE, and a
+        // death mid-write then leaves a permanently malformed state.json that
+        // creation refuses to repair (EEXIST) while every reader spawns another
+        // .corrupt backup. Atomicity matters more than exclusivity here: this
+        // path only runs under the workspace lock, so the exclusivity it gives up
+        // is exclusivity against writers that bypass the lock entirely — which
+        // nothing in this codebase does, and which no advisory lock can stop.
+        if (fs.existsSync(file)) return false;
+        writeFileAtomic(file, data);
+        return true;
       }
       throw e;
     }
@@ -642,6 +725,12 @@ function createJsonExclusive(file, obj) {
 }
 
 function initProject(cwd, opts = {}) {
+  // The library entry point is the same door as the CLI verb. `init --force` is
+  // an irreversible wipe, and the CLI's guard only ever covered the CLI: an
+  // auditor agent could reset the store by calling this directly. A plain init
+  // creates nothing that exists and wipes nothing, so it stays open — a
+  // propose-only agent must still be able to orient.
+  if (opts.force) assertMayWrite('init --force');
   // Creating the store is a WRITE, so it happens under the lock like every other
   // write. Without it, a first read on an empty store could publish its fresh
   // rev-0 record over a revision a locked writer had already committed — a read
@@ -657,6 +746,16 @@ function initProjectLocked(cwd, { force = false, resetBy = '', resetReason = '' 
   let created = false;
   if (force || !fs.existsSync(sPath)) {
     const fresh = schemas.newState();
+    // A wipe CONTINUES the revision line; it does not restart it. Restarting
+    // meant a writer that had loaded the old generation at rev 0 came back, found
+    // rev 0 again, matched, took the fast path and wrote its pre-reset record
+    // straight over the fresh one — erasing a deliberate, authorized wipe with a
+    // stale snapshot. One ordered truth: a store's revisions never restart while
+    // the store exists. A genuinely new store still opens at rev 0.
+    if (force) {
+      const previous = readJson(sPath);
+      if (previous) fresh.rev = revOf(previous) + 1;
+    }
     // A wipe destroys the only record of why the wipe happened. The tombstone is
     // the one line that survives it, so the next cold session reads "danny reset
     // this on 2026-07-29 to start a new run" instead of an unexplained blank.
@@ -728,18 +827,27 @@ function loadState(cwd) {
   // is the one the boundary reloaded under the lock. Handing a helper a second
   // copy read from disk is how a command loses half of its own mutation.
   if (_scope && _scope.state && _scope.dir === projectDir(cwd)) return _scope.state;
-  const existing = readJsonResilient(statePath(cwd));
-  if (existing) return rememberBase(cwd, existing);
-  // Auto-init on first read so skills never hit a missing file — but creating
-  // the record is a write, so it happens under the lock and it re-reads there:
-  // if the store appeared while we were queueing, that record wins and this read
-  // returns it. A read never replaces a record. (A corrupt file has already been
-  // backed up by readJsonResilient before we get here.)
+  // Parse-only peek: no backup, no write, no lock. The overwhelmingly common case
+  // is a healthy record, and that case must cost one read.
+  const healthy = readJson(statePath(cwd));
+  if (healthy) return rememberBase(cwd, healthy);
+  // Absent, empty, or malformed. All three need the lock from here, because all
+  // three end in a WRITE — the corrupt-bytes backup as much as the creation, and
+  // an unlocked backup-then-reinitialize is a read racing a writer.
   return withWorkspaceLock(cwd, 'state init', () => {
-    const appeared = readJsonResilient(statePath(cwd));
-    if (appeared) return rememberBase(cwd, appeared);
+    // Under the lock, and only now: the resilient read, which backs the corrupt
+    // bytes up before anything can overwrite them, and throws rather than
+    // reinitialize over a record that is present but unreadable.
+    const existing = readJsonResilient(statePath(cwd));
+    if (existing) return rememberBase(cwd, existing);
     const fresh = schemas.newState();
-    if (!createJsonExclusive(statePath(cwd), fresh)) {
+    if (fs.existsSync(statePath(cwd))) {
+      // Present but unusable, and its bytes are now safely backed up: REPLACING
+      // it is the repair. Refusing here (create-or-fail) left the bad file in
+      // place forever, so every future read backed it up again and the store
+      // could never be opened — a repair loop that never repaired.
+      writeJson(statePath(cwd), fresh);
+    } else if (!createJsonExclusive(statePath(cwd), fresh)) {
       const raced = readJsonResilient(statePath(cwd));
       if (raced) return rememberBase(cwd, raced);
     }
@@ -748,6 +856,8 @@ function loadState(cwd) {
 }
 
 function commitState(cwd, state, baseRev) {
+  // Last instant before the canonical publish: do we still own the lock?
+  assertStillOwner(cwd, `state rev ${baseRev + 1}`);
   state.updatedAt = schemas.nowIso();
   state.rev = baseRev + 1;
   writeJson(statePath(cwd), state);
@@ -897,6 +1007,22 @@ function saveState(cwd, state) {
 function rebaseAndCommit(cwd, state) {
   const disk = readJsonResilient(statePath(cwd));
   if (!disk) return commitState(cwd, state, revOf(state)); // nothing on disk to lose
+  // A wipe starts a new GENERATION of the record, and `createdAt` is its name. A
+  // delta computed against the old generation must never be merged into the new
+  // one, however the revision numbers happen to line up: the entire point of an
+  // authorized reset is that pre-reset intent stops applying, so rebasing it back
+  // in resurrects exactly what somebody deliberately destroyed.
+  if (String(state.createdAt) !== String(disk.createdAt)) {
+    const e = new Error(
+      `refused a write from a previous generation of this record (saveState): the snapshot was created at ` +
+        `${state.createdAt} and the workspace record at ${disk.createdAt} — the store was reset in between. ` +
+        'Reload the state; the change has to be re-decided against the record that exists now.'
+    );
+    e.code = 'ERATCHETSTALE';
+    e.expectedStateRev = revOf(state);
+    e.actualStateRev = revOf(disk);
+    throw e;
+  }
   const base = baseFor(cwd, state);
   if (revOf(disk) !== revOf(state) && !base) {
     // A snapshot at a revision that is no longer current, and nothing remembers
@@ -936,6 +1062,13 @@ function unchangedFrom(disk, next) {
 // state under it → compare the revision the caller believes it is editing →
 // apply → commit exactly one revision → release, on every path.
 //
+// `alsoLockFile` extends the transaction over a second file for its whole
+// duration, COMMIT INCLUDED. A verb whose decision depends on another file's
+// contents (the closure gate reads its proof from the journal) cannot release
+// that file's lock before it publishes: doing so does not close the window
+// between reading the evidence and acting on it, it just moves the window later.
+// Acquired inside the workspace lock, so the declared order still holds.
+//
 // A mismatch is REFUSED, not merged: a caller that names a revision is claiming
 // it read that exact record, and silently rebasing its decision onto a record it
 // never saw is how a stale agent's conclusion gets written as if it were fresh.
@@ -956,8 +1089,21 @@ function withWorkspaceMutation(cwd, opts, mutate) {
   const dir = projectDir(cwd);
   assertLockOrder(action);
   const handle = acquireLock(path.join(dir, LOCK_DIR_NAME), action);
-  _scope = { dir, action, state: null };
+  _scope = { dir, action, state: null, handle };
   try {
+    // The second lock, if the verb asked for one, wraps everything below —
+    // validation AND commit — and is released by withFileLock's own finally.
+    return o.alsoLockFile
+      ? withFileLock(o.alsoLockFile, `${action} (spans the commit)`, () => runMutation(cwd, o, action, mutate))
+      : runMutation(cwd, o, action, mutate);
+  } finally {
+    _scope = null;
+    releaseLock(handle);
+  }
+}
+
+function runMutation(cwd, o, action, mutate) {
+  {
     // The revision check comes BEFORE the read that would create the store. A
     // caller naming a revision on a store that does not exist is refusing to be
     // told "there was nothing there, so I made you something" — and a refusal
@@ -997,9 +1143,6 @@ function withWorkspaceMutation(cwd, opts, mutate) {
     if (JSON.stringify(s) === before) return { committed: false, rev: baseRev, state: s, result };
     commitState(cwd, s, baseRev);
     return { committed: true, rev: s.rev, state: s, result };
-  } finally {
-    _scope = null;
-    releaseLock(handle);
   }
 }
 
@@ -1020,11 +1163,19 @@ function loadLedger(cwd) {
   });
 }
 
+// The ledger is a second canonical file in the same store, so it answers to the
+// same lock. It used to write directly: two processes holding stale ledger
+// snapshots simply lost one of the two saves, with nothing to detect it. (The
+// ledger has no revision counter, so this serializes writes rather than rebasing
+// them — the last writer under the lock still wins. Named in the CHANGELOG.)
 function saveLedger(cwd, ledger) {
   assertMayWrite('saveLedger'); // the ledger is canonical too — one door standard
-  ledger.updatedAt = schemas.nowIso();
-  writeJson(ledgerPath(cwd), ledger);
-  return ledger;
+  return withWorkspaceLock(cwd, 'saveLedger', () => {
+    assertStillOwner(cwd, 'the ledger');
+    ledger.updatedAt = schemas.nowIso();
+    writeJson(ledgerPath(cwd), ledger);
+    return ledger;
+  });
 }
 
 // Short, sortable, collision-resistant id: <prefix>-<time36>-<rand>. The time

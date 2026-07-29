@@ -643,14 +643,24 @@ ok('C1 artifact close reads the journal under the journal lock, inside the works
   // The proof this gate reads lives in the journal. Reading it unlocked leaves a
   // window in which a REVERT lands after the read and before the commit, and the
   // artifact closes on a KEEP the record had already revoked.
+  // Both readers are probed: the gate reads its proof through the health-reporting
+  // one (a damaged log must not certify), and a future refactor back to the plain
+  // reader must not slip past this falsifier.
   const realRead = journal.readEvents;
+  const realHealth = journal.readEventsWithHealth;
   const observed = [];
-  journal.readEvents = function (cwd) {
+  const note = () =>
     observed.push({
       journalLocked: fs.existsSync(journalLockDir(proj)),
       workspaceLocked: fs.existsSync(workspaceLockDir(proj)),
     });
+  journal.readEvents = function (cwd) {
+    note();
     return realRead.call(journal, cwd);
+  };
+  journal.readEventsWithHealth = function (cwd) {
+    note();
+    return realHealth.call(journal, cwd);
   };
   const prevCwd = process.cwd();
   try {
@@ -665,6 +675,7 @@ ok('C1 artifact close reads the journal under the journal lock, inside the works
   } finally {
     process.chdir(prevCwd);
     journal.readEvents = realRead;
+    journal.readEventsWithHealth = realHealth;
   }
 
   assert.ok(observed.length, 'the close must actually read the journal');
@@ -1098,6 +1109,384 @@ ok('M13 a supplied event id that is already on the log is refused', () => {
     1,
     'and the refused append writes no line — one identity, one event'
   );
+});
+
+// ===========================================================================
+// Patch cycle 2 — the re-verification of cycle 1. Four findings cycle 1 only
+// MOVED, and seven the patch itself introduced. Same discipline: red first.
+// Traced by: claude-opus-5
+// ===========================================================================
+
+const lifecycle = require('../src/lifecycle');
+
+// A child that runs to completion and reports what it caught, synchronously —
+// so it can be launched from inside an injected hook while this process is
+// blocked mid-write. spawnSync IS the barrier; no sentinel files needed.
+function childRun(proj, body, extraEnv) {
+  const script = `'use strict';
+const fs = require('fs');
+const path = require('path');
+const SRC = ${JSON.stringify(SRC)};
+const out = { error: null, code: null, extra: null };
+try {
+${body}
+} catch (e) {
+  out.error = e && e.message ? e.message : String(e);
+  out.code = (e && e.code) || null;
+}
+process.stdout.write(JSON.stringify(out));`;
+  const r = spawnSync(process.execPath, ['-e', script], {
+    cwd: proj,
+    env: childEnv(proj, extraEnv),
+    encoding: 'utf8',
+  });
+  try {
+    return JSON.parse(r.stdout);
+  } catch (_e) {
+    return { error: `child produced no result (stdout: ${r.stdout}) (stderr: ${String(r.stderr).slice(0, 300)})`, code: null };
+  }
+}
+
+// The suite shares one journal across projects; a test that damages the log must
+// not damage every test after it.
+function withOwnJournal(proj, fn) {
+  const prev = process.env.RATCHET_EVOLVE_LOG;
+  const log = path.join(proj, 'own-evolve-log.jsonl');
+  process.env.RATCHET_EVOLVE_LOG = log;
+  try {
+    return fn(log);
+  } finally {
+    if (prev === undefined) delete process.env.RATCHET_EVOLVE_LOG;
+    else process.env.RATCHET_EVOLVE_LOG = prev;
+  }
+}
+
+// An artifact that will actually close: real file, bound KEEP, seam evidence.
+function closableArtifact(proj) {
+  fs.mkdirSync(path.join(proj, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(proj, 'src', 'a.js'), 'module.exports = 1;\n', 'utf8');
+  const art = artifacts.addArtifact(proj, { title: 'closable', kind: 'code', path: 'src/a.js' });
+  const fp = lifecycle.fingerprint(proj, art);
+  journal.appendEvent(
+    proj,
+    {
+      target: 'src/a.js',
+      artifactId: art.id,
+      verdict: 'KEEP',
+      verification: { commands: [{ command: 'node -e 0', pass: true }], result: 'pass' },
+      seam: { evidenceType: 'test', testedSeam: 'x', shipSeam: 'x', seamMatch: 'exact', independentFromBuilderMethod: true },
+    },
+    { verifiedHash: fp.hash, verifiedRev: fp.rev }
+  );
+  return art;
+}
+
+// --- C4 residual: no card shape is exempt from verification ------------------
+
+ok('C4 a tokenless judgment still verifies what the break moved', () => {
+  const proj = freshProject('c4-tokenless');
+  const lockDir = workspaceLockDir(proj);
+  // An older-format or hand-planted card carries no token. Cycle 1 made the
+  // moved-card check conditional on having one, so a tokenless judgment skipped
+  // verification entirely and could carry off a live successor.
+  fs.mkdirSync(lockDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(lockDir, 'owner.json'),
+    JSON.stringify({ pid: deadPid(), host: os.hostname(), at: new Date(Date.now() - 30000).toISOString(), action: 'tokenless' }),
+    'utf8'
+  );
+
+  const realRename = fs.renameSync;
+  let swapped = false;
+  fs.renameSync = function (from, to) {
+    if (!swapped && String(from) === lockDir) {
+      swapped = true;
+      realRename.call(fs, from, `${lockDir}.decoy`);
+      plantLock(lockDir, { ageMs: 0, token: 'liveB', action: 'live successor' });
+    }
+    return realRename.call(fs, from, to);
+  };
+  let refusal = null;
+  try {
+    state.withWorkspaceLock(proj, 'breaker', () => {});
+  } catch (e) {
+    refusal = e;
+  } finally {
+    fs.renameSync = realRename;
+  }
+
+  assert.ok(swapped, 'the injection must fire');
+  assert.ok(fs.existsSync(lockDir), 'the live successor must survive a break aimed at a tokenless predecessor');
+  assert.strictEqual(readToken(lockDir), 'liveB', 'and must still be the successor holding');
+  assert.ok(refusal, 'the breaker must end up refused');
+  fs.rmSync(lockDir, { recursive: true, force: true });
+  fs.rmSync(`${lockDir}.decoy`, { recursive: true, force: true });
+});
+
+// --- M12 residual: the ledger is canonical too -------------------------------
+
+ok('M12 saveLedger takes the workspace lock like every other write', () => {
+  const proj = freshProject('m12-ledger');
+  const ledger = state.loadLedger(proj);
+  const lockDir = plantLock(workspaceLockDir(proj), { ageMs: 0, token: 'ledgerholder', action: 'holding the store' });
+  const prevTimeout = process.env.RATCHET_LOCK_TIMEOUT_MS;
+  process.env.RATCHET_LOCK_TIMEOUT_MS = '400';
+  let refusal = null;
+  try {
+    ledger.features.push({ id: 'f1', name: 'written past the lock' });
+    state.saveLedger(proj, ledger);
+  } catch (e) {
+    refusal = e;
+  } finally {
+    if (prevTimeout === undefined) delete process.env.RATCHET_LOCK_TIMEOUT_MS;
+    else process.env.RATCHET_LOCK_TIMEOUT_MS = prevTimeout;
+  }
+  assert.ok(refusal, 'a ledger write must queue behind the workspace lock, not walk past it');
+  assert.strictEqual(refusal.code, 'ERATCHETLOCK', `and must be refused by the lock; got ${refusal.code}: ${refusal.message}`);
+  assert.strictEqual(
+    (state.loadLedger(proj).features || []).length,
+    0,
+    'and the refused write must leave the ledger untouched'
+  );
+  fs.rmSync(lockDir, { recursive: true, force: true });
+});
+
+// --- N1: a commit re-verifies that it still owns the lock --------------------
+
+ok('N1 a commit aborts if this process no longer owns the lock', () => {
+  const proj = freshProject('n1');
+  const s0 = state.loadState(proj);
+  s0.objective = 'the record before';
+  state.saveState(proj, s0);
+  const before = stateBytes(proj);
+  const lockDir = workspaceLockDir(proj);
+
+  // Every residual steal window — a failed restore, an ABA break, a
+  // lock-bypassing writer — ends the same way: two processes believe they hold
+  // one lock. Defense in depth is to check at the last possible instant, so a
+  // theft becomes a loser-side refusal that writes nothing instead of a silent
+  // double write.
+  let refusal = null;
+  try {
+    state.withWorkspaceMutation(proj, { action: 'n1' }, (s) => {
+      s.objective = 'must never land';
+      fs.writeFileSync(
+        path.join(lockDir, 'owner.json'),
+        JSON.stringify({ token: 'somebodyelse', pid: process.pid, host: os.hostname(), at: new Date().toISOString(), action: 'thief' }),
+        'utf8'
+      );
+    });
+  } catch (e) {
+    refusal = e;
+  }
+  assert.ok(refusal, 'a commit that no longer owns its lock must abort');
+  assert.strictEqual(refusal.code, 'ERATCHETLOCKLOST', `coded lock-lost; got ${refusal.code}: ${refusal.message}`);
+  assert.ok(stateBytes(proj).equals(before), 'and must write zero canonical bytes');
+  fs.rmSync(lockDir, { recursive: true, force: true });
+});
+
+// --- N2: the revision line never restarts while the store exists ------------
+
+ok('N2 a force reset continues the revision line instead of reusing rev 0', () => {
+  const proj = freshProject('n2-counter');
+  assert.strictEqual(state.loadState(proj).rev, 0, 'a fresh store on an EMPTY dir still opens at rev 0');
+  const s = state.loadState(proj);
+  s.objective = 'pre-reset';
+  state.saveState(proj, s);
+  assert.strictEqual(state.loadState(proj).rev, 1, 'work advances it');
+  state.initProject(proj, { force: true, resetBy: 'test', resetReason: 'n2' });
+  const after = state.loadState(proj);
+  assert.strictEqual(after.objective, '', 'the reset still wipes the record');
+  assert.strictEqual(after.rev, 2, `a reset is one more revision, not a restart — got rev ${after.rev}`);
+});
+
+ok('N2 a writer paused across a reset cannot resurrect the pre-reset record', () => {
+  const proj = freshProject('n2-resurrect');
+  const sync = path.join(proj, 'n2sync');
+  fs.mkdirSync(sync, { recursive: true });
+
+  // The child loads the freshly initialized store (rev 0) and waits. While it
+  // waits, real work lands and then the store is RESET. If a reset reuses rev 0,
+  // the child's stale snapshot matches the fresh generation's revision exactly,
+  // takes the fast path, and writes its whole pre-reset record over the reset —
+  // erasing a deliberate, authorized wipe.
+  const child = spawn(
+    process.execPath,
+    [
+      '-e',
+      `'use strict';
+const fs = require('fs'); const path = require('path');
+const state = require(path.join(${JSON.stringify(SRC)}, 'state.js'));
+const sync = ${JSON.stringify(sync)};
+const s = state.loadState(process.cwd());
+fs.writeFileSync(path.join(sync, 'loaded'), String(s.rev), 'utf8');
+const deadline = Date.now() + 20000;
+while (!fs.existsSync(path.join(sync, 'go')) && Date.now() < deadline) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+}
+const res = { error: null, code: null };
+try { s.objective = 'resurrected by a paused writer'; state.saveState(process.cwd(), s); }
+catch (e) { res.error = e.message; res.code = e.code || null; }
+fs.writeFileSync(path.join(sync, 'done'), JSON.stringify(res), 'utf8');`,
+    ],
+    { cwd: proj, env: childEnv(proj), stdio: 'ignore' }
+  );
+  child.unref();
+  const waitFor = (f) => {
+    const deadline = Date.now() + 20000;
+    while (!fs.existsSync(path.join(sync, f)) && Date.now() < deadline) sleepSync(20);
+    assert.ok(fs.existsSync(path.join(sync, f)), `child never reached "${f}"`);
+  };
+  waitFor('loaded');
+  assert.strictEqual(fs.readFileSync(path.join(sync, 'loaded'), 'utf8'), '0', 'the child holds a rev-0 snapshot');
+
+  const s = state.loadState(proj);
+  s.objective = 'work that happened before the reset';
+  state.saveState(proj, s);
+  state.initProject(proj, { force: true, resetBy: 'danny', resetReason: 'start a new run' });
+
+  fs.writeFileSync(path.join(sync, 'go'), '1', 'utf8');
+  waitFor('done');
+  const res = JSON.parse(fs.readFileSync(path.join(sync, 'done'), 'utf8'));
+
+  const final = state.loadState(proj);
+  assert.strictEqual(
+    final.objective,
+    '',
+    `an authorized reset must survive a paused writer — objective is ${JSON.stringify(final.objective)}, child said ${JSON.stringify(res)}`
+  );
+  assert.ok(res.error, `the stale writer must be refused, not merged — child reported: ${JSON.stringify(res)}`);
+  assert.strictEqual(res.code, 'ERATCHETSTALE', `and refused as stale; got ${res.code}`);
+});
+
+// --- N3: no fallback ever writes the canonical path in place -----------------
+
+ok('N3 a creation that dies mid-write never leaves a malformed record', () => {
+  const proj = fs.mkdtempSync(path.join(os.tmpdir(), 'ratchet-n3-'));
+  projects.push(proj);
+  // Force the no-hard-links fallback, then kill the write halfway. The 'wx'
+  // fallback opened the CANONICAL path and wrote into it, so a failure left a
+  // permanently malformed state.json that creation then refused to repair
+  // (EEXIST) while every reader spawned another .corrupt backup.
+  // The FIRST write of the record is the scratch copy every design makes; the
+  // SECOND is where the designs differ — an in-place canonical write, or another
+  // scratch file destined for a rename. Failing the second is what tells them
+  // apart, so the counter is the injection, not the path.
+  const [res] = runChildren(
+    proj,
+    `  const state = require(path.join(SRC, 'state.js'));
+  fs.linkSync = function () { throw Object.assign(new Error('EPERM: no hard links here'), { code: 'EPERM' }); };
+  const realWrite = fs.writeFileSync;
+  let records = 0;
+  fs.writeFileSync = function (file, data, ...rest) {
+    if (typeof data === 'string' && data.includes('"createdAt"')) {
+      records++;
+      if (records >= 2) {
+        realWrite.call(fs, file, data.slice(0, Math.floor(data.length / 2)), ...rest);
+        throw new Error('simulated ENOSPC mid-creation');
+      }
+    }
+    return realWrite.call(fs, file, data, ...rest);
+  };
+  try { state.loadState(process.cwd()); } finally { fs.writeFileSync = realWrite; }`,
+    ['n3']
+  );
+  assert.match(String(res.error), /simulated ENOSPC/, `the injection must fire; child said: ${res.error}`);
+
+  const sPath = state.statePath(proj);
+  if (fs.existsSync(sPath)) {
+    const raw = fs.readFileSync(sPath, 'utf8');
+    let parseError = null;
+    try {
+      JSON.parse(raw);
+    } catch (e) {
+      parseError = e.message;
+    }
+    assert.strictEqual(parseError, null, `a failed creation must never publish half a record — ${parseError}`);
+  }
+  // And the store must still be openable afterwards, without a repair loop.
+  assert.strictEqual(state.loadState(proj).rev, 0, 'the next read opens a clean store');
+});
+
+// --- N6/N10: a nonsense clock is not a shield; a refusal hands over the fix --
+
+ok('N6 a future-dated owner card cannot protect a lock forever', () => {
+  const proj = freshProject('n6');
+  // Age was computed as now - card.at, so a card stamped in the future clamped
+  // to age 0 and sat under soft-stale permanently — an unbreakable lock built
+  // from one bad timestamp. A clock that cannot be believed makes liveness
+  // unprovable; it does not make the holding sacred.
+  plantLock(workspaceLockDir(proj), { ageMs: -3600000, token: 'futurecard', action: 'stamped in the future' });
+  let ran = false;
+  state.withWorkspaceLock(proj, 'contender', () => {
+    ran = true;
+  });
+  assert.ok(ran, 'a card with an unbelievable timestamp must be recoverable');
+});
+
+ok('N10 a lock refusal hands the operator the resolution', () => {
+  const proj = freshProject('n10');
+  const lockDir = plantLock(workspaceLockDir(proj), { ageMs: 1000, token: 'livewedge', action: 'wedged writer' });
+  const prevTimeout = process.env.RATCHET_LOCK_TIMEOUT_MS;
+  process.env.RATCHET_LOCK_TIMEOUT_MS = '300';
+  let refusal = null;
+  try {
+    state.withWorkspaceLock(proj, 'contender', () => {});
+  } catch (e) {
+    refusal = e;
+  } finally {
+    if (prevTimeout === undefined) delete process.env.RATCHET_LOCK_TIMEOUT_MS;
+    else process.env.RATCHET_LOCK_TIMEOUT_MS = prevTimeout;
+  }
+  assert.ok(refusal, 'a live holder produces a refusal');
+  const m = refusal.message;
+  // A wedged live holder is never auto-broken by policy, so the operator IS the
+  // recovery path — the message has to contain everything that decision needs.
+  assert.ok(m.includes(lockDir), `the refusal must name the lock directory; got: ${m}`);
+  assert.ok(m.includes(String(process.pid)), `and the owner pid; got: ${m}`);
+  assert.ok(m.includes(os.hostname()), `and the owner host; got: ${m}`);
+  assert.ok(/wedged writer/.test(m), `and what it is doing; got: ${m}`);
+  assert.ok(/\bdelete\b/i.test(m) && /\.lock/.test(m), `and the manual remedy; got: ${m}`);
+  fs.rmSync(lockDir, { recursive: true, force: true });
+});
+
+// --- N7: the library door is the same door ----------------------------------
+
+ok('N7 a propose-only agent cannot wipe the store through initProject', () => {
+  const proj = freshProject('n7');
+  const s = state.loadState(proj);
+  s.objective = 'the record an auditor must not wipe';
+  state.saveState(proj, s);
+  const before = stateBytes(proj);
+  process.env.RATCHET_AGENT = 'ratchet-auditor';
+  try {
+    assert.throws(() => state.initProject(proj, { force: true }), /propose-only/, 'the library wipe is a wipe');
+    // A plain init still orients: it creates nothing that exists and wipes nothing.
+    assert.doesNotThrow(() => state.initProject(proj), 'a non-destructive init stays open to a propose-only agent');
+  } finally {
+    delete process.env.RATCHET_AGENT;
+  }
+  assert.ok(stateBytes(proj).equals(before), 'the refused wipe must move zero bytes');
+});
+
+// --- N8: the corrupt backup is a write, so it happens under the lock --------
+
+ok('N8 backing up a corrupt record happens under the workspace lock', () => {
+  const proj = freshProject('n8');
+  fs.writeFileSync(state.statePath(proj), '{ this is not json', 'utf8');
+  const realWrite = fs.writeFileSync;
+  const backups = [];
+  fs.writeFileSync = function (file, ...rest) {
+    if (String(file).includes('.corrupt.')) backups.push(fs.existsSync(workspaceLockDir(proj)));
+    return realWrite.call(fs, file, ...rest);
+  };
+  try {
+    state.loadState(proj);
+  } finally {
+    fs.writeFileSync = realWrite;
+  }
+  assert.strictEqual(backups.length, 1, `the corrupt record must be backed up exactly once; got ${backups.length}`);
+  assert.strictEqual(backups[0], true, 'and the backup — a write — must happen under the workspace lock');
 });
 
 fs.rmSync(tmp, { recursive: true, force: true });

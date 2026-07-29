@@ -329,30 +329,41 @@ ok('state carries a monotonic rev that increments on every CHANGE and survives l
   // invalidates every proof bound to the current one for nothing. The sequence
   // below is unchanged; each step now makes a real change to earn its revision,
   // and the no-op law it used to contradict is asserted at the end.
-  state.initProject(cwd, { force: true });
-  const fresh = state.loadState(cwd);
-  assert.strictEqual(fresh.rev, 0, 'a fresh state opens at rev 0');
+  // Its own store, because rev 0 now means "this record has never existed
+  // before" — a force reset CONTINUES the counter (asserted at the end), so
+  // running this against a store the rest of the suite has been resetting all
+  // day would be asserting an accident.
+  const proj = path.join(tmp, 'rev-counter');
+  fs.rmSync(proj, { recursive: true, force: true });
+  state.initProject(proj, { force: true });
+  const fresh = state.loadState(proj);
+  assert.strictEqual(fresh.rev, 0, 'a genuinely new store opens at rev 0');
   fresh.tags.push('rev-1');
-  state.saveState(cwd, fresh);
-  assert.strictEqual(state.loadState(cwd).rev, 1, 'the first write is rev 1');
-  const second = state.loadState(cwd);
+  state.saveState(proj, fresh);
+  assert.strictEqual(state.loadState(proj).rev, 1, 'the first write is rev 1');
+  const second = state.loadState(proj);
   second.tags.push('rev-2');
-  state.saveState(cwd, second);
-  assert.strictEqual(state.loadState(cwd).rev, 2, 'rev increments across writes and survives a reload');
+  state.saveState(proj, second);
+  assert.strictEqual(state.loadState(proj).rev, 2, 'rev increments across writes and survives a reload');
   // an identical resave is not a write: no revision, no timestamp churn
-  const bytes = fs.readFileSync(state.statePath(cwd));
-  state.saveState(cwd, state.loadState(cwd));
-  assert.strictEqual(state.loadState(cwd).rev, 2, 'a save that changes nothing costs no revision');
-  assert.ok(fs.readFileSync(state.statePath(cwd)).equals(bytes), 'a save that changes nothing writes no bytes');
+  const bytes = fs.readFileSync(state.statePath(proj));
+  state.saveState(proj, state.loadState(proj));
+  assert.strictEqual(state.loadState(proj).rev, 2, 'a save that changes nothing costs no revision');
+  assert.ok(fs.readFileSync(state.statePath(proj)).equals(bytes), 'a save that changes nothing writes no bytes');
+  // A wipe does not restart the count. A pre-reset snapshot would otherwise match
+  // the fresh generation's revision exactly and overwrite it — erasing an
+  // authorized reset with stale work. One ordered truth per store.
+  state.initProject(proj, { force: true, resetBy: 'test', resetReason: 'rev continuity' });
+  assert.strictEqual(state.loadState(proj).rev, 3, 'a reset is one more revision of the same store, not a restart');
   // a legacy (pre-0.8) state file has no rev — it is read as 0, lazily, never migrated
-  const legacy = state.loadState(cwd);
+  const legacy = state.loadState(proj);
   delete legacy.rev;
-  state.writeJson(state.statePath(cwd), legacy);
-  assert.strictEqual(state.loadState(cwd).rev, undefined, 'load does not rewrite a legacy file');
-  const migrating = state.loadState(cwd);
+  state.writeJson(state.statePath(proj), legacy);
+  assert.strictEqual(state.loadState(proj).rev, undefined, 'load does not rewrite a legacy file');
+  const migrating = state.loadState(proj);
   migrating.tags.push('rev-1-again');
-  state.saveState(cwd, migrating);
-  assert.strictEqual(state.loadState(cwd).rev, 1, 'a missing rev counts as 0, so the next write is 1');
+  state.saveState(proj, migrating);
+  assert.strictEqual(state.loadState(proj).rev, 1, 'a missing rev counts as 0, so the next write is 1');
 });
 
 ok('a corrupt state file is never clobbered when its backup fails', () => {
