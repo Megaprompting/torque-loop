@@ -203,7 +203,10 @@ ok('aperture meters loop depth from uncertainty', () => {
   assert.strictEqual(snap.score, 0);
   assert.strictEqual(snap.level, 'A0');
   assert.strictEqual(snap.implement, true);
-  assert.deepStrictEqual(snap.sequence, ['build', 'verify']);
+  // 0.8 contract change (deliberate, not a weakened assertion): every metered
+  // sequence ends on compile, including A0. A snap that never serializes leaves
+  // the work unrecorded, which is the one outcome the loop exists to prevent.
+  assert.deepStrictEqual(snap.sequence, ['build', 'verify', 'compile']);
 
   const mid = scoring.scoreAperture({ ambiguity: 1, terrain: 1, taste: 1, blastRadius: 1, reversibility: 1 });
   assert.strictEqual(mid.score, 5);
@@ -214,6 +217,21 @@ ok('aperture meters loop depth from uncertainty', () => {
   assert.strictEqual(max.level, 'A4');
   assert.strictEqual(max.implement, false, 'A4 must not build before constraints are locked');
   assert.ok(!max.sequence.includes('build'), 'A4 produces options, not code');
+});
+
+ok('every metered sequence ends on compile, and verify follows the last build', () => {
+  // Two invariants, not five hardcoded lists: a sequence that stops before
+  // compile loses the work, and a sequence that builds after its last verify
+  // ships something nothing ever ran.
+  for (const band of scoring.APERTURE_LEVELS) {
+    const seq = band.sequence;
+    assert.strictEqual(seq[seq.length - 1], 'compile', `${band.level} ends on compile (got ${seq.join(' → ')})`);
+    if (seq.includes('build')) {
+      const lastWrite = Math.max(seq.lastIndexOf('build'), seq.lastIndexOf('patch'));
+      const verifyAt = seq.lastIndexOf('verify');
+      assert.ok(verifyAt > lastWrite, `${band.level} verifies after its last build/patch (got ${seq.join(' → ')})`);
+    }
+  }
 });
 
 ok('aperture defaults a missing dimension to neutral, not certain', () => {
@@ -1511,6 +1529,52 @@ ok('the fog auto-close names its authority and its evidence', () => {
     assert.strictEqual(l.closedBy, map.id, 'the close names which map answered it');
     assert.ok(/unknown-map/.test(l.evidence), 'and states the evidence, not just the flag flip');
   }
+});
+
+ok('end to end: build → bound verify → close → compile actually reaches CLOSED', () => {
+  const proj = path.join(tmp, 'e2e-closed');
+  fs.rmSync(proj, { recursive: true, force: true });
+  fs.mkdirSync(path.join(proj, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(proj, 'src', 'shipped.js'), 'module.exports = 1;\n', 'utf8');
+  state.initProject(proj, { force: true });
+
+  inProject(proj, () => {
+    cli.run(['node', 'ratchet', 'state', 'set', 'objective', 'ship the closure gate']);
+    // BUILD
+    cli.run(['node', 'ratchet', 'artifact', 'add', '{"title":"shipped","kind":"code","path":"src/shipped.js"}']);
+    const art = state.loadState(proj).artifacts[0];
+    const events = () => journal.readEvents(proj);
+    assert.strictEqual(lifecycle.workflowClosed(state.loadState(proj), events(), proj).closed, false, 'a fresh build is not closed');
+    assert.ok(/ratchet-evolve verify/.test(lifecycle.nextTransition(state.loadState(proj), events(), proj).command));
+
+    // VERIFY, bound
+    const v = evolveVerify.verify({ target: 'src/shipped.js', testCommand: 'node -e 0', mode: 'code', cwd: proj, artifact: art });
+    journal.appendEvent(proj, {
+      target: 'src/shipped.js', artifactId: art.id, verdict: 'KEEP',
+      chosenMutation: 'ship it', verification: v,
+      seam: { evidenceType: 'test', testedSeam: 'node -e 0', shipSeam: 'node -e 0', seamMatch: 'exact', independentFromBuilderMethod: true },
+    }, { verifiedHash: v.verifiedHash });
+
+    // the loop now names close, not compile
+    assert.strictEqual(
+      lifecycle.nextTransition(state.loadState(proj), events(), proj).command, `ratchet artifact close ${art.id}`
+    );
+    // and a checkpoint here does NOT make it closed
+    cli.run(['node', 'ratchet', 'compile', 'done']);
+    assert.strictEqual(lifecycle.workflowClosed(state.loadState(proj), events(), proj).closed, false,
+      'checkpoint is not closure');
+
+    // CLOSE
+    cli.run(['node', 'ratchet', 'artifact', 'close', art.id]);
+    const closure = lifecycle.workflowClosed(state.loadState(proj), events(), proj);
+    assert.strictEqual(closure.closed, true, `expected CLOSED, blocked by: ${closure.blockers.map((b) => b.code).join(', ')}`);
+    assert.deepStrictEqual(closure.blockers, []);
+
+    // COMPILE — the last checkpoint after a real closure
+    assert.strictEqual(lifecycle.nextTransition(state.loadState(proj), events(), proj).command, 'ratchet compile done');
+    cli.run(['node', 'ratchet', 'compile', 'done']);
+    assert.strictEqual(lifecycle.nextTransition(state.loadState(proj), events(), proj).command, 'nothing pending');
+  });
 });
 
 // --- closure derivation (0.8 Closure Gate) ----------------------------------
