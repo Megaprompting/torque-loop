@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`src/mcp/workspace.js` — the root allowlist and canonical path containment**
+  (Torque MCP build-order step 2.1). The invariant: **no client-controlled path crosses
+  the configured roots, directly or indirectly.** A string check cannot enforce that,
+  because the filesystem decides what a path means — so containment is judged on a
+  canonical path, every component resolved through the filesystem, never on the text the
+  client sent. Resolution walks the path down rather than calling `realpath` once,
+  because a single call fails with `ENOENT` on a path that does not exist yet and says
+  nothing about the link already traversed. Refused directly: relative paths (with more
+  than one root there is no base to guess from), `..` escapes, unrelated absolute paths,
+  and a sibling that merely shares a root's name prefix (`/srv/work` does not contain
+  `/srv/work-evil`). Refused indirectly: a symlink leaving the root, a symlinked
+  directory partway along, and a **dangling** link whose destination nothing can confirm
+  — an unprovable target is refused, never assumed to stay inside. A NUL is refused
+  before any syscall sees it, since every syscall truncates there and the containment
+  check would read one path while the open used another. Zero roots is a **closed**
+  allowlist: every path is refused, which is the safe direction to fail. Roots are
+  canonicalized at construction and must be absolute, existing directories. Links that
+  stay *inside* a root are followed normally — containment is not achieved by refusing
+  the feature. Name comparison is case-insensitive only where the platform is. Refusals
+  name the boundary without echoing the resolved target, which would answer the question
+  the traversal was asking.
+- **`test/mcp-workspace.test.js` — 18-case containment suite**, written red against an
+  absent module and wired into `npm test` (the plugin-shape unwired-suite guard was
+  verified red against it first). Includes the positive control that keeps the suite
+  honest: an implementation that refused every symlink would block all the escapes and
+  still be wrong.
+
 - **`src/mcp/rpc.js` — the Torque MCP RPC kernel with era pinning** (CLI-enforced at the
   kernel boundary; Torque MCP 1.0 build-order step 1 of the ratified spec). A connection
   speaks exactly one protocol era: `server/discover` pins **modern** (MCP `2026-07-28` —
