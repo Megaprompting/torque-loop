@@ -1835,5 +1835,96 @@ ok('nextTransition derives one move, in precedence order, with a fixed shape', (
   );
 });
 
+// --- migration: a real v0.7 store, untouched (0.8 Closure Gate) -------------
+
+ok('a v0.7 store loads, scores, renders, and accepts every new verb without corruption', () => {
+  // Mirrors the shapes the live dogfood store actually carries: free-text
+  // statuses, a bare status:"closed", duplicate ids, an unattached open defect,
+  // a fragment-bearing path, unbound events, and no rev fields anywhere.
+  // Migration is additive and lazy: STATE_VERSION stays 1, no script runs.
+  const proj = path.join(tmp, 'v07-store');
+  fs.rmSync(proj, { recursive: true, force: true });
+  fs.mkdirSync(path.join(proj, '.ratchet'), { recursive: true });
+  state.initProject(proj, { force: true });
+
+  const legacy = state.loadState(proj);
+  delete legacy.rev;
+  legacy.objective = 'finish the 0.7 run';
+  legacy.nextAction = 'write the release memory';
+  legacy.nextCommand = '/ratchet:compile';
+  legacy.artifacts = [
+    { id: 'art-dup', at: '2026-07-01T00:00:00.000Z', kind: 'docs', title: 'first', status: 'v1', holes: [] },
+    { id: 'art-dup', at: '2026-07-01T00:00:01.000Z', kind: 'docs', title: 'second', status: 'v1', holes: [] },
+    { id: 'art-bare-closed', at: '2026-07-02T00:00:00.000Z', kind: 'code', title: 'done thing', status: 'closed', holes: [] },
+    { id: 'art-frag', at: '2026-07-03T00:00:00.000Z', kind: 'docs', title: 'release note', status: 'shipped v3', path: 'CHANGELOG.md#unreleased' },
+  ];
+  legacy.defects = [
+    { id: 'def-orphan', at: '2026-07-02T00:00:00.000Z', severity: 'medium', summary: 'nobody attached me', status: 'open', artifact: '' },
+  ];
+  legacy.assumptions = [{ id: 'asm-1', text: 'the seam holds', status: 'untested' }];
+  legacy.openLoops = [{ id: 'loop-1', text: 'decide the release name', status: 'open' }];
+  state.writeJson(state.statePath(proj), legacy);
+
+  const evolveLog = path.join(proj, 'evolve-log.jsonl');
+  fs.writeFileSync(evolveLog, JSON.stringify({
+    id: 'evo_2026_07_03_001', target: 'CHANGELOG.md', mode: 'docs', verdict: 'KEEP',
+    verification: { commands: [], manualChecks: ['read end to end'], result: 'manual' },
+    seam: { seamMatch: 'exact' },
+  }) + '\n', 'utf8');
+
+  inProject(proj, () => {
+    const s = state.loadState(proj);
+    assert.strictEqual(s.rev, undefined, 'load does not migrate the file');
+    const events = journal.readEvents(proj);
+    assert.strictEqual(events.length, 1);
+    assert.strictEqual(events[0].artifactId, undefined, 'a v0.7 event has no binding and never gains one');
+
+    // it SCORES
+    const layers = scoring.scoreConfidenceLayers(s, state.loadLedger(proj), events);
+    for (const l of ['artifact', 'session', 'ledger']) assert.ok(layers[l].scope, `${l} layer still scoped`);
+    // it RENDERS — every surface, no throw
+    assert.ok(/Ratchet state/.test(md.stateSummary(s)));
+    const r = receipt.assemble(proj);
+    assert.ok(/Ratchet receipt/.test(md.receipt(r)));
+    assert.ok(/Confidence/.test(md.confidenceLayers(layers, lifecycle.workflowClosed(s, events, proj))));
+    assert.doesNotThrow(() => md.fullExport(s, state.loadLedger(proj)));
+
+    // the fragment path downgrades to record scope, with the reason stated
+    const frag = lifecycle.fingerprint(proj, s.artifacts.find((a) => a.id === 'art-frag'));
+    assert.strictEqual(frag.hashScope, 'record');
+    assert.ok(/does not resolve to a file/.test(frag.downgradeReason));
+
+    // the bare "closed" is UNCERTIFIED: it runs the full gate, not the no-op
+    const bare = s.artifacts.find((a) => a.id === 'art-bare-closed');
+    assert.strictEqual(lifecycle.isClosed(bare), false);
+    assert.throws(() => cli.run(['node', 'ratchet', 'artifact', 'close', 'art-bare-closed']), /no KEEP proof bound/);
+
+    // the duplicate id refuses every lifecycle verb, repair-ably
+    assert.throws(() => cli.run(['node', 'ratchet', 'artifact', 'close', 'art-dup']), /share the id/);
+    assert.throws(() => cli.run(['node', 'ratchet', 'retract', 'art-dup', '--reason', 'x']), /share the id/);
+
+    // the unattached defect blocks WORKFLOW closure but not this artifact's close
+    const closure = lifecycle.workflowClosed(s, events, proj);
+    assert.strictEqual(closure.closed, false);
+    assert.ok(closure.blockers.some((b) => b.code === 'unattached-defects'));
+    const fragBlockers = lifecycle.closureBlockers(s, events, s.artifacts.find((a) => a.id === 'art-frag'), proj);
+    assert.ok(!fragBlockers.some((b) => b.code === 'unattached-defects'), 'an orphan defect is not this artifact\'s blocker');
+
+    // and every NEW verb works on the old store
+    cli.run(['node', 'ratchet', 'state', 'close', 'openLoops', 'loop-1', '--evidence', 'named it Closure Gate']);
+    cli.run(['node', 'ratchet', 'state', 'close', 'assumptions', 'asm-1', '--outcome', 'tested', '--evidence', 'held for 0.7']);
+    cli.run(['node', 'ratchet', 'defect', 'resolve', 'def-orphan', '--evidence', 'attached and fixed']);
+    say(() => cli.run(['node', 'ratchet', 'compile', 'done']));
+
+    const after = state.loadState(proj);
+    assert.strictEqual(after.openLoops[0].status, 'closed');
+    assert.strictEqual(after.assumptions[0].status, 'tested');
+    assert.strictEqual(after.defects[0].status, 'resolved');
+    assert.strictEqual(after.artifacts.length, 4, 'no artifact was lost or duplicated');
+    assert.ok(Number.isInteger(after.rev) && after.rev >= 1, 'rev started counting on the first write, lazily');
+    assert.strictEqual(after.version, 1, 'STATE_VERSION did not move');
+  });
+});
+
 fs.rmSync(tmp, { recursive: true, force: true });
 process.stdout.write(`\n${passed} passed\n`);
