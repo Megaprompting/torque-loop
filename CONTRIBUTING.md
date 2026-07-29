@@ -19,7 +19,7 @@ rule applies to contributions.
 Requires [Node.js](https://nodejs.org) ≥ 18.
 
 ```bash
-git clone https://github.com/TheLucidTech/torque-loop.git
+git clone https://github.com/Megaprompting/torque-loop.git
 cd torque-loop
 npm test            # runs the full smoke suite (no install step needed — zero deps)
 ```

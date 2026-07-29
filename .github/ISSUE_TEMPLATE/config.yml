@@ -1,8 +1,8 @@
 blank_issues_enabled: false
 contact_links:
   - name: Security vulnerability
-    url: https://github.com/TheLucidTech/torque-loop/security/advisories/new
+    url: https://github.com/Megaprompting/torque-loop/security/advisories/new
     about: Report security issues privately — do not open a public issue.
   - name: Question or discussion
-    url: https://github.com/TheLucidTech/torque-loop/discussions
+    url: https://github.com/Megaprompting/torque-loop/discussions
     about: Ask a question or discuss an idea before filing an issue.

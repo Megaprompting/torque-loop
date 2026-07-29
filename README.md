@@ -2,7 +2,7 @@
 
 # Torque Loop
 
-[![CI](https://github.com/TheLucidTech/torque-loop/actions/workflows/ci.yml/badge.svg)](https://github.com/TheLucidTech/torque-loop/actions/workflows/ci.yml)
+[![CI](https://github.com/Megaprompting/torque-loop/actions/workflows/ci.yml/badge.svg)](https://github.com/Megaprompting/torque-loop/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-black.svg)](LICENSE)
 [![Node.js ≥ 18](https://img.shields.io/badge/node-%E2%89%A518-black.svg)](package.json)
 
@@ -77,7 +77,7 @@ The repo doubles as a single-plugin marketplace, so you can install it directly.
 
 ```bash
 # 1. get the repo
-git clone https://github.com/TheLucidTech/torque-loop.git
+git clone https://github.com/Megaprompting/torque-loop.git
 
 # 2. in Claude Code, register it as a marketplace and install
 /plugin marketplace add /absolute/path/to/torque-loop
@@ -87,7 +87,7 @@ git clone https://github.com/TheLucidTech/torque-loop.git
 Or point at the GitHub repo without cloning first:
 
 ```text
-/plugin marketplace add TheLucidTech/torque-loop
+/plugin marketplace add Megaprompting/torque-loop
 /plugin install ratchet@torque-loop
 ```
 
@@ -123,7 +123,7 @@ The repo also contains a Codex marketplace manifest at
 
 ```bash
 # 1. get the repo
-git clone https://github.com/TheLucidTech/torque-loop.git
+git clone https://github.com/Megaprompting/torque-loop.git
 
 # 2. register this repo as a Codex marketplace
 codex plugin marketplace add /absolute/path/to/torque-loop
