@@ -43,15 +43,30 @@ ratchet state set nextAction "<single next move>"
 ratchet state set nextCommand "/ratchet:<command>"
 ratchet state append decisions '{"choice":"...","rejected":"...","tripwire":"..."}'   # if any new
 ratchet artifact add '{"title":"...","kind":"...","status":"...","holes":["..."]}'    # if any new
-ratchet defect add '{"severity":"...","summary":"...","status":"..."}'                 # if any new
-ratchet state append openLoops '{"text":"...","status":"open"}'                        # if any
+ratchet defect add '{"severity":"...","summary":"...","artifact":"<id>"}'              # if any new
+ratchet state append openLoops '{"text":"..."}'                                        # if any
 ratchet state set phase compile
 ratchet compile done
 ```
 
+A defect is born open — the CLI refuses a terminal birth status. Clearing one is a
+transition with proof: `ratchet defect resolve <id> --evidence "..."`.
+
 `ratchet compile done` clears the dirty flag, stamps `lastCompileAt`, and records a
 `compile.done` history event in one atomic move — which silences the Stop-hook nag. (Run it
-last: a `state set` after it would re-dirty the session.) Then emit the record:
+last: a `state set` after it would re-dirty the session.)
+
+**CHECKPOINT is not CLOSED.** `compile done` prints `CHECKPOINTED, NOT CLOSED` and the next
+required transition, because serializing says the record is current — never that the work
+is finished. An artifact is finished only when a KEEP is bound to its exact revision and
+you run:
+
+```
+ratchet artifact close <id>
+```
+
+Report the checkpoint as a checkpoint. If the run also closed the artifact, say CLOSED and
+name the proof id; otherwise say what closing still needs. Then emit the record:
 
 ```
 ratchet export markdown

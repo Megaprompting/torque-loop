@@ -76,10 +76,10 @@ ratchet artifact add '{"title":"handoff brief","kind":"decision-record","status"
 ratchet compile done
 ```
 
-`ratchet compile done` is the only checkpoint transition — `state set lastCompileAt`
-is refused, because a checkpoint you can assert by hand records nothing. It prints
-the next required transition; a handoff that ends on a checkpoint says CHECKPOINTED,
-not CLOSED, and names what closing would still take.
+`ratchet compile done` is the only checkpoint transition. The checkpoint scalars are no
+longer settable by hand, because a checkpoint you can assert records nothing. It prints
+the next required transition; a handoff that ends on a checkpoint says CHECKPOINTED, not
+CLOSED, and names what closing would still take.
 
 A good handoff is measured by one thing: the receiver's first action is correct without
 asking you anything.

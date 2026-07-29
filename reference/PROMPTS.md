@@ -4,8 +4,10 @@ These are the prompts the skills implement. Ratchet turns each from a copy-paste
 into a stateful, serialized command. If a skill and its source prompt ever disagree, the
 prompt is the load-bearing intent — fix the skill.
 
-**The path every prompt forces:** frame → choose → build → attack → patch → serialize → advance.
+**The path every prompt forces:** frame → choose → build → attack → patch → verify → serialize → advance.
 **The rule:** every move must produce *pressure*, not just insight.
+**The ending:** serializing is a CHECKPOINT, not a closure. An artifact closes only when a
+KEEP is bound to that exact revision — `ratchet artifact close <id>`. No proof → no close.
 
 ## Command ↔ prompt map
 
@@ -77,7 +79,12 @@ Process:
    - preserve working parts
    - show the delta
 
-7. Compile:
+7. Verify:
+   - run the harness against the artifact it is bound to
+   - record the result as evidence, never as an opinion
+   - on green, close the artifact; on red, patch again
+
+8. Compile:
    - decisions made
    - artifact created
    - unresolved risks

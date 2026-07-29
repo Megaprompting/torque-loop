@@ -207,4 +207,85 @@ ok('the probe primitive threads map → build → handoff with a disposal rule',
   assert.ok(/probe/i.test(read('templates/unknowns-map.md')), 'the map template offers probe as a closure');
 });
 
+// --- the closure gate reaches the prose too (0.8) ---------------------------
+// Every one of these is prompt-level guidance. The CLI enforcement lives in
+// src/lifecycle.js + the close verbs; these guards only stop the prose from
+// drifting back to teaching the loop that a checkpoint is an ending.
+
+ok('the canonical path forces verify, and the prompt catalog knows closure', () => {
+  const prompts = read('reference/PROMPTS.md');
+  const canonical = /\*\*The path every prompt forces:\*\*[^\r\n]*/.exec(prompts);
+  assert.ok(canonical, 'PROMPTS.md states the canonical path');
+  assert.ok(/verify/.test(canonical[0]), `the canonical path names verify: ${canonical[0]}`);
+  assert.ok(/artifact close|no proof → no close/i.test(prompts), 'the prompt source of truth knows the closure gate');
+});
+
+ok('ignite carries a verify step and the current A0–A4 table', () => {
+  const ignite = read('skills/ignite/SKILL.md');
+  assert.ok(/verify/i.test(ignite), 'ignite runs a verify step');
+  for (const level of ['A0', 'A1', 'A2', 'A3', 'A4']) {
+    assert.ok(new RegExp(`\\b${level}\\b`).test(ignite), `ignite's aperture table lists ${level}`);
+  }
+  // the table must match the shipped sequences, not a remembered older set
+  const scoring = require('../src/scoring');
+  for (const band of scoring.APERTURE_LEVELS) {
+    const row = new RegExp(`\\|\\s*${band.level}\\b[^\\r\\n]*`).exec(ignite);
+    assert.ok(row, `ignite has a table row for ${band.level}`);
+    for (const step of band.sequence) {
+      assert.ok(row[0].includes(step), `${band.level} row names "${step}" (row: ${row[0].trim()})`);
+    }
+  }
+});
+
+ok('loop cycles through verify and cannot stop on a score alone', () => {
+  const loop = read('skills/loop/SKILL.md');
+  assert.ok(/build\s*→\s*attack\s*→\s*patch\s*→\s*verify\s*→\s*compile/.test(loop), 'the cycle runs verify before compile');
+  assert.ok(/workflowClosed|workflow closure/i.test(loop), 'the stop condition reads workflow closure, not just loopClear');
+  assert.ok(/loopClear/.test(loop), 'and still reads loopClear');
+  assert.ok(
+    !/declare convergence and stop/.test(loop),
+    'the "converged" escape is gone: converging on an unclosed workflow is stopping early'
+  );
+});
+
+ok('patch resolves the ORIGINAL defect instead of birthing a resolved one', () => {
+  const patch = read('skills/patch/SKILL.md');
+  assert.ok(/ratchet defect resolve [^\r\n]*--evidence/.test(patch), 'patch serializes with defect resolve --evidence');
+  assert.ok(
+    !/defect add[^\r\n]*"status"\s*:\s*"(resolved|closed|waived|superseded)"/.test(patch),
+    'no born-resolved defect example — a defect cannot be born terminal'
+  );
+});
+
+ok('attack and verify name the artifact they are about', () => {
+  for (const rel of ['skills/attack/SKILL.md', 'skills/verify/SKILL.md']) {
+    const text = read(rel);
+    assert.ok(/"artifact"\s*:\s*"<id>"/.test(text), `${rel} payload names "artifact":"<id>"`);
+  }
+});
+
+ok('verify binds its run and closes on green', () => {
+  const verify = read('skills/verify/SKILL.md');
+  assert.ok(/ratchet-evolve verify [^\r\n]*--artifact/.test(verify), 'verify runs bound to an artifact');
+  assert.ok(/verifiedHash/.test(verify), 'and carries the verifiedHash into log append');
+  assert.ok(/ratchet artifact close/.test(verify), 'a green bound run ends by closing the artifact');
+});
+
+ok('compile teaches CHECKPOINT, not CLOSED', () => {
+  const compile = read('skills/compile/SKILL.md');
+  assert.ok(/CHECKPOINT/.test(compile), 'compile calls itself a checkpoint');
+  assert.ok(/not closure|NOT CLOSED/i.test(compile), 'and says out loud that it is not closure');
+  assert.ok(/ratchet artifact close/.test(compile), 'and names the verb that does close');
+  assert.ok(
+    !/defect add[^\r\n]*"status"\s*:\s*"(resolved|closed|waived|superseded)"/.test(compile),
+    'no terminal-status defect-add example'
+  );
+});
+
+ok('handoff checkpoints through compile done, never the scalar bypass', () => {
+  const handoff = read('skills/handoff/SKILL.md');
+  assert.ok(/ratchet compile done/.test(handoff), 'handoff uses compile done');
+  assert.ok(!/state set (dirty|lastCompileAt)/.test(handoff), 'and not the removed scalar bypass');
+});
+
 process.stdout.write(`\n${passed} passed\n`);

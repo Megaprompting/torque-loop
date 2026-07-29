@@ -46,11 +46,16 @@ The result names an aperture and the exact ratchet sequence to run:
 
 | Level | Score | Run |
 |---|---|---|
-| A0 Snap | 0–2 | `build → verify` — do it, prove it, stop. |
+| A0 Snap | 0–2 | `build → verify → compile` — do it, prove it, record it. |
 | A1 Narrow | 3–4 | `lock → build → verify → compile`. |
-| A2 Working | 5–6 | the full seven-step pipeline below. |
-| A3 Wide | 7–8 | `lock → map → auction → cut → decide → build …` — map the fog before you build. |
-| A4 Max | 9–10 | `lock → map → cut → decide`, then **STOP — produce options, do not build** until constraints are locked. |
+| A2 Working | 5–6 | `lock → cut → build → attack → patch → verify → compile` — the pipeline below. |
+| A3 Wide | 7–8 | `lock → map → auction → cut → decide → build → attack → patch → verify → compile` — map the fog before you build. |
+| A4 Max | 9–10 | `lock → map → cut → decide → compile`, then **STOP — produce options, do not build** until constraints are locked. |
+
+Every sequence ends on `compile`, and every sequence that builds runs `verify` after its
+last build/patch. Work that is never serialized cannot be resumed; an edit nothing ran
+after it is an unproven ship. `compile` is a CHECKPOINT — closing the artifact is a
+separate, earned move (`ratchet artifact close <id>`).
 
 When the read reports **`Pre-build map: required`**, run `/ratchet:map` before any
 build step and hand over the four-quadrant map first. The dial raises it at A3–A4, and
@@ -65,7 +70,7 @@ goes mechanical.
 **Do not inflate ceremony.** Running the full loop on an A0 task is the same failure
 as skipping it on an A4 task. Spend proof where uncertainty earns it.
 
-## The pipeline (the A2 default — run the aperture's metered sequence, not always all seven)
+## The pipeline (the A2 default — run the aperture's metered sequence, not always all of it)
 
 1. **Lock the target.** Apply the discipline of `/ratchet:lock`. Produce: literal
    object, operation, output shape, real outcome, proof-of-done, smallest artifact,
@@ -91,11 +96,17 @@ as skipping it on an A4 task. Spend proof where uncertainty earns it.
    Delegate to the `ratchet-auditor` subagent for anything that looks finished.
 
 6. **Patch what failed.** Apply `/ratchet:patch`. Fix only the defects found — REMOVE /
-   ADD / CHANGE — and retest. Do not rewrite for elegance.
+   ADD / CHANGE — and retest. Resolve the ORIGINAL defect with its proof:
+   `ratchet defect resolve <id> --evidence "<what proves it fixed>"`.
 
-7. **Compile state.** Apply `/ratchet:compile`. Write decisions, artifacts, defects, open
+7. **Verify, bound to the artifact.** Apply `/ratchet:verify`. Run the harness against the
+   artifact it belongs to — `ratchet-evolve verify <target> --artifact <id>` — and record
+   the result with its `verifiedHash`. On green, close it: `ratchet artifact close <id>`.
+
+8. **Compile state.** Apply `/ratchet:compile`. Write decisions, artifacts, defects, open
    loops, and the single next action + next command. Run `ratchet state set nextAction "..."`
-   and `ratchet state set nextCommand "/ratchet:..."`, then `ratchet export markdown`.
+   and `ratchet state set nextCommand "/ratchet:..."`, then `ratchet compile done`.
+   That is a CHECKPOINT, not a closure — read the transition it prints.
 
 ## Output contract
 

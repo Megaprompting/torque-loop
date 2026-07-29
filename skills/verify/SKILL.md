@@ -48,13 +48,37 @@ REQUIRED PATCHES: <smallest delta per failure>
 
 ## Serialize
 
-Record every failure as a defect and update the ledger:
+Run the harness BOUND to the artifact it is about, so the evidence names the exact bytes
+it was gathered against:
 
 ```
-ratchet defect add '{"severity":"...","summary":"verify: <failure>","feature":"<ledger feature id>"}'
+ratchet-evolve verify <target> --artifact <id> --test "<the command>" --json
+```
+
+That prints `verifiedHash` and `verifiedRev`. Carry `verifiedHash` into the log append —
+`log append` recomputes the hash and refuses if the file moved after the harness ran:
+
+```
+ratchet-evolve log append '{"target":"<target>","artifactId":"<id>","verdict":"KEEP",
+  "verification":{...from verify --json...},"verifiedHash":"<from verify>",
+  "seam":{"seamMatch":"exact","independentFromBuilderMethod":true,...}}'
+```
+
+On RED, record every failure as a defect and go patch:
+
+```
+ratchet defect add '{"severity":"...","summary":"verify: <failure>","artifact":"<id>","feature":"<ledger feature id>"}'
 ratchet ledger update tests '{"feature":"<id>","name":"<test>","status":"fail"}'
 ratchet score confidence
 ```
 
-Next: `/ratchet:patch` the failures, then re-run `/ratchet:verify` on the patched artifact.
-A change isn't done because it typechecks — it's done because the harness couldn't embarrass it.
+On GREEN, the run has earned the ending — close the artifact:
+
+```
+ratchet artifact close <id>
+```
+
+Next: on red, `/ratchet:patch` the failures then re-run `/ratchet:verify`. On green, the
+close above, then `/ratchet:compile`. A change isn't done because it typechecks — it's done
+because the harness couldn't embarrass it, and the proof is bound to that exact revision.
+Revising the artifact invalidates it: no proof → no close.
