@@ -104,6 +104,17 @@ ok('every hooks.json command resolves to a real CLI hook subcommand', () => {
   }
 });
 
+ok('every test suite participates in the authoritative test command', () => {
+  // A suite that exists but is not in `npm test` is a suite nobody runs — the
+  // concurrency falsifiers spent a whole release deliberately outside it, which
+  // is exactly how a suite gets left there. This is the tripwire for that drift.
+  const script = String((pkg.scripts || {}).test || '');
+  const suites = fs.readdirSync(path.join(root, 'test')).filter((f) => f.endsWith('.test.js'));
+  assert.ok(suites.length >= 4, `expected the shipped suites plus concurrency; found ${suites.length}`);
+  const missing = suites.filter((f) => !script.includes(`test/${f}`));
+  assert.deepStrictEqual(missing, [], `npm test must run every test/*.test.js — unwired: ${missing.join(', ')}`);
+});
+
 ok('every bin target from package.json exists', () => {
   for (const [name, rel] of Object.entries(pkg.bin || {})) {
     assert.ok(exists(rel), `bin ${name} -> ${rel} exists`);

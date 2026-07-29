@@ -14,7 +14,7 @@
     "node": ">=18"
   },
   "scripts": {
-    "test": "node test/cli.test.js && node test/evolve.test.js && node test/plugin-shape.test.js",
+    "test": "node test/cli.test.js && node test/evolve.test.js && node test/plugin-shape.test.js && node test/concurrency.test.js",
     "test:concurrency": "node test/concurrency.test.js",
     "preflight": "node scripts/preflight.js",
     "ratchet": "node bin/ratchet",

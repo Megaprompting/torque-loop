@@ -9,6 +9,101 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+#### Concurrency Gate — no lock → no write. Two writers. One ordered truth.
+
+0.8 shipped a monotonic `rev` that nothing read. It was placed there so a later version
+could detect a lost update without a migration; this is that version. Nine falsifiers
+(`test/concurrency.test.js`) were written RED first against 0.8 — eight of them real
+multi-process races, run on `process.execPath` with sentinel-file barriers so the
+interleavings are the operating system's, not a simulation. Traced by: claude-opus-5.
+
+- **One shared mutation primitive.** `state.withWorkspaceMutation(cwd, { expectedStateRev,
+  action }, mutate)` is now the only door onto a state revision: resolve the store →
+  acquire the cross-process lock → **reload the state under the lock** → compare
+  `expectedStateRev` when supplied → apply → commit **exactly one revision** → release in
+  a `finally` on every path. CLI-enforced. `expectedStateRev` is optional (the CLI does not
+  yet expose a `--expected-rev` flag) and mismatch is a **refusal**, never a silent rebase:
+  a caller that names a revision is claiming it read that exact record, and rebasing its
+  conclusion onto a record it never saw writes a stale decision as if it were fresh. A
+  refusal moves zero bytes, zero revisions, zero history (`err.code = 'ERATCHETSTALE'`).
+- **One public command is one transaction.** The boundary covers the whole verb, not each
+  save: `defect add` writes state, mirrors to the ledger, and links the mirror back inside a
+  single lock and commits once. Low-level helpers (`artifacts.js`, `ledger.js`) never lock
+  and never save independently — inside a transaction `loadState` returns the transaction's
+  live state and `saveState` defers to its commit. Threading a CAS through every save
+  instead would have produced multi-rev noise, self-staleness, and nested-lock deadlock.
+- **A real semantic change is one revision; an idempotent re-run is zero.** The commit fires
+  only when the serialized record actually moved, so re-running a serialize block costs no
+  revision, no timestamp churn, no write — a structural property of the boundary rather
+  than a rule each verb has to remember.
+- **The lock.** A directory (`<store>/.lock`) created with `mkdir`, the one create-or-fail
+  primitive every supported filesystem agrees is atomic; an owner card inside it names pid,
+  host, action, and real wall-clock time. Bounded retry with exponential backoff
+  (`RATCHET_LOCK_TIMEOUT_MS`, default 15s) then a **refusal that names the owner**, never a
+  hang. Stale recovery weighs **age and liveness together** — under `RATCHET_LOCK_STALE_MS`
+  (5s) a lock is never broken, past it a provably dead owner **on this host** loses it, past
+  `RATCHET_LOCK_HARD_STALE_MS` (120s) nobody keeps it. `process.kill(pid, 0)` alone is not
+  sufficient and is not trusted alone: pids are recycled. The break is done by an atomic
+  rename, so exactly one racer can perform it, and it is announced on stderr.
+- **Reentrancy is decided, not discovered.** A nested `withWorkspaceMutation` is refused
+  loudly (never a silent self-deadlock); a nested lock scope on the *same* workspace joins
+  the open one; a second *different* workspace is refused.
+- **Atomic persistence.** Every JSON write is serialize → same-directory temp file → fsync →
+  atomic rename over the canonical path → temp cleaned. A death anywhere before the rename
+  leaves the previous record byte-for-byte intact. Verified by SIGKILLing a lock-holding
+  writer mid-transaction on Windows: `state.json` unchanged by sha1, still parseable, and
+  the next writer recovered the abandoned lock by itself.
+- **Cross-process identifiers.** `makeId` was a timestamp plus a **process-local** counter,
+  so three processes sharing one clock handed out the same ids. It is now
+  `<prefix>-<time36>-<48 bits of CSPRNG>` — scannable and roughly ordered, unique because
+  of the entropy, not the clock. Zero new dependencies (`node:crypto`).
+- **The evolution journal names and appends as one step.** Event identity was
+  count-of-today's-events + 1, which every racing process computes identically before any of
+  them writes. It is now the highest sequence already on the log plus one, computed under a
+  dedicated lock beside the log file (the log's path is caller-selectable, so the workspace
+  lock would be the wrong scope in both directions). The `evo_YYYY_MM_DD_NNN` format is
+  unchanged.
+- **Cold start names interrupted-write residue.** An unrenamed scratch file or a held lock is
+  reported as a **warning, not a failure** — it is not a contradiction in the steering, but a
+  cold session opening on somebody's dead commit should be told rather than left to wonder.
+- **Every test suite must participate in `npm test`.** The concurrency falsifiers spent a
+  release deliberately outside the authoritative command, which is exactly how a suite gets
+  left there; `plugin-shape` now fails if any `test/*.test.js` is unwired. CI-enforced,
+  proven red against the unwired script before landing.
+
+### Changed
+
+- **Every branch of `score confidence` is a pure derived read.** The markdown branch used to
+  cache the session score back into state, so the *same* read moved bytes on one output mode
+  and not the other. A read that revises the record it reports on can lose a concurrent
+  write and can never be trusted as a read; the cache is removed (nothing consumed the
+  stored value — confidence is derived on every call). The deliberate mutation in the score
+  family is now exactly one: the fog-recording branch of `score aperture`, which is
+  double-checked (cheap unlocked pre-check, authoritative re-check under the lock) so two
+  concurrent scores record one fog loop, one history entry, one revision.
+- **A `saveState` that names no expected revision now rebases instead of overwriting.** It
+  takes the lock, re-reads what is actually on disk, and merges the caller's delta onto it —
+  arrays element-wise (every state collection is an append-mostly log), scalars only where
+  the caller actually moved them. Two processes that loaded the same revision both keep
+  their work, in two ordered revisions.
+- **`hook post-edit` writes through the boundary** like every other mutation, and is
+  therefore now refused for a propose-only agent (which by contract leaves no footprint).
+- **The propose-only write guard moved from the CLI router to the mutation boundary**
+  (`src/state.js`), so it guards the door every public write comes through instead of one
+  caller. Same rule, same message; the router still asks first so the error names the verb.
+
+### What this gate does NOT claim
+
+Named because an over-claimed guardrail is worse than none. Within **one workspace, on the
+tested platform (Windows/NTFS, Node 24, local filesystem)**, v0.9 guarantees ordered mutation
+and lost-update prevention for writes that go through the boundary. It does **not** claim:
+multi-file crash atomicity (`state.json` and `ledger.json` commit separately — a crash
+between them can leave an orphan ledger mirror); durability against power loss (the file is
+fsynced, the containing directory is not); correctness on network filesystems, where `mkdir`
+atomicity and pid liveness both stop meaning what they mean locally; protection against a
+writer that bypasses the boundary (the lock is advisory — anyone who can write the store can
+write the store); authenticated human approval; or distributed transactions of any kind.
+
 - **Hook drift guard.** `cmdHook`'s default case returns silently by design (a hook
   must never break the session), which means a renamed or misspelled subcommand in
   `hooks/hooks.json` would no-op forever in every installed copy with no error
