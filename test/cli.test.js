@@ -1577,6 +1577,127 @@ ok('end to end: build → bound verify → close → compile actually reaches CL
   });
 });
 
+// --- one derivation, four surfaces (0.8 Closure Gate) -----------------------
+
+ok('all four surfaces read the SAME nextTransition, not four lookalike strings', () => {
+  // No string-matching theatre: swap the derivation for a sentinel and demand
+  // the sentinel itself appears everywhere. A surface that computed its own
+  // answer would print its own answer instead.
+  const proj = path.join(tmp, 'sentinel');
+  fs.rmSync(proj, { recursive: true, force: true });
+  fs.mkdirSync(proj, { recursive: true });
+  state.initProject(proj, { force: true });
+
+  const real = lifecycle.nextTransition;
+  lifecycle.nextTransition = () => ({
+    label: 'SENTINEL-LABEL-9f31', command: 'SENTINEL-COMMAND-9f31', reason: 'injected', scope: 'injected',
+  });
+  try {
+    inProject(proj, () => {
+      const r = receipt.assemble(proj);
+      assert.strictEqual(r.next.transition.command, 'SENTINEL-COMMAND-9f31', 'receipt.assemble derives it');
+      assert.ok(/SENTINEL-COMMAND-9f31/.test(md.receipt(r)), 'and renders it');
+      assert.ok(/SENTINEL-COMMAND-9f31/.test(md.stateSummary(state.loadState(proj))), 'md.stateSummary derives it');
+
+      const compiled = say(() => cli.run(['node', 'ratchet', 'compile', 'done']));
+      assert.ok(/SENTINEL-COMMAND-9f31/.test(compiled), `compile done prints it — got: ${compiled}`);
+
+      const errs = [];
+      const origErr = process.stderr.write;
+      process.stderr.write = (str) => { errs.push(String(str)); return true; };
+      try {
+        cli.run(['node', 'ratchet', 'touch', 'x.md']);
+        cli.run(['node', 'ratchet', 'hook', 'stop-check']);
+      } finally {
+        process.stderr.write = origErr;
+      }
+      assert.ok(/SENTINEL-COMMAND-9f31/.test(errs.join('')), `stop-check prints it — got: ${errs.join('')}`);
+    });
+  } finally {
+    lifecycle.nextTransition = real;
+  }
+});
+
+ok('compile done says CHECKPOINTED, NOT CLOSED — and names what closing needs', () => {
+  const proj = path.join(tmp, 'checkpoint-voice');
+  fs.rmSync(proj, { recursive: true, force: true });
+  fs.mkdirSync(proj, { recursive: true });
+  state.initProject(proj, { force: true });
+  inProject(proj, () => {
+    const text = say(() => cli.run(['node', 'ratchet', 'compile', 'done']));
+    assert.ok(/CHECKPOINTED, NOT CLOSED — state serialized/.test(text), text);
+    assert.ok(/NEXT REQUIRED TRANSITION: .+ -> .+/.test(text), text);
+
+    const json = JSON.parse(say(() => cli.run(['node', 'ratchet', 'compile', 'done', '--json'])));
+    assert.strictEqual(json.checkpointed, true);
+    assert.strictEqual(json.closed, false, 'a checkpoint on an unclosed workflow says so');
+    for (const k of ['label', 'command', 'reason', 'scope']) assert.ok(json.next[k], `next.${k} present`);
+  });
+});
+
+ok('stop-check refuses to imply closure when it cannot read the state', () => {
+  const proj = path.join(tmp, 'stop-check-blind');
+  fs.rmSync(proj, { recursive: true, force: true });
+  fs.mkdirSync(proj, { recursive: true });
+  state.initProject(proj, { force: true });
+  const real = lifecycle.nextTransition;
+  lifecycle.nextTransition = () => { throw new Error('unreadable'); };
+  const errs = [];
+  const origErr = process.stderr.write;
+  process.stderr.write = (str) => { errs.push(String(str)); return true; };
+  try {
+    inProject(proj, () => {
+      assert.doesNotThrow(() => cli.run(['node', 'ratchet', 'hook', 'stop-check']), 'a hook never breaks the session');
+    });
+  } finally {
+    process.stderr.write = origErr;
+    lifecycle.nextTransition = real;
+  }
+  assert.ok(/closure state unreadable — do not claim closed/.test(errs.join('')), errs.join(''));
+});
+
+ok('confidence renders a fourth layer: workflow closure and its blockers', () => {
+  const proj = path.join(tmp, 'fourth-layer');
+  fs.rmSync(proj, { recursive: true, force: true });
+  fs.mkdirSync(proj, { recursive: true });
+  state.initProject(proj, { force: true });
+  inProject(proj, () => {
+    const text = say(() => cli.run(['node', 'ratchet', 'score', 'confidence']));
+    assert.ok(/Workflow closure/.test(text), text);
+    assert.ok(/not closed|NOT CLOSED/i.test(text), 'an unclosed workflow says so, never omits it');
+    assert.ok(/Scope:/.test(text.split('Workflow closure')[1] || ''), 'the fourth layer names its scope too');
+  });
+});
+
+// --- the receipt binds its proof (0.8 Closure Gate) --------------------------
+
+ok('receipt PROOF uses the ACTIVE artifact\'s bound event, and labels legacy evidence', () => {
+  const { proj, art } = boundFixture('receipt-bound', { kind: 'code', file: 'src/thing.js' });
+  inProject(proj, () => {
+    // A KEEP that matches by path but is bound to nothing: display only.
+    journal.appendEvent(proj, {
+      target: 'src/thing.js', mode: 'code', verdict: 'KEEP', chosenMutation: 'legacy shaped',
+      verification: { commands: [{ command: 'node -e 0', pass: true }], result: 'pass' },
+      seam: { evidenceType: 'test', testedSeam: 'x', shipSeam: 'x', seamMatch: 'exact', independentFromBuilderMethod: true },
+    });
+    let r = receipt.assemble(proj);
+    assert.ok(r.proof.keep, 'legacy evidence still renders');
+    assert.strictEqual(r.proof.keep.binding, 'legacy-unbound');
+    assert.strictEqual(r.proof.canAuthorizeClosure, false);
+    assert.ok(/legacy unbound evidence — display only, cannot authorize closure/.test(md.receipt(r)), md.receipt(r));
+
+    // now bind proof to the artifact itself
+    const v = evolveVerify.verify({ target: 'src/thing.js', testCommand: 'node -e 0', mode: 'code', cwd: proj, artifact: art });
+    journal.appendEvent(proj, keepFields(art, { chosenMutation: 'bound' }), { verifiedHash: v.verifiedHash });
+    r = receipt.assemble(proj);
+    assert.strictEqual(r.proof.keep.binding, 'bound');
+    assert.strictEqual(r.proof.keep.mutation, 'bound', 'the bound event wins over the last global KEEP');
+    assert.strictEqual(r.proof.canAuthorizeClosure, true);
+    assert.strictEqual(r.proof.shipDecision, 'justified');
+    assert.ok(!/legacy unbound evidence/.test(md.receipt(r)));
+  });
+});
+
 // --- closure derivation (0.8 Closure Gate) ----------------------------------
 
 ok('fingerprint binds to file bytes, and says so when it cannot', () => {

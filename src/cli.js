@@ -224,9 +224,9 @@ function run(argv) {
     }
 
     case 'compile': {
-      if (sub !== 'done') throw new Error('usage: ratchet compile done');
+      if (sub !== 'done') throw new Error('usage: ratchet compile done [--json]');
       assertMayWrite('compile done');
-      return cmdCompileDone(cwd);
+      return cmdCompileDone(cwd, asJson);
     }
 
     case 'doctor':
@@ -663,14 +663,17 @@ function cmdScore(cwd, sub, rest, asJson) {
         events = [];
       }
       const layers = scoring.scoreConfidenceLayers(s, ledger, events);
-      if (asJson) return out(JSON.stringify(layers, null, 2));
+      // The fourth read: closure is a fact with named blockers, not a score, and
+      // it ships beside the scores so a high number can never read as "done".
+      const closure = lifecycle.workflowClosed(s, events, cwd);
+      if (asJson) return out(JSON.stringify({ ...layers, closure }, null, 2));
       // Cache the session score back into state (a write). A propose-only agent
       // still gets the read — it just leaves no footprint.
       if (!proposeOnlyAgent()) {
         s.confidence = layers.session.score;
         state.saveState(cwd, s);
       }
-      return out(md.confidenceLayers(layers));
+      return out(md.confidenceLayers(layers, closure));
     }
     case 'aperture': {
       const result = scoring.scoreAperture(readPayload(rest[0]));
@@ -738,27 +741,58 @@ function cmdHook(cwd, sub) {
               `Run /ratchet:compile to serialize state before the trail goes cold.`
           );
         }
+        // The same derivation the receipt and compile print. A session that ends
+        // without it ends on whatever the model last believed.
+        let events = [];
+        try {
+          events = journal.readEvents(cwd);
+        } catch (_e) {
+          events = [];
+        }
+        const next = lifecycle.nextTransition(s, events, cwd);
+        err(`[ratchet] NEXT REQUIRED TRANSITION: ${next.label} -> ${next.command}`);
         return;
       }
       default:
         return;
     }
   } catch (_e) {
-    // Hooks fail closed: never break the session.
+    // Hooks fail closed: never break the session — but silence here reads as
+    // "nothing to do", which is the one thing an unreadable closure state must
+    // never imply. Say it cannot be trusted, then exit 0 like every hook.
+    try {
+      err('[ratchet] closure state unreadable — do not claim closed.');
+    } catch (_e2) {
+      /* nothing left to try */
+    }
   }
 }
 
-// Atomically mark a session as compiled. Unlike `state set`, this CLEARS dirty
-// (so the Stop hook stops nagging) and stamps lastCompileAt in one move. Compile
-// completion is an event, not a scalar edit — it must never re-dirty the state.
-function cmdCompileDone(cwd) {
+// Atomically mark a session as CHECKPOINTED. Unlike `state set`, this CLEARS
+// dirty (so the Stop hook stops nagging) and stamps lastCompileAt in one move.
+// Compile completion is an event, not a scalar edit — it must never re-dirty the
+// state, and it must never be mistaken for closure: it says the record is
+// current, not that the work is finished.
+function cmdCompileDone(cwd, asJson) {
   const now = schemas.nowIso();
   const s = state.loadState(cwd);
   s.lastCompileAt = now;
   s.dirty = false;
   s.history.push({ id: state.makeId('hist'), at: now, event: 'compile.done', note: 'state serialized' });
   state.saveState(cwd, s);
-  return out('compiled — dirty cleared, state serialized');
+
+  let events = [];
+  try {
+    events = journal.readEvents(cwd);
+  } catch (_e) {
+    events = [];
+  }
+  const next = lifecycle.nextTransition(s, events, cwd);
+  if (asJson) {
+    return out(JSON.stringify({ checkpointed: true, closed: lifecycle.workflowClosed(s, events, cwd).closed, next }, null, 2));
+  }
+  out('CHECKPOINTED, NOT CLOSED — state serialized');
+  return out(`NEXT REQUIRED TRANSITION: ${next.label} -> ${next.command}`);
 }
 
 // Extract the raw YAML frontmatter block from a SKILL.md / agent .md file.
