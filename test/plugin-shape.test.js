@@ -216,7 +216,12 @@ ok('the canonical path forces verify, and the prompt catalog knows closure', () 
   const prompts = read('reference/PROMPTS.md');
   const canonical = /\*\*The path every prompt forces:\*\*[^\r\n]*/.exec(prompts);
   assert.ok(canonical, 'PROMPTS.md states the canonical path');
-  assert.ok(/verify/.test(canonical[0]), `the canonical path names verify: ${canonical[0]}`);
+  // Order is the claim, not the vocabulary: verify has to sit AFTER patch and
+  // BEFORE serialize, or the path still teaches serializing an unproven change.
+  assert.ok(
+    /patch[^\r\n]*→[^\r\n]*verify[^\r\n]*→[^\r\n]*serialize/.test(canonical[0]),
+    `the canonical path runs patch → verify → serialize: ${canonical[0]}`
+  );
   assert.ok(/artifact close|no proof → no close/i.test(prompts), 'the prompt source of truth knows the closure gate');
 });
 
@@ -231,8 +236,13 @@ ok('ignite carries a verify step and the current A0–A4 table', () => {
   for (const band of scoring.APERTURE_LEVELS) {
     const row = new RegExp(`\\|\\s*${band.level}\\b[^\\r\\n]*`).exec(ignite);
     assert.ok(row, `ignite has a table row for ${band.level}`);
+    // In ORDER — a row listing the right steps in the wrong order is exactly the
+    // drift this guard exists to catch (e.g. compile before verify).
+    let cursor = 0;
     for (const step of band.sequence) {
-      assert.ok(row[0].includes(step), `${band.level} row names "${step}" (row: ${row[0].trim()})`);
+      const at = row[0].indexOf(step, cursor);
+      assert.ok(at >= 0, `${band.level} row names "${step}" in sequence order (row: ${row[0].trim()})`);
+      cursor = at + step.length;
     }
   }
 });
@@ -258,9 +268,13 @@ ok('patch resolves the ORIGINAL defect instead of birthing a resolved one', () =
 });
 
 ok('attack and verify name the artifact they are about', () => {
+  // The DEFECT ADD payload is what has to carry it — the field mentioned in prose
+  // somewhere else on the page is not what a caller copies.
   for (const rel of ['skills/attack/SKILL.md', 'skills/verify/SKILL.md']) {
     const text = read(rel);
-    assert.ok(/"artifact"\s*:\s*"<id>"/.test(text), `${rel} payload names "artifact":"<id>"`);
+    const add = /ratchet defect add[^\r\n]*/.exec(text);
+    assert.ok(add, `${rel} shows a defect add example`);
+    assert.ok(/"artifact"\s*:\s*"<id>"/.test(add[0]), `${rel} defect add payload names "artifact":"<id>": ${add[0]}`);
   }
 });
 
@@ -274,7 +288,11 @@ ok('verify binds its run and closes on green', () => {
   assert.ok(append, 'verify shows a log append example');
   assert.ok(/verifiedHash/.test(append[0]), 'the log append example carries verifiedHash');
   assert.ok(/verifiedRev/.test(append[0]), 'the log append example carries verifiedRev');
-  assert.ok(/ratchet artifact close/.test(verify), 'a green bound run ends by closing the artifact');
+  // On the GREEN path specifically. `artifact close` sitting under the red-path
+  // instructions would teach closing on a failed run — the opposite of the gate.
+  const green = verify.split(/On GREEN/i)[1] || '';
+  assert.ok(green, 'verify separates the green path');
+  assert.ok(/ratchet artifact close/.test(green), 'a green bound run ends by closing the artifact');
 });
 
 ok('compile teaches CHECKPOINT, not CLOSED', () => {

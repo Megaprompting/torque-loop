@@ -1727,6 +1727,69 @@ ok('the fog auto-close names its authority and its evidence', () => {
   }
 });
 
+ok('end to end through the real binaries: build → bound verify → close → compile', () => {
+  // The in-process version below shares module state with the test. This one
+  // spawns bin/ratchet and bin/ratchet-evolve as the user does, carrying
+  // verifiedHash AND verifiedRev between two separate processes — the seam where
+  // a JSON contract between the two CLIs would actually break.
+  const { spawnSync } = require('child_process');
+  const root = path.resolve(__dirname, '..');
+  const proj = path.join(tmp, 'e2e-spawned');
+  fs.rmSync(proj, { recursive: true, force: true });
+  fs.mkdirSync(path.join(proj, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(proj, 'src', 'shipped.js'), 'module.exports = 1;\n', 'utf8');
+
+  const env = {
+    ...process.env,
+    RATCHET_DATA_DIR: path.join(proj, '.data'),
+    RATCHET_EVOLVE_LOG: path.join(proj, '.ratchet', 'evolve-log.jsonl'),
+  };
+  delete env.RATCHET_AGENT;
+  const run = (bin, ...argv) => {
+    const r = spawnSync(process.execPath, [path.join(root, 'bin', bin), ...argv], {
+      cwd: proj, env, encoding: 'utf8',
+    });
+    return { code: r.status, out: (r.stdout || '') + (r.stderr || '') };
+  };
+
+  assert.strictEqual(run('ratchet', 'state', 'set', 'objective', 'ship it').code, 0);
+  assert.strictEqual(
+    run('ratchet', 'artifact', 'add', '{"id":"art-e2e","title":"shipped","kind":"code","path":"src/shipped.js"}').code, 0
+  );
+
+  // close is refused before proof exists
+  const early = run('ratchet', 'artifact', 'close', 'art-e2e');
+  assert.strictEqual(early.code, 1, early.out);
+  assert.ok(/no proof → no close/.test(early.out), early.out);
+
+  // bound verify, across the process boundary
+  const v = run('ratchet-evolve', 'verify', 'src/shipped.js', '--artifact', 'art-e2e', '--test', 'node -e 0', '--json');
+  assert.strictEqual(v.code, 0, v.out);
+  const verified = JSON.parse(v.out);
+  assert.strictEqual(verified.hashScope, 'file');
+  assert.strictEqual(verified.verifiedRev, 1);
+
+  const appended = run('ratchet-evolve', 'log', 'append', JSON.stringify({
+    target: 'src/shipped.js', artifactId: 'art-e2e', verdict: 'KEEP', chosenMutation: 'ship it',
+    verifiedHash: verified.verifiedHash, verifiedRev: verified.verifiedRev,
+    verification: { commands: verified.commands, result: verified.result },
+    seam: { evidenceType: 'test', testedSeam: 'node -e 0', shipSeam: 'node -e 0', seamMatch: 'exact', independentFromBuilderMethod: true },
+  }));
+  assert.strictEqual(appended.code, 0, appended.out);
+
+  const closed = run('ratchet', 'artifact', 'close', 'art-e2e');
+  assert.strictEqual(closed.code, 0, closed.out);
+  assert.ok(/closed — rev 1/.test(closed.out), closed.out);
+  // idempotent through the binary too
+  assert.strictEqual(run('ratchet', 'artifact', 'close', 'art-e2e').code, 0);
+
+  const compiled = run('ratchet', 'compile', 'done', '--json');
+  assert.strictEqual(compiled.code, 0, compiled.out);
+  const summary = JSON.parse(compiled.out);
+  assert.strictEqual(summary.checkpointed, true);
+  assert.strictEqual(summary.closed, true, `the workflow is CLOSED through the real CLI: ${compiled.out}`);
+});
+
 ok('end to end: build → bound verify → close → compile actually reaches CLOSED', () => {
   const proj = path.join(tmp, 'e2e-closed');
   fs.rmSync(proj, { recursive: true, force: true });
@@ -2214,7 +2277,26 @@ ok('a v0.7 store loads, scores, renders, and accepts every new verb without corr
     const fragBlockers = lifecycle.closureBlockers(s, events, s.artifacts.find((a) => a.id === 'art-frag'), proj);
     assert.ok(!fragBlockers.some((b) => b.code === 'unattached-defects'), 'an orphan defect is not this artifact\'s blocker');
 
-    // and every NEW verb works on the old store
+    // and a migrated artifact can actually be PROVEN and CLOSED — "accepts every
+    // new verb" is only true if the whole closure path runs on a v0.7 record.
+    fs.mkdirSync(path.join(proj, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(proj, 'src', 'migrated.js'), 'module.exports = 7;\n', 'utf8');
+    cli.run(['node', 'ratchet', 'artifact', 'add', '{"id":"art-frag","path":"src/migrated.js"}']);
+    const migrated = state.loadState(proj).artifacts.find((a) => a.id === 'art-frag');
+    assert.strictEqual(migrated.rev, 2, 'a legacy record with no rev revises to 2');
+    const mv = evolveVerify.verify({ target: 'src/migrated.js', testCommand: 'node -e 0', mode: 'auto', cwd: proj, artifact: migrated });
+    assert.strictEqual(mv.hashScope, 'file', 'the fragment path was replaced by a real file');
+    journal.appendEvent(proj, {
+      target: 'src/migrated.js', artifactId: 'art-frag', verdict: 'KEEP', chosenMutation: 'proved a migrated record',
+      verification: { commands: mv.commands, result: mv.result },
+      seam: { evidenceType: 'test', testedSeam: 'node -e 0', shipSeam: 'node -e 0', seamMatch: 'exact', independentFromBuilderMethod: true },
+    }, { verifiedHash: mv.verifiedHash, verifiedRev: mv.verifiedRev });
+    cli.run(['node', 'ratchet', 'artifact', 'close', 'art-frag']);
+    const nowClosed = state.loadState(proj).artifacts.find((a) => a.id === 'art-frag');
+    assert.strictEqual(lifecycle.isClosed(nowClosed), true, 'a v0.7 record earns a real closure certificate');
+    assert.strictEqual(nowClosed.closedRev, 2);
+
+    // and every OTHER new verb works on the old store
     cli.run(['node', 'ratchet', 'state', 'close', 'openLoops', 'loop-1', '--evidence', 'named it Closure Gate']);
     cli.run(['node', 'ratchet', 'state', 'close', 'assumptions', 'asm-1', '--outcome', 'tested', '--evidence', 'held for 0.7']);
     cli.run(['node', 'ratchet', 'defect', 'resolve', 'def-orphan', '--evidence', 'attached and fixed']);
