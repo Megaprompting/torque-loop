@@ -521,19 +521,27 @@ ok('F-G a write that dies mid-file leaves the old canonical bytes intact', () =>
   state.saveState(proj, seed);
   const before = stateBytes(proj);
 
-  // Inject the crash class the canonical write has no answer for — power loss,
+  // Inject the crash class a canonical write has no answer for — power loss,
   // ENOSPC, SIGKILL between the truncate and the last byte — by writing half the
   // JSON and throwing. In a child, so the patched fs never touches this process.
+  //
+  // The trigger is the PAYLOAD, not the destination. It was written as
+  // `file === statePath`, which only fires against an implementation that writes
+  // the record in place — the very design this falsifier exists to kill. Under
+  // temp-file + atomic rename nothing ever writes that path with a string, the
+  // injection would silently never fire, and the suite would go green on a
+  // no-op. Keyed on the bytes it fires on BOTH designs, so a future in-place
+  // regression still trips it. (Changed with the 0.9 implementation; the law and
+  // every assertion below are untouched.)
   const [res] = runChildren(
     proj,
     `  const state = require(path.join(SRC, 'state.js'));
   const cwd = process.cwd();
-  const sPath = state.statePath(cwd);
   const s = state.loadState(cwd);
   s.objective = 'G: interrupted';
   const realWrite = fs.writeFileSync;
   fs.writeFileSync = function (file, data, ...rest) {
-    if (String(file) === sPath && typeof data === 'string') {
+    if (typeof data === 'string' && data.includes('G: interrupted')) {
       realWrite.call(fs, file, data.slice(0, Math.floor(data.length / 2)), ...rest);
       throw new Error('simulated crash mid-write (ENOSPC)');
     }
