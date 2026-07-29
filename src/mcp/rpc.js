@@ -22,6 +22,7 @@ const LEGACY_VERSION = '2025-11-25';
 const ERR_PARSE = -32700;
 const ERR_INVALID_REQUEST = -32600;
 const ERR_METHOD_NOT_FOUND = -32601;
+const ERR_INVALID_PARAMS = -32602;
 const ERR_INTERNAL = -32603;
 // MCP-allocated range (-32020..-32099), per the 2026-07-28 allocation policy.
 const ERR_UNSUPPORTED_PROTOCOL_VERSION = -32022;
@@ -43,15 +44,11 @@ function errorResponse(id, code, message, data) {
 }
 
 function createKernel({ serverInfo, capabilities, methods }) {
-  const table = Object.assign({}, methods || {});
+  // Null prototype: a method named "constructor" or "__proto__" must miss the
+  // table, not dredge up Object.prototype and dispatch it.
+  const table = Object.assign(Object.create(null), methods || {});
   const caps = capabilities || {};
   const info = serverInfo || { name: 'torque-mcp', version: '0.0.0' };
-
-  function methodEras(name) {
-    if (name === 'server/discover') return ['modern'];
-    if (name === 'initialize' || name === 'notifications/initialized') return ['legacy'];
-    return table[name] ? table[name].eras : null;
-  }
 
   function createConnection() {
     let era = null;
@@ -59,13 +56,22 @@ function createKernel({ serverInfo, capabilities, methods }) {
     function requireModernVersion(msg) {
       const meta = (msg.params && msg.params._meta) || {};
       const version = meta[META + 'protocolVersion'];
-      if (version === MODERN_VERSION) return meta;
-      const said = version === undefined ? 'no protocol version' : `protocol version ${version}`;
-      throw rpcError(
-        ERR_UNSUPPORTED_PROTOCOL_VERSION,
-        `request carried ${said}; this server speaks ${MODERN_VERSION} ` +
-          `(_meta ${META}protocolVersion on every request) or the legacy ${LEGACY_VERSION} initialize handshake`
-      );
+      if (version !== MODERN_VERSION) {
+        const said = version === undefined ? 'no protocol version' : `protocol version ${version}`;
+        throw rpcError(
+          ERR_UNSUPPORTED_PROTOCOL_VERSION,
+          `request carried ${said}; this server speaks ${MODERN_VERSION} ` +
+            `(_meta ${META}protocolVersion on every request) or the legacy ${LEGACY_VERSION} initialize handshake`
+        );
+      }
+      const clientCaps = meta[META + 'clientCapabilities'];
+      if (typeof clientCaps !== 'object' || clientCaps === null) {
+        throw rpcError(
+          ERR_INVALID_PARAMS,
+          `modern requests carry ${META}clientCapabilities (an object) in _meta on every request`
+        );
+      }
+      return meta;
     }
 
     function eraRefusal(method) {
@@ -82,17 +88,25 @@ function createKernel({ serverInfo, capabilities, methods }) {
 
       if (method === 'initialize') {
         if (era === 'modern') throw eraRefusal(method);
-        if (era === 'legacy') throw rpcError(ERR_INVALID_REQUEST, 'initialize already ran on this connection');
-        era = 'legacy';
-        const requested = msg.params && msg.params.protocolVersion;
+        if (era === 'legacy') {
+          throw rpcError(ERR_INVALID_REQUEST, 'initialize already ran on this connection — reconnect to start a new session');
+        }
+        const params = msg.params;
+        if (typeof params !== 'object' || params === null || Array.isArray(params) || typeof params.protocolVersion !== 'string') {
+          throw rpcError(ERR_INVALID_PARAMS, 'initialize params carry a protocolVersion string (plus capabilities and clientInfo)');
+        }
+        era = 'legacy'; // pinned only after the handshake proves its shape
         return {
-          protocolVersion: requested === LEGACY_VERSION ? requested : LEGACY_VERSION,
+          protocolVersion: params.protocolVersion === LEGACY_VERSION ? params.protocolVersion : LEGACY_VERSION,
           capabilities: caps,
           serverInfo: info,
         };
       }
 
       if (method === 'server/discover') {
+        // Version-exempt by design (attack-round-1 ruling): discover is the
+        // door a client knocks to learn what versions exist — demanding proof
+        // of a version before answering that question is circular.
         if (era === 'legacy') throw eraRefusal(method);
         era = 'modern';
         return {
@@ -107,20 +121,24 @@ function createKernel({ serverInfo, capabilities, methods }) {
         return null;
       }
 
-      const entry = table[method];
-      if (!entry) throw rpcError(ERR_METHOD_NOT_FOUND, `method not found: ${method}`);
-
+      // The stateless contract outranks method resolution: a request that
+      // cannot prove its era gets the era answer, never a method answer.
       if (era === null) {
-        // No pin yet and not a handshake verb: only a modern stateless request
-        // can stand on its own — it must prove its version, and doing so pins.
         requireModernVersion(msg);
         era = 'modern';
       } else if (era === 'modern') {
         // Stateless means every request re-proves its version; the pin only
         // guards the era boundary, it never carries negotiation state forward.
         requireModernVersion(msg);
+      } else {
+        // A modern-marked request executing under legacy would be exactly the
+        // mixed connection the pin exists to prevent.
+        const meta = (msg.params && msg.params._meta) || {};
+        if (meta[META + 'protocolVersion'] !== undefined) throw eraRefusal(method);
       }
 
+      const entry = table[method];
+      if (!entry) throw rpcError(ERR_METHOD_NOT_FOUND, `method not found: ${method}`);
       if (!entry.eras.includes(era)) throw eraRefusal(method);
 
       return entry.handler(msg.params || {}, { era, serverInfo: info });
@@ -142,34 +160,47 @@ function createKernel({ serverInfo, capabilities, methods }) {
       if (!msg || typeof msg !== 'object' || msg.jsonrpc !== JSONRPC || typeof msg.method !== 'string') {
         return errorResponse(msg && msg.id, ERR_INVALID_REQUEST, 'not a JSON-RPC 2.0 request');
       }
+      if (msg.id !== undefined && msg.id !== null && typeof msg.id !== 'string' && typeof msg.id !== 'number') {
+        // An unusable id cannot be echoed, so the answer carries null — and the
+        // request is never dispatched.
+        return errorResponse(null, ERR_INVALID_REQUEST, 'a JSON-RPC id is a string, a number, or null');
+      }
 
       const isNotification = msg.id === undefined;
-      let result;
+      if (isNotification && (msg.method === 'initialize' || msg.method === 'server/discover')) {
+        // A handshake needs an answer to exist; a notification-shaped one can
+        // only pin an era silently, which poisons the connection. Dropped.
+        return null;
+      }
+
+      let response;
       try {
-        result = dispatch(msg);
-        // A JSON-RPC result is an object or it is nothing — validated inside
-        // the try so a bad handler answers -32603 instead of crashing the
-        // decoration below and taking the connection with it.
-        if (!isNotification && (typeof result !== 'object' || result === null || Array.isArray(result))) {
-          throw rpcError(ERR_INTERNAL, `handler for ${msg.method} returned a non-object result`);
+        let result = dispatch(msg);
+        if (!isNotification) {
+          // A JSON-RPC result is an object or it is nothing — and decoration
+          // runs inside the boundary too, because copying a result executes its
+          // getters and a throwing getter must answer -32603, not kill the
+          // connection.
+          if (typeof result !== 'object' || result === null || Array.isArray(result)) {
+            throw rpcError(ERR_INTERNAL, `handler for ${msg.method} returned a non-object result`);
+          }
+          if (era === 'modern') {
+            // Modern results always name themselves: resultType is required by
+            // the protocol, and serverInfo travels in _meta because there is no
+            // handshake left to have said it once. Decoration works on a copy —
+            // the handler's object may be frozen or shared across requests.
+            result = Object.assign({}, result);
+            if (result.resultType === undefined) result.resultType = 'complete';
+            result._meta = Object.assign({}, result._meta, { [META + 'serverInfo']: info });
+          }
+          response = { jsonrpc: JSONRPC, id: msg.id, result };
         }
       } catch (e) {
         if (isNotification) return null; // no channel to answer on — drop, never crash
         const rpc = e && e.rpc ? e.rpc : { code: ERR_INTERNAL, message: 'internal error' };
         return errorResponse(msg.id, rpc.code, rpc.message, rpc.data);
       }
-      if (isNotification) return null;
-
-      if (era === 'modern') {
-        // Modern results always name themselves: resultType is required by the
-        // protocol, and serverInfo travels in _meta because there is no
-        // handshake left to have said it once. Decoration works on a copy — the
-        // handler's object may be frozen or shared across requests.
-        result = Object.assign({}, result);
-        if (result.resultType === undefined) result.resultType = 'complete';
-        result._meta = Object.assign({}, result._meta, { [META + 'serverInfo']: info });
-      }
-      return { jsonrpc: JSONRPC, id: msg.id, result };
+      return isNotification ? null : response;
     }
 
     return { handleMessage, era: () => era };

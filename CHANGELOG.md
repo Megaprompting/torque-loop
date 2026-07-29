@@ -18,19 +18,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   after the pin the other era's surface is a named `-32010` refusal carrying the remedy
   (reconnect) — never a silent downgrade, never a mixed connection. A missing or
   unsupported protocol version is `-32022` (`UnsupportedProtocolVersion`, MCP-allocated
-  range) naming both supported doors; a method that exists only in the other era refuses
-  by era rather than lying with `-32601`. Handlers register per-era in a declarative
-  table; a throwing handler answers `-32603` and the connection survives. Scope: the
-  kernel judges envelopes and eras only — no tools, resources, state access, or transport
-  policy live here (those are later build-order steps).
+  range) naming both supported doors, checked **before** method resolution so a wrong
+  version never learns method names; missing `clientCapabilities` is `-32602` naming the
+  key; a method that exists only in the other era — or a modern-marked request arriving
+  on a legacy connection — refuses by era rather than lying with `-32601`. Handshakes
+  must be requests: a notification-shaped `initialize`/`server/discover` is dropped and
+  pins nothing, a shapeless `initialize` refuses `-32602` unpinned, and a non-JSON-RPC id
+  type refuses `-32600` undispatched. The method table is null-prototype (a method named
+  `constructor` misses, never dispatches `Object.prototype`). Handlers register per-era
+  in a declarative table; a throwing handler — or a result whose own getter throws under
+  decoration — answers `-32603` and the connection survives. Named ruling:
+  `server/discover` is **version-exempt by design** — it is the door a client knocks to
+  learn what versions exist, and demanding proof of a version before answering that
+  question is circular. Scope: the kernel judges envelopes and eras only — no tools,
+  resources, state access, or transport policy live here (those are later build-order
+  steps).
 - **`src/mcp/stdio.js` — newline-delimited JSON framing for local stdio** (Phase 1
-  transport). Framing only: split and coalesced chunks reassemble, a garbage line answers
-  `-32700` instead of killing the stream, an unterminated line past `maxLineBytes`
-  (default 8 MiB) is refused once and discarded rather than buffered forever, and every
-  protocol judgment defers to the kernel. No `bin/` entry point yet — exposing `ratchet-mcp` is a public-surface decision
-  parked for Danny (open loop).
-- **`test/mcp-rpc.test.js` — 22-case contract suite**, wired into `npm test` (the
-  plugin-shape unwired-suite guard was verified red against it first).
+  transport). Framing only: split and coalesced chunks reassemble with multi-byte UTF-8
+  surviving a mid-codepoint cut (`StringDecoder`, not `String(chunk)`), a garbage line
+  answers `-32700` instead of killing the stream, any line past `maxLineBytes` (default
+  8 MiB, measured in **bytes**) is refused whether or not it ever ends, a result the
+  kernel accepted but JSON cannot carry (BigInt, cycles) answers `-32603` on the wire,
+  and every protocol judgment defers to the kernel. No `bin/` entry point yet — exposing
+  `ratchet-mcp` is a public-surface decision parked for Danny (open loop).
+- **`test/mcp-rpc.test.js` — 38-case contract suite**, wired into `npm test` (the
+  plugin-shape unwired-suite guard was verified red against it first). An independent
+  Codex review of the first cut returned 15 findings and the verdict "one era does NOT
+  hold"; 12 reproduced red and were fixed, one was ruled design (the discover exemption
+  above), one was a test that could not fail (strengthened to assert eras), and one —
+  remedies on standard JSON-RPC refusals — was applied where a remedy exists
+  (`reconnect`) and declined for wire-level errors whose reason is the remedy.
 
 ## [0.9.0] - 2026-07-29 — Concurrency Gate
 
