@@ -726,13 +726,12 @@ function saveLedger(cwd, ledger) {
   return ledger;
 }
 
-// Short, sortable, collision-resistant id: <prefix>-<time36>-<rand>
-let _counter = 0;
+// Short, sortable, collision-resistant id: <prefix>-<time36>-<rand>. The time
+// prefix keeps ids scannable and roughly ordered; the entropy is what makes them
+// unique. The counter this replaced was PROCESS-LOCAL, so two processes sharing
+// a clock handed out the same ids — a CSPRNG has no such shared state.
 function makeId(prefix) {
-  _counter = (_counter + 1) % 1000;
-  const t = Date.now().toString(36);
-  const c = _counter.toString(36).padStart(2, '0');
-  return `${prefix || 'id'}-${t}${c}`;
+  return `${prefix || 'id'}-${Date.now().toString(36)}-${crypto.randomBytes(6).toString('hex')}`;
 }
 
 module.exports = {
