@@ -5,7 +5,163 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [Unreleased] — Closure Gate
+
+0.7 gated the fog. It left the loop able to *stop* but not to *finish*: `compile done`
+serialized the record and every surface treated that as an ending, so a session could
+checkpoint forever and call it done. **Checkpoint is not closure — no proof → no close.**
+An artifact closes only when a KEEP is bound to that exact revision, and revising it
+invalidates the proof.
+
+Every entry names whether it is CLI-enforced or prompt-level, and the falsifier that was
+run red against v0.7 before it landed.
+
+### Added
+
+- **`src/lifecycle.js` — one pure derivation of what "closed" means** (CLI-enforced).
+  `fingerprint` (rev + content hash + `hashScope`), `bindingEvent`, `closureBlockers`,
+  `isClosed`, `workflowClosed`, `nextTransition`. Pure by construction: it never requires
+  the journal (events are always passed in) and never writes, so four surfaces cannot
+  drift into four different answers. *Falsifier: the module's seven contract cases; against
+  v0.7 the suite dies at `Cannot find module '../src/lifecycle'`.*
+- **`ratchet artifact close <id> [--waive-holes --owner --reason]`** (CLI-enforced) —
+  under the existing `artifact` group, behind `assertMayWrite`. Refuses with ALL blockers
+  in one fixed order (`terminal · probe · no-bound-proof · open-defects · holes`); on
+  success stamps `status:'closed'`, `closedAt`, `closedBy` (the bound event id),
+  `closedRev`, `closedHash`, optional `holesWaiver`, and records `artifact.closed`. A
+  second close of a certified artifact is a **no-op, not an error** — re-running a
+  serialize block must be free. A record-scope close additionally requires `--owner` and
+  `--reason`: it certifies a claim about a record, not about shipped bytes. *Falsifier:
+  proven red by disabling the verb — `usage: ratchet artifact add <json> | ratchet artifact
+  close <id>`.*
+- **`ratchet state close openLoops|assumptions <id>`** (CLI-enforced) — loops close with
+  `--evidence` or park with `--owner` + `--revisit-trigger`; assumptions end
+  `--outcome tested|killed` with evidence. **A parked loop still drains confidence**
+  (pinned by a test): a parked question is an unanswered question with an owner. Other
+  collections are refused and pointed at their own verb.
+- **Proof binding on every event** (CLI-enforced). `newEvent` gains `artifactId`,
+  `artifactRev`, `artifactHash`, `hashScope`, `source` — additive, always present, so
+  every v0.7 event stays valid and permanently unbound. `appendEvent` on a bound event
+  computes rev/hash itself and refuses caller-supplied `artifactRev`/`artifactHash`,
+  refuses a caller-supplied event id, **derives `mode` from the bound artifact** and
+  refuses caller disagreement (a code artifact bound through `mode:"docs"` skipped the
+  seam gate entirely), and requires `opts.verifiedHash`, refusing when the bytes moved
+  (`file changed after verification — re-verify.`). *Falsifiers: forged rev/hash accepted;
+  `mode:"docs"` on a `.js` artifact accepted; edit-then-append accepted.*
+- **`ratchet-evolve verify <target> --artifact <id>`** (CLI-enforced) — fingerprints
+  before AND after the test command, refuses a target that moved under the harness
+  (`target changed during verification`), and emits `{artifactId, verifiedHash,
+  verifiedRev, hashScope}` for the append call. *Falsifier: verify emitted no fingerprint
+  at all.*
+- **A dormant `state.rev`** (CLI-enforced). `saveState` increments a monotonic integer;
+  `newState` opens at 0 and a missing rev reads as 0, lazily. **Nothing reads it in 0.8** —
+  it ships now because a lost-update check added later cannot retro-number files written
+  before the counter existed. *Falsifier: `a fresh state opens at rev 0` → rev was
+  undefined.*
+- **A fourth confidence read: workflow closure** (CLI-enforced). `score confidence`
+  renders CLOSED / NOT CLOSED with its named blockers beside the three scored layers.
+  Deliberately not a score — closure is a fact, and a number can always read "high enough".
+
+### Changed
+
+- **The KEEP gate reads the commands, not the claim** (CLI-enforced). Any `commands[]`
+  entry with `pass !== true` refuses regardless of the claimed `result`; a claimed result
+  that contradicts green commands refuses; a bare-string command (no machine verdict)
+  is no longer evidence; and unwaived code KEEP now requires
+  `seam.independentFromBuilderMethod === true` **strictly** — omitted and `null`, the
+  shape a self-verifying builder actually leaves behind, previously rode through.
+  *Falsifiers: `{result:"pass",commands:[{pass:false}]}`, `{commands:["npm test"]}`, and a
+  seam with no independence claim — all three accepted by v0.7.*
+- **Artifact identity and idempotent revision** (CLI-enforced). Terminal statuses and
+  eight reserved fields (`rev`, `closedAt`, `closedBy`, `closedRev`, `closedHash`,
+  `holesWaiver`, `retracted`, `supersededBy`) are refused on birth and update — a closure
+  certificate must not be typeable in a payload. Re-adding an existing id **revises in
+  place** (merge, `rev++`, one record); an identical retry is a **true no-op** — no rev
+  bump, no `updatedAt` churn, no history line, byte-identical state, because a spurious
+  bump silently invalidates bound proof. `kind` is immutable on update (a probe must not
+  become closable in place); a duplicated id refuses every lifecycle verb repair-ably;
+  `revises` is provenance only; a probe promotion must name an existing, non-probe
+  replacement.
+- **Defects attach honestly** (CLI-enforced). Exactly one live artifact auto-attaches
+  (`attachedBy:'auto'`); zero leaves it unattached (`'none'`); **two or more refuses and
+  names them**, because guessing blocks the innocent artifact and lets the guilty one
+  close. A repeat report (same artifact + same trimmed, case-insensitive summary, while
+  live) dedups and escalates severity in place. Birth into a terminal status is refused.
+  Each record stamps the `artifactRev`/`artifactHash` it was found against.
+  Evidence/owner/reason/`by` validation MOVED from `cmdDefect` into
+  `artifacts.transitionDefect` — a gate with one polite caller is a convention.
+- **The checkpoint is not settable by hand** (CLI-enforced). `dirty` and `lastCompileAt`
+  are removed from `STATE_SCALARS`; `compile done` is the only checkpoint transition. It
+  now prints `CHECKPOINTED, NOT CLOSED — state serialized` plus the next required
+  transition, and `--json` emits `{checkpointed, closed, next}`.
+- **`state reset --force` also requires `--owner` and `--reason`** (CLI-enforced), and the
+  fresh state opens with a `state.reset` tombstone naming both — a wipe destroys the only
+  record of why the wipe happened.
+- **`state append` refuses `artifacts` and `defects` outright** (CLI-enforced) — both have
+  gated constructors a raw append walks past — forces birth status for
+  `assumptions`/`openLoops`, and dedups on trimmed text.
+- **`ledger update defects` refuses a caller-supplied `status`** (CLI-enforced): the
+  mirror is written only by a state defect transition. *Falsifier:
+  `'{"id":"x","status":"resolved"}'` accepted by v0.7.*
+- **One derivation, four surfaces** (CLI-enforced). `receipt.assemble` (`next.transition`),
+  `md.stateSummary`, `compile done`, and the `stop-check` hook all call
+  `lifecycle.nextTransition`. *Falsifier refuses string-matching theatre: the test injects
+  a sentinel derivation and demands the sentinel itself appear on all four.*
+- **The receipt binds its proof** (CLI-enforced). The PROOF card and `shipDecision` read
+  the ACTIVE artifact's bound event instead of the last global KEEP. A path/title match
+  still renders but is labelled `legacy unbound evidence — display only, cannot authorize
+  closure`, and `proof.canAuthorizeClosure` states the fact separately from the seam
+  judgment.
+- **Aperture sequences end on compile and verify what they built** (CLI-enforced).
+  A0 `build,verify,compile` · A1 `lock,build,verify,compile` · A2 unchanged ·
+  A3 gains `verify` · A4 gains `compile`. Pinned by two invariants over every band rather
+  than five literals. *This changed an existing assertion (`A0 === ['build','verify']`) —
+  a deliberate contract change, not a weakened test.*
+- **Windows: one path, one store** (CLI-enforced). On win32 `projectSlug` hashes the
+  lowercased resolved path, with a legacy fallback that keeps reading an existing
+  old-cased dir. Two casings of one project used to get two stores. *Falsifier: `one path,
+  one slug` → two distinct slugs.*
+- **A corrupt state file is never clobbered when its backup fails** (CLI-enforced) —
+  `readJsonResilient` used to tell the caller to reinitialize anyway, deleting the only
+  copy. The corrupt-backup filename is now allowlisted to `[0-9A-Za-z-]` (the stamp came
+  from `RATCHET_NOW`, caller-controlled text landing in a path).
+- **Prompt re-sync** (prompt-level, guarded by eight new `plugin-shape` assertions).
+  PROMPTS.md's canonical path gains verify and states the ending rule; `ignite` gains a
+  verify step and an A0–A4 table checked against `scoring.APERTURE_LEVELS` itself; `loop`
+  cycles `build → attack → patch → verify → compile`, reads `loopClear` AND
+  `workflowClosed.closed`, and **loses the "converged" escape** (two idle iterations on an
+  unclosed workflow is *blocked*, not converged); `patch` resolves the ORIGINAL defect id
+  with `--evidence` and drops the born-resolved example; `attack`/`verify` payloads name
+  `"artifact":"<id>"`; `verify` runs bound and closes on green; `compile` teaches
+  CHECKPOINT vs CLOSED; `handoff` checkpoints via `compile done`.
+
+### Migration
+
+Additive and lazy. `STATE_VERSION` stays **1** and there is no migration script. A fixture
+test mirrors the shapes the live store actually carries — free-text artifact statuses, a
+bare `status:'closed'` (read as **uncertified**: it runs the full close gate, not the
+no-op), duplicate ids (refused repair-ably), an unattached open defect (blocks
+`workflowClosed`, not another artifact's close), a fragment-bearing path
+`CHANGELOG.md#unreleased` (downgrades to record scope with the reason stated), events with
+no `artifactId` (permanently unbound), and no `rev` fields — and asserts the store loads,
+scores, renders, and accepts every new verb without corruption.
+
+### Trust boundary
+
+The proof binding is **machine-authored, not unforgeable**. It stops in-band laundering by
+the model — the path the loop itself runs through — by refusing caller-supplied identity,
+caller-chosen mode, and stale verification. It is **not** filesystem tampering protection:
+the journal is plaintext at a caller-selectable path (`RATCHET_EVOLVE_LOG`), so anyone who
+can write files can write lines. No signing is built, and none is implied.
+
+### Parked (named, not silently deferred)
+
+- **Ledger TEST rows remain an ungated write.** `ledger update tests` can still assert a
+  status by hand. Only the defect mirror was gated in 0.8; the test rows are a known
+  laundering surface, parked with the gate deliberately scoped to one collection.
+- **Closed-artifact rot detection → v0.9 Entropy Gate.** A closure certifies a revision;
+  nothing yet notices when the file behind a closed artifact changes afterwards, and
+  same-path lineage is not validated. Out of scope here on purpose.
 
 ## [0.7.0] - 2026-07-06 — Probe Gate
 
