@@ -10,17 +10,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **`src/mcp/workspace.js` — the root allowlist and canonical path containment**
-  (Torque MCP build-order step 2.1). The invariant, **with its boundary named**: *at the
-  moment `resolve()` returns*, no client-controlled path names a location outside the
-  configured roots, directly or indirectly. A string check cannot establish that, because
-  the filesystem decides what a path means — so containment is judged on a canonical
-  path, every component resolved through the filesystem in order, never on the text the
-  client sent.
-  - **Not provided: safety across time.** A pathname API cannot promise the path still
-    means the same thing when the caller opens it, and Node exposes no `openat`-style
-    primitive to bind a resolution to an opened directory without a dependency. The
-    result is true as of its return; closing that window is the job of the bound
-    workspace handles in the next sub-step. Named here rather than implied away.
+  (Torque MCP build-order step 2.1). The invariant, **with its boundary named**: no
+  client-controlled path is accepted unless the components this module observed, as it
+  observed them, placed it inside a configured root — directly or indirectly. A string
+  check cannot establish that, because the filesystem decides what a path means — so
+  containment is judged on a canonical path, every component resolved through the
+  filesystem in order, never on the text the client sent.
+  - **Not provided: safety across time** — not after the call, and *not even at the
+    instant it returns*. Each component is observed at its own moment and the filesystem
+    can be rearranged between any two of them, so the result describes what was true
+    during the walk and may already be stale on the way back. A pathname API cannot do
+    better: Node exposes no `openat`-style primitive to bind a resolution to an opened
+    directory without a dependency. Closing that window means never handing back a name
+    at all — operating through a bound handle instead — which is the next sub-step's
+    job. Named here rather than implied away.
   - Resolution walks component by component rather than calling `realpath` once: a
     single call fails with `ENOENT` on a path that does not exist yet, and says nothing
     about a link already traversed. `..` is applied to where the path has *actually*
@@ -29,14 +32,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     named. Climbing past a component that does not exist is refused outright, since the
     filesystem would give that no answer either.
   - Refused directly: relative and drive-relative paths (Node calls Windows `\work`
-    absolute, but it means a different place depending on the process's current drive),
-    `..` escapes, unrelated absolute paths, and a sibling that merely shares a root's
-    name prefix (`/srv/work` does not contain `/srv/work-evil`).
+    absolute, but it means a different place depending on the process's current drive —
+    and `\\name\` is the same trap in UNC costume, since a real UNC path needs a server
+    *and* a share), `..` escapes, unrelated absolute paths, and a sibling that merely
+    shares a root's name prefix (`/srv/work` does not contain `/srv/work-evil`).
+  - **A backslash is a separator only where the platform says so.** On POSIX it is an
+    ordinary character in a filename, so splitting on it would turn `/srv/work\evil` — a
+    *sibling* of the root — into a path inside it. Extended UNC (`\\?\UNC\...`) is
+    refused rather than half-handled, because its root is not what `path.parse` reports.
   - Refused indirectly: a symlink leaving the root, a symlinked directory partway along,
     a **dangling** link whose destination nothing can confirm, a component that is a file
-    rather than a directory, and any component that could not be examined at all —
-    unreadable is not absent, so `EACCES` fails closed rather than being treated as a
-    path that does not exist yet.
+    rather than a directory (including a *link to* a file, and a trailing separator on
+    one — a file has no contents to descend into, and `..` may not climb out of it as if
+    it had), and any component that could not be examined at all — unreadable is not
+    absent, so `EACCES` fails closed rather than being treated as a path that does not
+    exist yet.
   - Name comparison is **exact, never case-folded**: both sides come from
     `realpath.native`, which answers with the name the filesystem actually stores, so
     equivalent spellings have already converged. Lowercasing would be worse than useless
@@ -47,16 +57,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     stay *inside* a root are followed normally — containment is not achieved by refusing
     the feature. Refusals name the boundary without echoing the resolved target, which
     would answer the question the traversal was asking.
-- **`test/mcp-workspace.test.js` — 24-case containment suite**, written red against an
+- **`test/mcp-workspace.test.js` — 28-case containment suite**, written red against an
   absent module and wired into `npm test` (the plugin-shape unwired-suite guard was
-  verified red against it first). An independent Codex review of the first cut returned
-  "do not ship" with 12 findings — 4 breaking containment — and every accepted one was
-  reproduced before its fix. Four were defects in the tests themselves, now corrected:
-  cases that built their `..` paths with `path.join`, which normalizes the dot segments
-  away before the module ever sees them; a case-comparison test that a mutant with case
-  folding disabled still passed; an assertion that could not fail; and a rationale
-  comment that was simply wrong about how Node handles a NUL. The suite keeps the
-  positive controls that stop it passing for the wrong reason: an implementation that
+  verified red against it first). Two independent Codex review rounds, both returning
+  "do not ship" (12 findings then 7), with every accepted finding reproduced before its
+  fix. **Six of the nineteen were defects in the tests themselves**, which is the point
+  of running the review at all: cases that built their `..` paths with `path.join`, which
+  normalizes the dot segments away before the module ever sees them; a case-comparison
+  test the reviewer defeated by loading the *old* implementation and watching it pass; an
+  assertion that could not fail; a UNC fixture that refused because the path did not
+  exist rather than because it was malformed; and a rationale comment that was wrong
+  about how Node handles a NUL. Every falsifier is now verified red against the
+  implementation it targets, checked out from git rather than assumed. The suite keeps
+  the positive controls that stop it passing for the wrong reason: an implementation that
   refused every symlink, or every `..`, would block all the escapes and still be broken.
 
 - **`src/mcp/rpc.js` — the Torque MCP RPC kernel with era pinning** (CLI-enforced at the

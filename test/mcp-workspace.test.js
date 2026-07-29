@@ -4,10 +4,13 @@
 // containment. Run: node test/mcp-workspace.test.js
 //
 // The invariant this suite exists to defend:
-//   NO CLIENT-CONTROLLED PATH CROSSES THE CONFIGURED ROOTS — directly or
-//   indirectly. Directly means `..` and absolute escapes; indirectly means
-//   symlinks, dangling links, canonical-casing tricks, and names that merely
-//   share a root's prefix.
+//   NO CLIENT-CONTROLLED PATH IS ACCEPTED unless the components the resolver
+//   observed placed it inside a configured root — directly or indirectly.
+//   Directly means `..` and absolute escapes; indirectly means symlinks,
+//   dangling links, name-spelling tricks, separators the platform does not
+//   recognize, and names that merely share a root's prefix. The resolver
+//   observes each component at its own moment and promises nothing about later
+//   ones: that window is the next sub-step's problem, not this suite's.
 // Written RED first against an absent module. Traced by: claude-fable-5
 
 const os = require('os');
@@ -285,13 +288,95 @@ ok('W20 dot-dot means the parent of where the path really arrived', () => {
 ok('W21 a component that cannot be examined is refused, not treated as absent', () => {
   const { root } = world('w21');
   const roots = workspace.createRoots([root]);
+  const sep = path.sep;
   // A file cannot contain further components: this path can never exist, so
   // returning it as a legal future target would be a lie.
   refuses(roots, path.join(root, 'inside.txt', 'child.txt'), 'a path descending through a file');
-  refuses(roots, path.join(root, 'inside.txt', '..', '..', 'outside', 'secret.txt'),
+  // Literal, not path.join: join would normalize this to a plain outside path
+  // and the file component would never reach the module.
+  refuses(roots, `${root}${sep}inside.txt${sep}..${sep}..${sep}outside${sep}secret.txt`,
     'a traversal laundered through a file component');
 });
 
+ok('W25 a backslash is a separator only where the platform says so', () => {
+  const { base, root } = world('w25');
+  const roots = workspace.createRoots([root]);
+  if (process.platform === 'win32') {
+    assert.strictEqual(roots.resolve(`${root}/inside.txt`), fs.realpathSync.native(path.join(root, 'inside.txt')),
+      'Windows accepts either separator');
+  } else {
+    // On POSIX "workspace\evil" is ONE filename, a sibling of the root. Reading
+    // the backslash as a separator would silently retarget it inside.
+    const sibling = path.join(base, 'workspace\\evil');
+    fs.mkdirSync(sibling, { recursive: true });
+    fs.writeFileSync(path.join(sibling, 'secret.txt'), 'not yours', 'utf8');
+    refuses(roots, path.join(sibling, 'secret.txt'), 'a sibling whose name contains a backslash');
+  }
+});
+
+ok('W26 a UNC path without a share is not a location', () => {
+  const { root } = world('w26');
+  const roots = workspace.createRoots([root]);
+  if (process.platform !== 'win32') {
+    refuses(roots, '\\\\server\\share\\file.txt', 'a UNC path on POSIX');
+    return;
+  }
+  // The fixture has to be a name that RESOLVES, or the refusal proves nothing
+  // but "that path does not exist". A single-component "\\name\" is not a UNC
+  // path at all: Windows anchors it to the current drive, so it names a
+  // different directory depending on where the process is running.
+  const here = process.cwd();
+  const firstSegment = here.slice(path.parse(here).root.length).split(path.sep)[0];
+  const driveRelative = `${path.sep}${path.sep}${firstSegment}${path.sep}`;
+  assert.ok(fs.existsSync(driveRelative), `the fixture must resolve to be worth refusing: ${driveRelative}`);
+  refuses(roots, driveRelative, 'a UNC-shaped path naming no share');
+  refuses(roots, '\\\\?\\UNC\\server\\share\\x', 'an extended UNC path this module does not handle');
+  for (const bad of [driveRelative, '\\\\?\\UNC\\server\\share']) {
+    let err = null;
+    try {
+      workspace.createRoots([bad]);
+    } catch (e) {
+      err = e;
+    }
+    assert.strictEqual(err && err.code, 'ERATCHETROOT', `must not be configurable as a root: ${bad}`);
+  }
+});
+
+ok('W27 a file cannot be descended into, through a link or a trailing separator', () => {
+  const { root } = world('w27');
+  const roots = workspace.createRoots([root]);
+  const sep = path.sep;
+  const link = path.join(root, 'file-link');
+  symlinkOrFail(path.join(root, 'inside.txt'), link, 'file');
+  // The link resolves to a FILE; climbing out of it with .. would treat that
+  // file as a directory, which the OS never does.
+  refuses(roots, `${link}${sep}..${sep}inside.txt`, 'dot-dot climbing out of a link to a file');
+  refuses(roots, `${link}${sep}child.txt`, 'a path descending through a link to a file');
+  refuses(roots, path.join(root, 'inside.txt') + sep, 'a file named with a trailing separator');
+  // The control: a trailing separator on a real directory is just framing.
+  assert.strictEqual(roots.resolve(root + sep), root);
+});
+
+ok('W28 two names that only a lowercase() would confuse stay distinct', () => {
+  // The regression test for case folding. U+0130 (dotted capital I) lowercases
+  // in JavaScript to "i" + U+0307 — two code points — so an implementation
+  // comparing lowercased strings judges these two directories the same one.
+  // Written as escapes: the precomposed and decomposed forms are
+  // indistinguishable by eye, and a case-VARIANT pair would prove nothing
+  // because Windows correctly treats those as one name.
+  const base = fixture('w28');
+  const dotted = path.join(base, 'İ-root');
+  const decomposed = path.join(base, 'i̇-root');
+  assert.strictEqual('İ-root'.toLowerCase(), 'i̇-root'.toLowerCase(),
+    'the fixture only means something if JavaScript folds these together');
+  fs.mkdirSync(dotted, { recursive: true });
+  assert.ok(!fs.existsSync(decomposed),
+    'this filesystem must keep the two spellings distinct for this falsifier to mean anything');
+  fs.mkdirSync(decomposed, { recursive: true });
+  fs.writeFileSync(path.join(decomposed, 'secret.txt'), 'not yours', 'utf8');
+  const roots = workspace.createRoots([dotted]);
+  refuses(roots, path.join(decomposed, 'secret.txt'), 'a sibling whose lowercase form collides with the root');
+});
 ok('W22 a path that does not exist may not climb past what does not exist', () => {
   const { root } = world('w22');
   const roots = workspace.createRoots([root]);
