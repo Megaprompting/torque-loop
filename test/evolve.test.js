@@ -127,6 +127,50 @@ ok('proof gate: KEEP is rejected without proof', () => {
   );
 });
 
+ok('proof gate: a red command refuses the KEEP whatever the summary claims', () => {
+  const keep = (over) => schema.newEvent({ target: 't', verdict: 'KEEP', ...over });
+  // The laundering path: relabel the summary field and a failed command rides
+  // through. The derived result wins over the claimed one.
+  assert.throws(
+    () => schema.validateKeepGate(keep({ verification: { commands: [{ pass: false }], result: 'pass' } })),
+    /did not pass/
+  );
+  // one green + one red is still red
+  assert.throws(
+    () => schema.validateKeepGate(keep({ verification: { commands: [{ command: 'a', pass: true }, { command: 'b', pass: false }], result: 'pass' } })),
+    /did not pass/
+  );
+  // a command entry with no machine verdict is not proof
+  assert.throws(
+    () => schema.validateKeepGate(keep({ verification: { commands: ['npm test'], result: 'pass' } })),
+    /no machine verdict/
+  );
+  // green commands but a summary that says otherwise: the contradiction is refused
+  assert.throws(
+    () => schema.validateKeepGate(keep({ verification: { commands: [{ pass: true }], result: 'manual' } })),
+    /contradicts/
+  );
+});
+
+ok('seam gate: omitted independence is refused, not defaulted through', () => {
+  const keepCode = (over) =>
+    schema.newEvent({
+      target: 'src/router.js',
+      mode: 'code',
+      verdict: 'KEEP',
+      verification: { commands: [{ pass: true }], result: 'pass' },
+      ...over,
+    });
+  // null / omitted is the common shape — it must refuse exactly like false.
+  assert.throws(() => schema.validateKeepGate(keepCode({ seam: { seamMatch: 'exact' } })), /independent/i);
+  assert.throws(
+    () => schema.validateKeepGate(keepCode({ seam: { seamMatch: 'exact', independentFromBuilderMethod: null } })),
+    /independent/i
+  );
+  // a named waiver still overrides
+  schema.validateKeepGate(keepCode({ seam: { seamMatch: 'exact', waiver: { by: 'danny', reason: 'hotfix' } } }));
+});
+
 ok('seam gate: production KEEP needs an exact ship-seam match', () => {
   const keepCode = (over) =>
     schema.newEvent({

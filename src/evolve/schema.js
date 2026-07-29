@@ -96,6 +96,29 @@ function validateKeepGate(event) {
   if (!commands.length && !manualChecks.length) {
     throw new Error('cannot KEEP: no verification evidence');
   }
+  // The summary field is a claim; the commands are the evidence. Derive the
+  // result from the commands and let the derivation win, so a red run can never
+  // be laundered into a KEEP by relabelling `result`. A command entry with no
+  // `pass` field (a bare string) carries no machine verdict at all — it is a
+  // note, not proof.
+  if (commands.length) {
+    const unverdicted = commands.filter((c) => !c || typeof c !== 'object' || !('pass' in c));
+    if (unverdicted.length) {
+      throw new Error(
+        'cannot KEEP: a verification command carries no machine verdict — record {command, pass} entries ' +
+          '(the shape `ratchet-evolve verify` emits), not bare strings'
+      );
+    }
+    const failed = commands.filter((c) => c.pass !== true);
+    if (failed.length) {
+      throw new Error(
+        `cannot KEEP: verification command did not pass (${failed.map((c) => c.command || 'unnamed command').join(', ')})`
+      );
+    }
+    if (result !== 'pass') {
+      throw new Error(`cannot KEEP: claimed result "${result || 'unset'}" contradicts the commands run (derived "pass")`);
+    }
+  }
   if (result === 'manual' && !manualChecks.length) {
     throw new Error('cannot KEEP: manual verification requires explicit checks');
   }
@@ -115,10 +138,13 @@ function validateKeepGate(event) {
             'test the ship seam, or waive with a named owner + reason (wrong proof → no ship)'
         );
       }
-      if (seam.independentFromBuilderMethod === false) {
+      // Strictly true. An omitted/null flag is an unmade claim, and an unmade
+      // claim about independence is exactly the one a self-verifying builder
+      // leaves out — so silence refuses like a denial does.
+      if (seam.independentFromBuilderMethod !== true) {
         throw new Error(
-          "cannot KEEP production code: verification repeated the builder's own method, so it is not " +
-            'independent — vary the method, or waive with a named owner + reason'
+          "cannot KEEP production code: verification did not declare itself independent from the builder's own " +
+            'method (seam.independentFromBuilderMethod must be true) — vary the method, or waive with a named owner + reason'
         );
       }
     }

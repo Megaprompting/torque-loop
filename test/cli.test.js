@@ -468,7 +468,9 @@ ok('receipt PROOF renders an evidence card for a KEEP, with its seam', () => {
     mode: 'code',
     chosenMutation: 'assemble eight fixed sections',
     verdict: 'KEEP',
-    verification: { commands: ['node test/cli.test.js'], result: 'pass' },
+    // {command, pass} — the shape `ratchet-evolve verify` emits. A bare string
+    // carries no machine verdict, and 0.8's proof gate refuses one.
+    verification: { commands: [{ command: 'node test/cli.test.js', pass: true }], result: 'pass' },
     seam: {
       evidenceType: 'test',
       testedSeam: 'ratchet receipt',
