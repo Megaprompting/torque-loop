@@ -188,7 +188,12 @@ function closureBlockers(state, events, artifact, cwd, request = {}) {
     });
   }
 
-  const holes = Array.isArray(artifact.holes) ? artifact.holes : [];
+  // Defensive normalization: a legacy record can carry holes as a bare string,
+  // and `Array.isArray(...) ? ... : []` reads that as ZERO holes — closing an
+  // artifact over an open hole nobody can see. Absent means none; anything
+  // present is at least one.
+  const raw = artifact.holes;
+  const holes = Array.isArray(raw) ? raw : raw == null || raw === '' ? [] : [raw];
   const waived = Boolean(request.waiveHoles && String(request.owner || '').trim() && String(request.reason || '').trim());
   if (holes.length && !waived) {
     out.push({

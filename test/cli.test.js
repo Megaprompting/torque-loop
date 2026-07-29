@@ -424,17 +424,25 @@ ok('two casings of one Windows path resolve to a single store', () => {
   }
 });
 
-ok('a legacy-cased store is MIGRATED once, not merely borrowed', () => {
+ok('a legacy-cased store migrates even when the FIRST call spells the cwd lowercase', () => {
   if (process.platform !== 'win32') return; // the fallback only exists on win32
-  // The stranding: returning the legacy dir per-invocation without moving it
-  // means the discovery has to succeed on EVERY call forever. It does not — the
-  // early return when normalized === legacy skips discovery entirely, so a
-  // differently-cased cwd silently opens a fresh, empty store beside the real one.
-  const proj = path.join(tmp, 'SlugMigrate', 'Repo');
+  // The residual stranding: deriving the legacy slug from the CALLER's spelling
+  // means a caller who happens to type the path in lowercase produces
+  // normalized === legacy, the discovery is skipped entirely, and the real
+  // mixed-case store is stranded forever behind a fresh empty one. The casing
+  // has to come from the filesystem, which knows it, not from the caller, who
+  // may not. Ordering matters here: lowercase FIRST is the whole test.
+  const onDisk = path.join(tmp, 'SlugLower', 'Repo'); // created with mixed casing
+  fs.mkdirSync(onDisk, { recursive: true });
+  const spelledLower = onDisk.toLowerCase(); // what the caller supplies
+
   const projects = path.join(state.baseDir(), 'projects');
-  const legacySlug = state.legacySlugFor(proj);
-  const normalizedSlug = state.normalizedSlugFor(proj);
-  assert.notStrictEqual(legacySlug, normalizedSlug, 'the fixture path must actually differ in casing');
+  const legacySlug = state.legacySlugFor(spelledLower);
+  const normalizedSlug = state.normalizedSlugFor(spelledLower);
+  assert.notStrictEqual(
+    legacySlug, normalizedSlug,
+    'the slugs are derived from the on-disk casing, so a lowercase spelling still finds the legacy one'
+  );
 
   fs.rmSync(path.join(projects, legacySlug), { recursive: true, force: true });
   fs.rmSync(path.join(projects, normalizedSlug), { recursive: true, force: true });
@@ -445,14 +453,14 @@ ok('a legacy-cased store is MIGRATED once, not merely borrowed', () => {
     'utf8'
   );
 
-  // one call is enough: the store MOVES to the normalized slug
-  assert.strictEqual(state.projectSlug(proj), normalizedSlug, 'the slug is the normalized one after migration');
+  // the FIRST post-upgrade call uses the lowercase spelling
+  assert.strictEqual(state.projectSlug(spelledLower), normalizedSlug, 'it migrates rather than stranding');
   assert.ok(!fs.existsSync(path.join(projects, legacySlug)), 'the legacy dir is gone, not left as a decoy');
   assert.strictEqual(
-    state.loadState(proj).objective, 'written under the old casing', 'and the record came with it'
+    state.loadState(spelledLower).objective, 'written under the old casing', 'and the record came with it'
   );
-  // the lower-cased spelling of the same path now finds the same record
-  assert.strictEqual(state.loadState(proj.toLowerCase()).objective, 'written under the old casing');
+  // and the mixed-case spelling of the same path resolves to that same store
+  assert.strictEqual(state.loadState(onDisk).objective, 'written under the old casing');
 });
 
 ok('two stores for one path is a conflict to name, never a guess to make', () => {
@@ -1144,6 +1152,52 @@ ok('a legacy or falsey-shaped retry is still a no-op', () => {
   assert.strictEqual(fs.readFileSync(state.statePath(cwd), 'utf8'), mid, 'byte-identical state');
 });
 
+ok('a scalar holes value is a real hole, and repairing it is a real revision', () => {
+  // Canonicalization made holes:"TODO" and holes:["TODO"] compare equal, so the
+  // repair no-opped and the SCALAR survived in the store — where every
+  // Array.isArray guard reads it as ZERO holes. The artifact then closes with an
+  // open hole nobody can see.
+  state.initProject(cwd, { force: true });
+  const s = state.loadState(cwd);
+  s.artifacts = [{ id: 'art-scalar', at: '2026-07-01T00:00:00.000Z', kind: 'spec', title: 'legacy', status: 'v1', holes: 'TODO', rev: 1 }];
+  state.saveState(cwd, s);
+
+  // the closure gate must not be fooled by the shape
+  const scalar = state.loadState(cwd).artifacts[0];
+  const codes = lifecycle.closureBlockers(state.loadState(cwd), [], scalar, cwd).map((b) => b.code);
+  assert.ok(codes.includes('holes'), `a scalar hole still blocks closure, got: ${codes.join(',')}`);
+
+  // and repairing the shape is a REVISION, not a silent no-op
+  const repaired = artifacts.addArtifact(cwd, { id: 'art-scalar', holes: ['TODO'] });
+  assert.strictEqual(repaired.rev, 2, 'normalizing a present non-array holes value is a real revision');
+  assert.deepStrictEqual(repaired.holes, ['TODO'], 'and the array shape is what persists');
+  // once repaired, an identical retry is a no-op again
+  const before = fs.readFileSync(state.statePath(cwd), 'utf8');
+  assert.strictEqual(artifacts.addArtifact(cwd, { id: 'art-scalar', holes: ['TODO'] }).rev, 2);
+  assert.strictEqual(fs.readFileSync(state.statePath(cwd), 'utf8'), before, 'byte-identical after the repair');
+});
+
+ok('clearing a lineage link is a revision; only an ABSENT one is idempotent', () => {
+  state.initProject(cwd, { force: true });
+  artifacts.addArtifact(cwd, { id: 'art-lineage', kind: 'spec', title: 'v2', revises: 'art-old' });
+  assert.strictEqual(state.loadState(cwd).artifacts[0].revises, 'art-old');
+
+  // absent → leave it alone (idempotent)
+  const untouched = artifacts.addArtifact(cwd, { id: 'art-lineage', title: 'v2' });
+  assert.strictEqual(untouched.rev, 1, 'omitting revises does not clear it');
+  assert.strictEqual(untouched.revises, 'art-old');
+
+  // explicitly empty → CLEAR it, and that is a real revision
+  const cleared = artifacts.addArtifact(cwd, { id: 'art-lineage', revises: '' });
+  assert.strictEqual(cleared.rev, 2, 'clearing a lineage claim is a revision');
+  assert.ok(!('revises' in cleared), 'the field is gone, not left as an empty string');
+
+  // and the same clear again is a no-op
+  const before = fs.readFileSync(state.statePath(cwd), 'utf8');
+  assert.strictEqual(artifacts.addArtifact(cwd, { id: 'art-lineage', revises: '' }).rev, 2);
+  assert.strictEqual(fs.readFileSync(state.statePath(cwd), 'utf8'), before, 'byte-identical on the repeated clear');
+});
+
 ok('a defect whose artifact cannot be fingerprinted is recorded, never half-attached', () => {
   // The stamp used to fail silently, leaving the defect attached with
   // artifactRev:null and artifactHash:'' — an attachment that blocks the
@@ -1485,10 +1539,16 @@ ok('binding refuses evidence gathered against an older revision', () => {
 
 ok('a bound event cannot claim its own provenance', () => {
   const { proj, art, fp } = boundFixture('bind-source');
-  assert.throws(
-    () => journal.appendEvent(proj, keepFields(art, { source: 'forged' }), { verifiedHash: fp.hash, verifiedRev: fp.rev }),
-    /source/i
-  );
+  // Refusing only a DIFFERENT value is the weaker gate: the forgery that matters
+  // supplies the RIGHT-looking value, so the field must be refused if present at
+  // all. The CLI always stamps it.
+  for (const forged of ['forged', 'evolve', '', null, 0]) {
+    assert.throws(
+      () => journal.appendEvent(proj, keepFields(art, { source: forged }), { verifiedHash: fp.hash, verifiedRev: fp.rev }),
+      /source/i,
+      `source: ${JSON.stringify(forged)} must be refused`
+    );
+  }
   const e = journal.appendEvent(proj, keepFields(art), { verifiedHash: fp.hash, verifiedRev: fp.rev });
   assert.strictEqual(e.source, 'evolve', 'the CLI stamps provenance on a bound event');
 });

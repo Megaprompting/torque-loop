@@ -136,11 +136,14 @@ function resolveBinding(cwd, fields, opts) {
     );
   }
 
-  // Provenance is stamped, not claimed: a caller-chosen `source` would let a
-  // hand-written line present itself as harness output.
-  const claimedSource = fields.source ? String(fields.source) : '';
-  if (claimedSource && claimedSource !== BOUND_SOURCE) {
-    throw new Error(`source "${claimedSource}" is stamped by the CLI on a bound event, not supplied — omit "source".`);
+  // Provenance is stamped, not claimed. Refusing only a DIFFERENT value is the
+  // weaker gate — the forgery that matters supplies the RIGHT-looking one, and
+  // an empty or falsey value slips a hand-written line past just as well. If the
+  // caller mentions `source` at all, refuse: the CLI always stamps it.
+  if (Object.prototype.hasOwnProperty.call(fields, 'source')) {
+    throw new Error(
+      `source is stamped by the CLI on a bound event, not supplied (got ${JSON.stringify(fields.source)}) — omit "source".`
+    );
   }
 
   return {

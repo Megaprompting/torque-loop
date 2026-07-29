@@ -49,9 +49,21 @@ function canonicalFields(kind, item, fallback) {
     status: pick('status', 'v0') || 'v0',
     holes: withProbeHole(kind, normalizeHoles(holesSource)),
   };
-  const revises = item.revises != null ? String(item.revises) : base.revises != null ? String(base.revises) : '';
-  if (revises) out.revises = revises;
+  // `revises` is always present in the canonical shape, possibly '' — absent and
+  // explicitly-empty are different intents: omitting it leaves the lineage
+  // alone, clearing it retracts a lineage claim. Collapsing them meant a clear
+  // was silently dropped and the old link survived.
+  out.revises = item.revises !== undefined ? String(item.revises) : base.revises != null ? String(base.revises) : '';
   return out;
+}
+
+// Only an ABSENT holes value is equivalent to []. A PRESENT non-array value
+// (a legacy `holes: "TODO"`) is a real hole in the wrong shape: canonicalizing
+// it silently made the repair compare equal to the stored scalar, so the no-op
+// path kept the scalar — and every `Array.isArray` guard downstream then read it
+// as zero holes. Repairing the shape is a genuine revision.
+function hasLegacyHolesShape(record) {
+  return record.holes !== undefined && !Array.isArray(record.holes);
 }
 
 function assertArtifactInput(item) {
@@ -123,8 +135,12 @@ function reviseArtifact(cwd, s, existing, item, now) {
   // runs against the EXISTING record put through the same normalization, so a
   // legacy record acquiring its missing `holes: []` is not read as a change.
   const canonicalExisting = canonicalFields(next_kind(existing), existing, existing);
-  const changed = ARTIFACT_MUTABLE.some((k) => JSON.stringify(next[k]) !== JSON.stringify(canonicalExisting[k]));
+  const changed =
+    hasLegacyHolesShape(existing) ||
+    ARTIFACT_MUTABLE.some((k) => JSON.stringify(next[k]) !== JSON.stringify(canonicalExisting[k]));
   if (!changed) return existing;
+  // '' is the canonical "no lineage" and must not persist as an empty string.
+  if (!next.revises) delete next.revises;
 
   next.rev = (Number.isInteger(existing.rev) ? existing.rev : 1) + 1;
   next.updatedAt = now;
@@ -150,6 +166,7 @@ function addArtifact(cwd, item) {
   // only: naming what this supersedes does not retire it. A lineage claim is not
   // a lifecycle event; only `retract` and `close` are.
   const record = { id: id || state.makeId('art'), at: now, rev: 1, kind, ...canonicalFields(kind, item, null) };
+  if (!record.revises) delete record.revises;
   s.artifacts.push(record);
   s.dirty = true;
   s.history.push({ id: state.makeId('hist'), at: record.at, event: 'artifact.add', note: record.title });

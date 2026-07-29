@@ -35,12 +35,38 @@ function slugFor(root, lowercase) {
   return `${name}-${hash}`;
 }
 
-function normalizedSlugFor(cwd) {
-  return slugFor(cwd || process.cwd(), process.platform === 'win32');
+// The one authority on how this path is really spelled. A caller may type
+// `d:\repo` for a directory stored as `D:\Repo`, and on Windows both open it —
+// so the caller's casing is not evidence of anything. realpathSync.native asks
+// the filesystem, which knows. Falls back to the plain resolve when the path
+// does not exist yet or native is unavailable.
+function caseExactPath(cwd) {
+  const root = path.resolve(cwd || process.cwd());
+  try {
+    if (typeof fs.realpathSync.native === 'function') return fs.realpathSync.native(root);
+  } catch (_e) {
+    /* not on disk yet, or no native impl — fall through */
+  }
+  try {
+    return fs.realpathSync(root);
+  } catch (_e) {
+    return root;
+  }
 }
 
+// The slug a pre-0.8 store was created under: hashed from the path's TRUE
+// casing, not the caller's. Deriving it from the caller meant a caller who
+// happened to type lowercase produced legacy === normalized, the migration
+// check short-circuited, and the real mixed-case store was stranded behind a
+// fresh empty one — forever, because the trigger depended on a casing the
+// caller no longer supplied.
 function legacySlugFor(cwd) {
-  return slugFor(cwd || process.cwd(), false);
+  return slugFor(caseExactPath(cwd), false);
+}
+
+function normalizedSlugFor(cwd) {
+  if (process.platform !== 'win32') return slugFor(cwd || process.cwd(), false);
+  return slugFor(caseExactPath(cwd), true);
 }
 
 // Windows paths are case-insensitive, so `D:\Repo` and `d:\repo` are one
@@ -56,8 +82,11 @@ function legacySlugFor(cwd) {
 function projectSlug(cwd) {
   const root = cwd || process.cwd();
   if (process.platform !== 'win32') return slugFor(root, false);
-  const normalized = slugFor(root, true);
-  const legacy = slugFor(root, false);
+  // Both slugs come from the on-disk casing, so the answer no longer depends on
+  // how the caller spelled the path. When the true path is already all-lowercase
+  // the two coincide and there is genuinely nothing to migrate.
+  const normalized = normalizedSlugFor(root);
+  const legacy = legacySlugFor(root);
   if (normalized === legacy) return normalized;
 
   const projects = path.join(baseDir(), 'projects');
