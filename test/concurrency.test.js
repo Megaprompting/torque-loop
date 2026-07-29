@@ -13,6 +13,7 @@ const os = require('os');
 const path = require('path');
 const fs = require('fs');
 const assert = require('assert');
+const crypto = require('crypto');
 const { spawn, spawnSync } = require('child_process');
 
 const tmp = path.join(os.tmpdir(), 'ratchet-concurrency-test-' + process.pid);
@@ -58,6 +59,11 @@ function freshProject(label) {
 // by the bytes — a matching `rev` says nothing about a churned timestamp.
 function stateBytes(proj) {
   return fs.readFileSync(state.statePath(proj));
+}
+
+// Digests, so a purity failure quotes the same evidence a hand-check produces.
+function sha(buf) {
+  return crypto.createHash('sha256').update(buf).digest('hex').slice(0, 12);
 }
 
 // The single public mutation the gate will expose: acquire the lock, reload the
@@ -318,8 +324,11 @@ ok('F-B two processes saving from the same snapshot lose neither mutation', () =
 
 // --- F-C: confidence read purity ---------------------------------------------
 
-ok('F-C score confidence --json changes zero bytes of canonical state', () => {
-  const proj = freshProject('f-c');
+// Both confidence branches are scored by ONE method, deliberately: if the two
+// falsifiers measured purity differently, a difference in their verdicts would
+// be evidence about the harness rather than about the code.
+function assertConfidenceReadIsPure(label, argv) {
+  const proj = freshProject(label);
   // Give the read something to score, so purity is not proven on an empty file.
   const seed = state.loadState(proj);
   seed.objective = 'C: read must not write';
@@ -327,7 +336,7 @@ ok('F-C score confidence --json changes zero bytes of canonical state', () => {
   state.saveState(proj, seed);
 
   const before = stateBytes(proj);
-  const res = spawnSync(process.execPath, [BIN, 'score', 'confidence', '--json'], {
+  const res = spawnSync(process.execPath, [BIN, ...argv], {
     cwd: proj,
     env: childEnv(proj),
     encoding: 'utf8',
@@ -338,11 +347,24 @@ ok('F-C score confidence --json changes zero bytes of canonical state', () => {
   const after = stateBytes(proj);
   assert.ok(
     after.equals(before),
-    'a read must not write: state.json changed across `score confidence --json` — ' +
-      `${before.length} → ${after.length} bytes; rev ${JSON.parse(before).rev} → ${JSON.parse(after).rev}, ` +
+    `a read must not write: state.json changed across \`ratchet ${argv.join(' ')}\` — ` +
+      `sha256 ${sha(before)} → ${sha(after)}; ${before.length} → ${after.length} bytes; ` +
+      `rev ${JSON.parse(before).rev} → ${JSON.parse(after).rev}, ` +
       `updatedAt ${JSON.parse(before).updatedAt} → ${JSON.parse(after).updatedAt}, ` +
       `confidence ${JSON.stringify(JSON.parse(before).confidence)} → ${JSON.stringify(JSON.parse(after).confidence)}`
   );
+}
+
+ok('F-C score confidence --json changes zero bytes of canonical state', () => {
+  assertConfidenceReadIsPure('f-c', ['score', 'confidence', '--json']);
+});
+
+// The default (markdown) branch caches the session score back into state, so the
+// read moves bytes. v0.9 removes that cache: EVERY branch of score confidence is
+// a pure derived read, and the only deliberate mutation in the score family is
+// the fog-recording branch of `score aperture` (F-D's territory).
+ok('F-C2 score confidence (markdown, no --json) changes zero bytes of canonical state', () => {
+  assertConfidenceReadIsPure('f-c2', ['score', 'confidence']);
 });
 
 // --- F-D: the aperture write carve-out ---------------------------------------
