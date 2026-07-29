@@ -577,6 +577,368 @@ ok('F-G a write that dies mid-file leaves the old canonical bytes intact', () =>
   assert.strictEqual(residue.join(', '), '', `residue beside the record must name itself temporary — found ${residue.join(', ')}`);
 });
 
+// ===========================================================================
+// Patch cycle — the Codex review of the first implementation. Each falsifier
+// below states a law that implementation broke, and was written RED against it.
+// Traced by: claude-opus-5
+// ===========================================================================
+
+const artifacts = require('../src/artifacts');
+const journal = require('../src/evolve/journal');
+const cli = require('../src/cli');
+
+// The lock the journal actually uses, resolved the same way the implementation
+// resolves it — a test that guesses the path proves nothing about the lock.
+function journalLockDir(proj) {
+  const log = journal.logPath(proj);
+  try {
+    return path.join(fs.realpathSync(path.dirname(log)), `${path.basename(log)}.lock`);
+  } catch (_e) {
+    return `${log}.lock`;
+  }
+}
+
+function workspaceLockDir(proj) {
+  return path.join(state.projectDir(proj), '.lock');
+}
+
+// An owner card exactly like the one acquireLock writes, so a planted lock is
+// indistinguishable from a real holding.
+function plantLock(lockDir, { pid, host, ageMs, action = 'planted', token = 'plantedtoken' }) {
+  fs.mkdirSync(lockDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(lockDir, 'owner.json'),
+    JSON.stringify({
+      token,
+      pid: pid == null ? process.pid : pid,
+      host: host == null ? os.hostname() : host,
+      at: new Date(Date.now() - (ageMs || 0)).toISOString(),
+      action,
+    }),
+    'utf8'
+  );
+  return lockDir;
+}
+
+function readToken(lockDir) {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(lockDir, 'owner.json'), 'utf8')).token;
+  } catch (_e) {
+    return '';
+  }
+}
+
+// A pid that is certainly not running: claim one, let it exit, reuse the number.
+function deadPid() {
+  const done = spawnSync(process.execPath, ['-e', 'process.exit(0)']);
+  return done.pid;
+}
+
+// --- C2: a first read never publishes over a committed record ----------------
+
+ok('C2 creating the store on first read takes the lock instead of racing it', () => {
+  const proj = fs.mkdtempSync(path.join(os.tmpdir(), 'ratchet-c2-'));
+  projects.push(proj);
+  // Deliberately NOT initialized: this is the empty-store case.
+  assert.ok(!fs.existsSync(state.statePath(proj)), 'the store must start absent');
+
+  // Hold the workspace lock, then ask a child to read the empty store. An
+  // unlocked auto-init publishes its fresh rev-0 record immediately — and that
+  // record can land on top of a revision the lock holder is about to commit, a
+  // read erasing a write. Under the fix the child has to wait for the lock, so a
+  // short timeout turns the race into a visible refusal.
+  const [res] = (() => {
+    let out;
+    state.withWorkspaceLock(proj, 'c2 holder', () => {
+      out = runChildren(
+        proj,
+        `  const state = require(path.join(SRC, 'state.js'));
+  const s = state.loadState(process.cwd());
+  result.rev = s.rev;`,
+        ['reader'],
+        { RATCHET_LOCK_TIMEOUT_MS: '1200', RATCHET_LOCK_STALE_MS: '600000' }
+      );
+      // Commit a real revision while the reader is queued behind the lock.
+      const s = state.loadState(proj);
+      s.objective = 'C2: the record the reader must not erase';
+      state.saveState(proj, s);
+    });
+    return out;
+  })();
+
+  assert.ok(
+    /could not acquire/i.test(String(res.error)),
+    `the reader must queue behind the lock, not write through it — child reported: ${res.error}`
+  );
+  const after = state.loadState(proj);
+  assert.strictEqual(
+    after.objective,
+    'C2: the record the reader must not erase',
+    'the lock holder\'s committed record must survive the concurrent first read'
+  );
+});
+
+ok('C2 a first-time creation refuses to replace a record that appeared meanwhile', () => {
+  const proj = freshProject('c2-exclusive');
+  const before = stateBytes(proj);
+  // The primitive underneath: publishing a fresh record is create-or-fail, so
+  // even a caller that reached the create with a stale "it is absent" belief
+  // cannot overwrite the record that exists now.
+  const created = state.createJsonExclusive(state.statePath(proj), schemas.newState());
+  assert.strictEqual(created, false, 'creating over an existing record must refuse');
+  assert.ok(stateBytes(proj).equals(before), 'and must not move one byte of it');
+});
+
+// --- C3: liveness beats age, and release is ownership-verified ---------------
+
+ok('C3 a lock whose owner is alive on this host is never broken, at any age', () => {
+  const proj = freshProject('c3-live');
+  // Ten minutes old — far past hard-stale — but the owner is THIS process, which
+  // is provably running. Breaking it would not unwedge the holder; it would add
+  // a second writer to the record the holder still has open.
+  const lockDir = plantLock(workspaceLockDir(proj), { ageMs: 600000, token: 'liveowner', action: 'wedged but alive' });
+  let refusal = null;
+  try {
+    state.withWorkspaceLock(proj, 'contender', () => {});
+  } catch (e) {
+    refusal = e;
+  }
+  assert.ok(refusal, 'a live owner must produce a refusal, not a stolen lock');
+  assert.strictEqual(refusal.code, 'ERATCHETLOCK', `the refusal must name the lock; got: ${refusal.message}`);
+  assert.match(refusal.message, /wedged but alive/, 'and must name the holder it is waiting on');
+  assert.strictEqual(readToken(lockDir), 'liveowner', 'the live holding must still be there, untouched');
+  fs.rmSync(lockDir, { recursive: true, force: true });
+});
+
+ok('C3 a dead owner past soft-stale still loses the lock', () => {
+  const proj = freshProject('c3-dead');
+  // The other half of the same rule: liveness is what protects a lock, so an
+  // owner that is provably gone must not protect one.
+  plantLock(workspaceLockDir(proj), { pid: deadPid(), ageMs: 30000, token: 'deadowner' });
+  let ran = false;
+  state.withWorkspaceLock(proj, 'contender', () => {
+    ran = true;
+  });
+  assert.ok(ran, 'a provably dead owner past soft-stale must be recovered from');
+});
+
+ok('C3 release removes OUR holding or nothing at all', () => {
+  const proj = freshProject('c3-release');
+  const lockDir = workspaceLockDir(proj);
+  // Our holding is broken as stale and a successor takes the slot. On the way
+  // out we must not delete the successor's live lock — that is two writers with
+  // no lock between them, and neither of them ever finds out.
+  state.withWorkspaceLock(proj, 'overrunner', () => {
+    fs.writeFileSync(
+      path.join(lockDir, 'owner.json'),
+      JSON.stringify({ token: 'successor', pid: process.pid, host: os.hostname(), at: new Date().toISOString(), action: 'successor' }),
+      'utf8'
+    );
+  });
+  assert.ok(fs.existsSync(lockDir), "the successor's lock must survive our release");
+  assert.strictEqual(readToken(lockDir), 'successor', 'and must still be the successor holding, untouched');
+  fs.rmSync(lockDir, { recursive: true, force: true });
+});
+
+// --- C4: ABA on the stale break ----------------------------------------------
+
+ok('C4 a stale break that moves a different holding puts it back', () => {
+  const proj = freshProject('c4');
+  const lockDir = workspaceLockDir(proj);
+  plantLock(lockDir, { pid: deadPid(), ageMs: 30000, token: 'judgedstale' });
+
+  // The break decides on one owner and then renames whatever occupies .lock at
+  // that instant. Swap in a NEW live holding in between — the exact ABA the
+  // decision cannot see — and the break must notice it moved the wrong thing.
+  const realRename = fs.renameSync;
+  let swapped = false;
+  fs.renameSync = function (from, to) {
+    if (!swapped && String(from) === lockDir) {
+      swapped = true;
+      realRename.call(fs, from, `${lockDir}.decoy`);
+      plantLock(lockDir, { ageMs: 0, token: 'newlive', action: 'fresh live holding' });
+    }
+    return realRename.call(fs, from, to);
+  };
+  let refusal = null;
+  try {
+    state.withWorkspaceLock(proj, 'breaker', () => {});
+  } catch (e) {
+    refusal = e;
+  } finally {
+    fs.renameSync = realRename;
+  }
+
+  assert.ok(swapped, 'the injection must fire — otherwise this proves nothing');
+  assert.ok(fs.existsSync(lockDir), 'the new live holding must not be destroyed by a break aimed at its predecessor');
+  assert.strictEqual(readToken(lockDir), 'newlive', 'and it must still be the new holding');
+  assert.ok(refusal, 'the breaker must end up refused, not holding a stolen lock');
+  fs.rmSync(lockDir, { recursive: true, force: true });
+  fs.rmSync(`${lockDir}.decoy`, { recursive: true, force: true });
+});
+
+// --- H5: base snapshots survive losing object identity -----------------------
+
+ok('H5 a snapshot that lost its object identity still rebases by revision', () => {
+  const proj = freshProject('h5');
+  const loaded = state.loadState(proj);
+  // Anything that copies a snapshot — a JSON round trip, structuredClone, an IPC
+  // hop — drops the identity the base map was keyed on. The revision it carries
+  // is still the truth about what it was read from.
+  const copy = JSON.parse(JSON.stringify(loaded));
+
+  const other = state.loadState(proj);
+  other.tags.push('landed-while-you-were-thinking');
+  state.saveState(proj, other);
+
+  copy.tags.push('mine');
+  state.saveState(proj, copy);
+
+  const final = state.loadState(proj);
+  assert.ok(final.tags.includes('landed-while-you-were-thinking'), `the committed write must survive — tags: ${final.tags}`);
+  assert.ok(final.tags.includes('mine'), `and so must the rebased one — tags: ${final.tags}`);
+});
+
+ok('H5 a snapshot at an unknown revision is refused, never written blind', () => {
+  const proj = freshProject('h5-blind');
+  const s = state.loadState(proj);
+  s.objective = 'the record';
+  state.saveState(proj, s);
+  const before = stateBytes(proj);
+
+  // A hand-built object claiming a revision nobody remembers reading. There is
+  // no delta to rebase and no claim to honour: overwriting it blind is the v0.8
+  // defect wearing a 0.9 lock.
+  const forged = { ...JSON.parse(before.toString('utf8')), rev: 99, objective: 'blind overwrite' };
+  let refusal = null;
+  try {
+    state.saveState(proj, forged);
+  } catch (e) {
+    refusal = e;
+  }
+  assert.ok(refusal, 'a blind overwrite must be refused');
+  assert.strictEqual(refusal.code, 'ERATCHETSTALE', `refusal must be coded stale; got ${refusal.code}: ${refusal.message}`);
+  assert.ok(stateBytes(proj).equals(before), 'and must move zero bytes');
+});
+
+// --- H8: duplicate ids never hybridize ---------------------------------------
+
+ok('H8 a rebase never merges two records that merely share an id', () => {
+  const proj = freshProject('h8');
+  const seed = state.loadState(proj);
+  // A store that is already broken: one id, two records. Matching them by "the
+  // Nth record carrying this id" is only stable while both sides agree on the
+  // order — and nothing makes them agree. Once the committed order moves, the
+  // Nth-occurrence match pairs UNRELATED rows and merging them field-by-field
+  // builds a record that never existed: this record's title, that record's
+  // status. That is not a lost update, it is a fabricated one.
+  seed.artifacts = [
+    { id: 'dup', at: schemas.nowIso(), kind: 'code', title: 'first', status: 'v0', holes: [] },
+    { id: 'dup', at: schemas.nowIso(), kind: 'code', title: 'second', status: 'v0', holes: [] },
+  ];
+  state.saveState(proj, seed);
+
+  const mine = state.loadState(proj);
+  const theirs = state.loadState(proj);
+  theirs.artifacts.reverse(); // the committed order moves under me
+  theirs.artifacts[0].status = 'committed-by-them';
+  state.saveState(proj, theirs);
+
+  mine.artifacts[0].status = 'edited-by-me'; // I edited the one titled "first"
+  mine.tags.push('mine-also-appended');
+  state.saveState(proj, mine);
+
+  const final = state.loadState(proj);
+  const rows = final.artifacts.map((a) => `${a.title}:${a.status}`);
+  assert.ok(
+    !rows.includes('second:edited-by-me') && !rows.includes('first:committed-by-them'),
+    `no record may wear another record's field — got ${JSON.stringify(rows)}`
+  );
+  assert.deepStrictEqual(
+    rows,
+    ['second:committed-by-them', 'first:v0'],
+    `an ambiguous id falls back to committed order, whole records only — got ${JSON.stringify(rows)}`
+  );
+  assert.strictEqual(final.artifacts.length, 2, 'and must not duplicate the ambiguous records');
+  assert.ok(final.tags.includes('mine-also-appended'), 'unambiguous work in the same save still rebases normally');
+});
+
+// --- H9: a release that cannot delete still frees the slot -------------------
+
+ok('H9 a lock that cannot be deleted is moved aside, never left blocking', () => {
+  const proj = freshProject('h9');
+  // In a child, so the patched fs never touches this process. Deleting the lock
+  // fails; if that is shrugged off, the .lock survives with a dead owner's pid
+  // and every future writer waits out the full timeout.
+  const [res] = runChildren(
+    proj,
+    `  const state = require(path.join(SRC, 'state.js'));
+  const lockDir = path.join(state.projectDir(process.cwd()), '.lock');
+  const realRm = fs.rmSync;
+  fs.rmSync = function (target, ...rest) {
+    if (String(target) === lockDir) throw Object.assign(new Error('EBUSY: simulated undeletable lock'), { code: 'EBUSY' });
+    return realRm.call(fs, target, ...rest);
+  };
+  const s = state.loadState(process.cwd());
+  s.objective = 'H9';
+  state.saveState(process.cwd(), s);
+  result.lockLeft = fs.existsSync(lockDir);`,
+    ['h9']
+  );
+  assert.strictEqual(res.error, null, `child failed: ${res.error}`);
+  assert.strictEqual(res.lockLeft, false, 'a lock that could not be deleted must be moved aside, not left in place');
+
+  // The real proof: the next writer is not blocked.
+  const started = Date.now();
+  const s = state.loadState(proj);
+  s.objective = 'H9 next writer';
+  state.saveState(proj, s);
+  assert.ok(Date.now() - started < 2000, `the next writer must not wait for a timeout — took ${Date.now() - started}ms`);
+  assert.strictEqual(state.loadState(proj).objective, 'H9 next writer', 'and must actually commit');
+});
+
+// --- H10: a refusal creates nothing ------------------------------------------
+
+ok('H10 a CAS refusal on an absent store leaves the store absent', () => {
+  const proj = fs.mkdtempSync(path.join(os.tmpdir(), 'ratchet-h10-'));
+  projects.push(proj);
+  const sPath = state.statePath(proj);
+  assert.ok(!fs.existsSync(sPath), 'the store must start absent');
+
+  let refusal = null;
+  try {
+    state.withWorkspaceMutation(proj, { expectedStateRev: 0, action: 'cas on nothing' }, (s) => {
+      s.objective = 'should never land';
+    });
+  } catch (e) {
+    refusal = e;
+  }
+  assert.ok(refusal, 'naming a revision on a store that does not exist must be refused');
+  assert.strictEqual(refusal.code, 'ERATCHETSTALE', `coded stale; got ${refusal.code}`);
+  assert.ok(
+    !fs.existsSync(sPath),
+    'a zero-byte refusal means zero bytes — the refusal must not leave a freshly minted state.json behind'
+  );
+});
+
+// --- M12: saveState and saveLedger are the same door -------------------------
+
+ok('M12 a propose-only agent cannot write through saveState or saveLedger', () => {
+  const proj = freshProject('m12');
+  const s = state.loadState(proj);
+  const l = state.loadLedger(proj);
+  const before = stateBytes(proj);
+  process.env.RATCHET_AGENT = 'ratchet-builder';
+  try {
+    s.objective = 'written by a propose-only agent';
+    assert.throws(() => state.saveState(proj, s), /propose-only/, 'saveState must not be the softer second door');
+    assert.throws(() => state.saveLedger(proj, l), /propose-only/, 'and neither must saveLedger');
+  } finally {
+    delete process.env.RATCHET_AGENT;
+  }
+  assert.ok(stateBytes(proj).equals(before), 'the refused writes must move zero bytes');
+});
+
 fs.rmSync(tmp, { recursive: true, force: true });
 for (const p of projects) fs.rmSync(p, { recursive: true, force: true });
 process.stdout.write(`\n${passed} passed, ${failures.length} failed\n`);

@@ -321,23 +321,37 @@ ok('corrupt state.json is backed up, not silently lost', () => {
 
 // --- store integrity (0.8 Closure Gate) -------------------------------------
 
-ok('state carries a monotonic rev that increments on every write and survives load', () => {
-  // Dormant in 0.8: nothing reads it. It exists so a later version can detect a
-  // lost update without a migration — which is only possible if it starts now.
+ok('state carries a monotonic rev that increments on every CHANGE and survives load', () => {
+  // 0.8 wrote this counter and read nothing from it; 0.9 compares against it, so
+  // what counts as an increment tightened. It used to be "every saveState call",
+  // which this test drove with unmodified resaves. A save that would not move the
+  // record is not a write in 0.9 — it costs no revision, because bumping rev
+  // invalidates every proof bound to the current one for nothing. The sequence
+  // below is unchanged; each step now makes a real change to earn its revision,
+  // and the no-op law it used to contradict is asserted at the end.
   state.initProject(cwd, { force: true });
   const fresh = state.loadState(cwd);
   assert.strictEqual(fresh.rev, 0, 'a fresh state opens at rev 0');
+  fresh.tags.push('rev-1');
   state.saveState(cwd, fresh);
   assert.strictEqual(state.loadState(cwd).rev, 1, 'the first write is rev 1');
   const second = state.loadState(cwd);
+  second.tags.push('rev-2');
   state.saveState(cwd, second);
   assert.strictEqual(state.loadState(cwd).rev, 2, 'rev increments across writes and survives a reload');
+  // an identical resave is not a write: no revision, no timestamp churn
+  const bytes = fs.readFileSync(state.statePath(cwd));
+  state.saveState(cwd, state.loadState(cwd));
+  assert.strictEqual(state.loadState(cwd).rev, 2, 'a save that changes nothing costs no revision');
+  assert.ok(fs.readFileSync(state.statePath(cwd)).equals(bytes), 'a save that changes nothing writes no bytes');
   // a legacy (pre-0.8) state file has no rev — it is read as 0, lazily, never migrated
   const legacy = state.loadState(cwd);
   delete legacy.rev;
   state.writeJson(state.statePath(cwd), legacy);
   assert.strictEqual(state.loadState(cwd).rev, undefined, 'load does not rewrite a legacy file');
-  state.saveState(cwd, state.loadState(cwd));
+  const migrating = state.loadState(cwd);
+  migrating.tags.push('rev-1-again');
+  state.saveState(cwd, migrating);
   assert.strictEqual(state.loadState(cwd).rev, 1, 'a missing rev counts as 0, so the next write is 1');
 });
 

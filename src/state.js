@@ -282,11 +282,15 @@ function proposeOnlyAgent() {
 function assertMayWrite(action) {
   const a = proposeOnlyAgent();
   if (a) {
-    throw new Error(
+    const e = new Error(
       `agent "${a}" has propose-only memory and may not mutate canonical state (${action}). ` +
         'Emit the exact command for the caller or the ratchet-scribe to run instead. ' +
         '(Only the scribe writes canonical state; unset RATCHET_AGENT for the main caller, or set it to scribe.)'
     );
+    // Coded, so a caller that swallows errors by policy (hooks) can still tell a
+    // refusal apart from a failure and say which one it was.
+    e.code = 'ERATCHETPROPOSEONLY';
+    throw e;
   }
 }
 
@@ -322,8 +326,12 @@ function pidAlive(pid) {
   }
 }
 
+function ownerCardPath(lockDir) {
+  return path.join(lockDir, 'owner.json');
+}
+
 function lockOwner(lockDir) {
-  const card = readJson(path.join(lockDir, 'owner.json'));
+  const card = readJson(ownerCardPath(lockDir));
   let at = card ? Date.parse(card.at) : NaN;
   if (!Number.isFinite(at)) {
     // No card, or an unreadable one: either a lock caught mid-acquisition or one
@@ -336,38 +344,76 @@ function lockOwner(lockDir) {
     }
   }
   return {
+    // The token is what actually identifies a HOLDING: pid + host can be
+    // recycled, a token cannot. Release and stale-break both compare it.
+    token: card ? String(card.token || '') : '',
     pid: card ? Number(card.pid) : NaN,
     host: card ? String(card.host || '') : '',
     action: (card && card.action) || 'unknown',
     ageMs: Math.max(0, Date.now() - at),
+    card,
   };
 }
 
-// Stale recovery weighs AGE and LIVENESS together, never liveness alone: pids
-// are recycled, so process.kill(pid, 0) on a long-dead owner can answer "alive"
-// about a stranger's process — and on another host it answers about the wrong
-// machine entirely. Under SOFT the lock is never broken (a slow writer is not a
-// dead one); past SOFT a provably dead owner on THIS host loses it; past HARD
-// nobody keeps a workspace lock, alive, wedged, or impersonated.
-function breakIfStale(lockDir) {
+// A lock whose owner is PROVABLY ALIVE on this host is never broken — not at
+// soft-stale, not at hard-stale, not ever. A wedged live holder produces a
+// perpetual named refusal, and an honest refusal beats a stolen lock: breaking a
+// live writer's lock does not unwedge it, it just adds a second writer to the
+// record it is still holding open. Hard-stale therefore applies ONLY where
+// liveness cannot be established at all — a dead pid, a foreign host, or an
+// owner card nobody can read.
+function staleVerdict(owner) {
   const soft = envMs('RATCHET_LOCK_STALE_MS', 5000);
   const hard = envMs('RATCHET_LOCK_HARD_STALE_MS', 120000);
+  if (owner.ageMs < soft) return '';
+  const local = owner.host === os.hostname() && Number.isInteger(owner.pid);
+  if (local && pidAlive(owner.pid)) return ''; // alive on this host — never broken
+  if (local) return 'the owning process is gone';
+  // Foreign host or unreadable card: liveness is unknowable from here, so only
+  // sheer age can settle it.
+  if (owner.ageMs < hard) return '';
+  return owner.host ? `owner is on another host (${owner.host}) and unreachable` : 'the owner card is unreadable';
+}
+
+function breakIfStale(lockDir) {
   const owner = lockOwner(lockDir);
-  const provablyDead = owner.host === os.hostname() && !pidAlive(owner.pid);
-  if (owner.ageMs < soft) return false;
-  if (!provablyDead && owner.ageMs < hard) return false;
-  // Two waiters can reach this verdict in the same instant. Rename is atomic and
-  // only one of them can win it, so exactly one process ever breaks a given
-  // lock — and the loser retries against a directory that is already gone.
+  const why = staleVerdict(owner);
+  if (!why) return false;
+  // Two waiters can reach this verdict in the same instant. Rename is atomic, so
+  // only one of them can win it — but the rename moves whatever occupies .lock
+  // AT THAT MOMENT, which may already be a new, live generation (ABA). So verify
+  // what was actually moved before destroying it.
   const doomed = `${lockDir}.stale-${crypto.randomBytes(4).toString('hex')}`;
   try {
     fs.renameSync(lockDir, doomed);
   } catch (_e) {
     return false; // somebody else won the break, or the owner released it first
   }
+  const moved = lockOwner(doomed);
+  if (owner.token && moved.token !== owner.token) {
+    // We judged one holding stale and moved a different one. Put it back if the
+    // slot is still free; if it is not, a third holding is already there and
+    // undoing would be a second theft — name the incident instead.
+    let restored = false;
+    try {
+      if (!fs.existsSync(lockDir)) {
+        fs.renameSync(doomed, lockDir);
+        restored = true;
+      }
+    } catch (_e) {
+      /* fall through to the loud path */
+    }
+    process.stderr.write(
+      `[ratchet] ABORTED a stale-lock break at ${lockDir}: judged token ${owner.token.slice(0, 8)} stale but moved ` +
+        `token ${(moved.token || 'none').slice(0, 8)} (pid ${moved.pid}). ` +
+        (restored ? 'Restored it — no lock was destroyed.' : `COULD NOT RESTORE: a live holding is at ${doomed}, inspect it by hand.`) +
+        '\n'
+    );
+    return restored; // restored → retry the acquire loop; not restored → do not spin on it
+  }
   removeDirSync(doomed);
   process.stderr.write(
-    `[ratchet] broke a stale lock at ${lockDir} — owner pid ${owner.pid} (${owner.action}), ${Math.round(owner.ageMs / 1000)}s old.\n`
+    `[ratchet] broke a stale lock at ${lockDir} — ${why}: pid ${owner.pid} (${owner.action}), ${Math.round(owner.ageMs / 1000)}s old.\n`
   );
   return true;
 }
@@ -390,6 +436,7 @@ function removeDirSync(dir) {
 function acquireLock(lockDir, action) {
   ensureDir(path.dirname(lockDir));
   const deadline = Date.now() + envMs('RATCHET_LOCK_TIMEOUT_MS', 15000);
+  const token = crypto.randomBytes(8).toString('hex');
   let wait = 2;
   for (;;) {
     let held = false;
@@ -404,15 +451,15 @@ function acquireLock(lockDir, action) {
         // Real wall clock, never schemas.nowIso: RATCHET_NOW is a frozen record
         // clock, and a lock stamped with a frozen time is born stale.
         fs.writeFileSync(
-          path.join(lockDir, 'owner.json'),
-          JSON.stringify({ pid: process.pid, host: os.hostname(), at: new Date().toISOString(), action: action || 'mutation' }),
+          ownerCardPath(lockDir),
+          JSON.stringify({ token, pid: process.pid, host: os.hostname(), at: new Date().toISOString(), action: action || 'mutation' }),
           'utf8'
         );
       } catch (e) {
         removeDirSync(lockDir); // never hold a lock nobody can identify or age
         throw e;
       }
-      return lockDir;
+      return { dir: lockDir, token, action: action || 'mutation' };
     }
     if (breakIfStale(lockDir)) continue;
     if (Date.now() >= deadline) {
@@ -429,8 +476,40 @@ function acquireLock(lockDir, action) {
   }
 }
 
-function releaseLock(lockDir) {
-  if (lockDir) removeDirSync(lockDir);
+// Release removes OUR holding or nothing. A blind rmdir is how a process that
+// overran its own lock (broken as stale, re-acquired by a successor) deletes the
+// successor's live lock on its way out — two writers, no lock, and neither of
+// them ever learns. So the token is checked first, and a failed removal is
+// neutralized rather than shrugged off: a .lock nobody owns and nobody can
+// delete blocks every future writer until the timeout, every time.
+function releaseLock(handle) {
+  if (!handle || !handle.dir) return true;
+  const owner = lockOwner(handle.dir);
+  if (!fs.existsSync(handle.dir)) return true; // already gone (broken as stale)
+  if (owner.token !== handle.token) {
+    process.stderr.write(
+      `[ratchet] NOT releasing ${handle.dir}: it is held by token ${(owner.token || 'none').slice(0, 8)} ` +
+        `(pid ${owner.pid}, ${owner.action}), not by this process's ${handle.token.slice(0, 8)}. ` +
+        'Our holding was broken as stale and somebody else owns the lock now — leaving it alone.\n'
+    );
+    return false;
+  }
+  if (removeDirSync(handle.dir)) return true;
+  // Could not delete it. Move it out of the way with the same atomic primitive a
+  // stale break uses, so the slot is free even if the bytes linger.
+  const doomed = `${handle.dir}.stale-${crypto.randomBytes(4).toString('hex')}`;
+  try {
+    fs.renameSync(handle.dir, doomed);
+    removeDirSync(doomed);
+    process.stderr.write(`[ratchet] could not delete ${handle.dir}; moved it aside so the next writer is not blocked.\n`);
+    return true;
+  } catch (_e) {
+    process.stderr.write(
+      `[ratchet] STUCK LOCK: could not release or move ${handle.dir} (pid ${process.pid}). ` +
+        'Every future writer here will wait for the timeout until it is removed by hand.\n'
+    );
+    return false;
+  }
 }
 
 // At most ONE lock scope is open per process, and it is remembered here. The
@@ -438,6 +517,27 @@ function releaseLock(lockDir) {
 // on a lock this very process holds: a silent self-deadlock. Nested callers with
 // the same scope JOIN the open one instead — helpers never lock.
 let _scope = null;
+
+// LOCK ORDER: workspace → file, never the reverse.
+//
+// Two lock families exist (the workspace store, and per-file locks such as the
+// evolution journal). A process that holds one and waits for the other in the
+// opposite order to another process is the textbook ABBA wedge; here it would
+// resolve as a pair of timeouts rather than a hang, but a pair of timeouts is
+// still two failed commands and no diagnosis. So the order is declared and
+// ENFORCED: taking a workspace lock while holding a file lock throws by name.
+// The file locks currently open in this process, innermost last.
+const _fileScopes = [];
+
+function assertLockOrder(what) {
+  if (_fileScopes.length) {
+    throw new Error(
+      `lock order violation: refusing to take the workspace lock (${what}) while holding the file lock ` +
+        `${_fileScopes[_fileScopes.length - 1].dir}. The order is workspace → file, never the reverse — ` +
+        'acquire the workspace lock (or let the read that creates the store run) before entering the file lock.'
+    );
+  }
+}
 
 // Lock a store directory for the duration of fn. Use this for a public command
 // whose write is not a state.json revision (ledger upserts, the init/reset wipe)
@@ -450,13 +550,28 @@ function withWorkspaceLock(cwd, action, fn) {
       `refusing to lock ${dir} while ${_scope.dir} is open (${_scope.action}) — one process holds one workspace at a time.`
     );
   }
-  const lockDir = acquireLock(path.join(dir, LOCK_DIR_NAME), action);
+  assertLockOrder(action);
+  const handle = acquireLock(path.join(dir, LOCK_DIR_NAME), action);
   _scope = { dir, action, state: null };
   try {
     return fn();
   } finally {
     _scope = null;
-    releaseLock(lockDir);
+    releaseLock(handle);
+  }
+}
+
+// The lock has to name the same FILE for every caller, and two callers can spell
+// one file differently (a symlinked directory, Windows path casing). Resolving
+// the parent directory is cheap and fixes both. It does NOT fix hard links: two
+// names for one inode in two different directories resolve to two lock keys, and
+// no dependency-free way to key a lock by inode exists. Named, not silently
+// assumed away — see the CHANGELOG boundary list.
+function fileLockDir(file) {
+  try {
+    return path.join(fs.realpathSync(path.dirname(file)), `${path.basename(file)}${LOCK_DIR_NAME}`);
+  } catch (_e) {
+    return `${file}${LOCK_DIR_NAME}`; // parent does not exist yet — lexical is all there is
   }
 }
 
@@ -465,11 +580,16 @@ function withWorkspaceLock(cwd, action, fn) {
 // cannot borrow the workspace's lock without making unrelated writers queue
 // behind each other in both directions.
 function withFileLock(file, action, fn) {
-  const lockDir = acquireLock(`${file}${LOCK_DIR_NAME}`, action);
+  const dir = fileLockDir(file);
+  const already = _fileScopes.find((s) => s.dir === dir);
+  if (already) return fn(); // same file, same process — join, never re-acquire
+  const handle = acquireLock(dir, action);
+  _fileScopes.push({ dir, action });
   try {
     return fn();
   } finally {
-    releaseLock(lockDir);
+    _fileScopes.pop();
+    releaseLock(handle);
   }
 }
 
@@ -477,7 +597,60 @@ function withFileLock(file, action, fn) {
 // State lifecycle.
 // ---------------------------------------------------------------------------
 
-function initProject(cwd, { force = false, resetBy = '', resetReason = '' } = {}) {
+// Create a file that does not exist yet, atomically, and REFUSE if it appeared
+// in the meantime. A rename always replaces its destination — which is right for
+// a revision and catastrophically wrong for a first-time creation, where the
+// thing being replaced is somebody else's committed record and the replacement
+// is an empty one. Hard-linking the temp file into place is the same atomic
+// publish with create-or-fail semantics; where links are unavailable, an
+// exclusive 'wx' open is the fallback.
+function createJsonExclusive(file, obj) {
+  ensureDir(path.dirname(file));
+  const data = JSON.stringify(obj, null, 2) + '\n';
+  const tmp = `${file}.tmp-${process.pid.toString(36)}-${crypto.randomBytes(4).toString('hex')}`;
+  try {
+    writeFileAtomic(tmp, data);
+    try {
+      fs.linkSync(tmp, file);
+      return true;
+    } catch (e) {
+      if (e && e.code === 'EEXIST') return false; // somebody else created it first
+      if (e && (e.code === 'EPERM' || e.code === 'ENOSYS' || e.code === 'EXDEV' || e.code === 'EOPNOTSUPP')) {
+        // No hard links on this filesystem. 'wx' still refuses an existing file;
+        // it just cannot publish the bytes in one step.
+        let fd;
+        try {
+          fd = fs.openSync(file, 'wx');
+          fs.writeFileSync(fd, data, 'utf8');
+          return true;
+        } catch (e2) {
+          if (e2 && e2.code === 'EEXIST') return false;
+          throw e2;
+        } finally {
+          if (fd !== undefined) fs.closeSync(fd);
+        }
+      }
+      throw e;
+    }
+  } finally {
+    try {
+      fs.rmSync(tmp, { force: true });
+    } catch (_e) {
+      /* the .tmp- name says what it is if it survives */
+    }
+  }
+}
+
+function initProject(cwd, opts = {}) {
+  // Creating the store is a WRITE, so it happens under the lock like every other
+  // write. Without it, a first read on an empty store could publish its fresh
+  // rev-0 record over a revision a locked writer had already committed — a read
+  // erasing a write, which is the exact failure the gate exists to make
+  // impossible. A caller that already holds this workspace just joins the scope.
+  return withWorkspaceLock(cwd, opts.force ? 'init --force' : 'init', () => initProjectLocked(cwd, opts));
+}
+
+function initProjectLocked(cwd, { force = false, resetBy = '', resetReason = '' } = {}) {
   ensureDir(projectDir(cwd));
   const sPath = statePath(cwd);
   const lPath = ledgerPath(cwd);
@@ -495,12 +668,14 @@ function initProject(cwd, { force = false, resetBy = '', resetReason = '' } = {}
         note: `state wiped by ${resetBy || 'unnamed'} — ${resetReason || 'no reason recorded'}`,
       });
     }
-    writeJson(sPath, fresh);
-    created = true;
+    // A wipe is a deliberate replacement; a first creation is not allowed to
+    // replace anything.
+    if (force) writeJson(sPath, fresh);
+    else created = createJsonExclusive(sPath, fresh);
+    if (force) created = true;
   }
-  if (force || !fs.existsSync(lPath)) {
-    writeJson(lPath, schemas.newLedger());
-  }
+  if (force) writeJson(lPath, schemas.newLedger());
+  else if (!fs.existsSync(lPath)) createJsonExclusive(lPath, schemas.newLedger());
   return { dir: projectDir(cwd), created, statePath: sPath, ledgerPath: lPath };
 }
 
@@ -509,6 +684,34 @@ function initProject(cwd, { force = false, resetBy = '', resetReason = '' } = {}
 // answer is the bytes that caller actually read. WeakMap, so a dropped snapshot
 // is not a leak.
 const _base = new WeakMap();
+
+// The same answer, keyed by <statePath>@<rev> instead of by object identity.
+// Object identity is lost the moment a snapshot crosses a boundary that copies
+// it — structuredClone, JSON round-trip, an IPC hop, a helper that spreads it —
+// and a snapshot with no remembered base used to fall through to a blind
+// overwrite, which is precisely the v0.8 lost update wearing a 0.9 lock. The
+// revision it claims is enough to find what it was read from. Bounded, because
+// this is a cache and not a record.
+const _baseByRev = new Map();
+const BASE_CACHE_MAX = 64;
+
+function baseKey(cwd, rev) {
+  return `${statePath(cwd)}@${rev}`;
+}
+
+function rememberBase(cwd, snapshot) {
+  const copy = clone(snapshot);
+  _base.set(snapshot, copy);
+  const key = baseKey(cwd, revOf(snapshot));
+  _baseByRev.delete(key); // re-insert so the newest key is last for eviction
+  _baseByRev.set(key, copy);
+  if (_baseByRev.size > BASE_CACHE_MAX) _baseByRev.delete(_baseByRev.keys().next().value);
+  return snapshot;
+}
+
+function baseFor(cwd, state) {
+  return _base.get(state) || _baseByRev.get(baseKey(cwd, revOf(state))) || null;
+}
 
 function clone(o) {
   return JSON.parse(JSON.stringify(o));
@@ -526,16 +729,22 @@ function loadState(cwd) {
   // copy read from disk is how a command loses half of its own mutation.
   if (_scope && _scope.state && _scope.dir === projectDir(cwd)) return _scope.state;
   const existing = readJsonResilient(statePath(cwd));
-  if (existing) {
-    _base.set(existing, clone(existing));
-    return existing;
-  }
-  // Auto-init on first read so skills never hit a missing file. A corrupt file
-  // has already been backed up by readJsonResilient before we overwrite it.
-  const fresh = schemas.newState();
-  writeJson(statePath(cwd), fresh);
-  _base.set(fresh, clone(fresh));
-  return fresh;
+  if (existing) return rememberBase(cwd, existing);
+  // Auto-init on first read so skills never hit a missing file — but creating
+  // the record is a write, so it happens under the lock and it re-reads there:
+  // if the store appeared while we were queueing, that record wins and this read
+  // returns it. A read never replaces a record. (A corrupt file has already been
+  // backed up by readJsonResilient before we get here.)
+  return withWorkspaceLock(cwd, 'state init', () => {
+    const appeared = readJsonResilient(statePath(cwd));
+    if (appeared) return rememberBase(cwd, appeared);
+    const fresh = schemas.newState();
+    if (!createJsonExclusive(statePath(cwd), fresh)) {
+      const raced = readJsonResilient(statePath(cwd));
+      if (raced) return rememberBase(cwd, raced);
+    }
+    return rememberBase(cwd, fresh);
+  });
 }
 
 function commitState(cwd, state, baseRev) {
@@ -544,7 +753,7 @@ function commitState(cwd, state, baseRev) {
   writeJson(statePath(cwd), state);
   // The caller may save the same object again; its base has to move with it or
   // the second save would rebase against a revision that is two writes old.
-  _base.set(state, clone(state));
+  rememberBase(cwd, state);
   return state;
 }
 
@@ -586,13 +795,42 @@ function indexBy(list) {
   return index;
 }
 
+// Ids that appear more than once in ANY of the three lists. Matching records by
+// "the Nth record carrying id X" pairs two records that merely share an id and
+// an ordinal, and merging them field-by-field builds a record that never existed
+// — A's evidence stapled onto B's status. A duplicated id means the store is
+// already broken; the merge refuses to make it worse.
+function duplicatedIds(lists) {
+  const dupes = new Set();
+  for (const list of lists) {
+    const seen = new Set();
+    for (const item of list) {
+      if (!isPlainObject(item) || item.id == null) continue;
+      const id = String(item.id);
+      if (seen.has(id)) dupes.add(id);
+      seen.add(id);
+    }
+  }
+  return dupes;
+}
+
+function idOf(item) {
+  return isPlainObject(item) && item.id != null ? String(item.id) : null;
+}
+
 function mergeArray(base, mine, theirs) {
   const baseIdx = indexBy(base);
   const mineIdx = indexBy(mine);
+  const dupes = duplicatedIds([base, mine, theirs]);
   const out = [];
   const takenFromMine = new Set();
   // Their order is the committed order and stays authoritative.
   for (const [key, item] of indexBy(theirs)) {
+    const id = idOf(item);
+    if (id && dupes.has(id)) {
+      out.push(item); // committed order wins outright for an ambiguous id
+      continue;
+    }
     if (mineIdx.has(key)) {
       takenFromMine.add(key);
       out.push(mergeValue(baseIdx.get(key), mineIdx.get(key), item));
@@ -605,6 +843,8 @@ function mergeArray(base, mine, theirs) {
   }
   // Then whatever I appended, in the order I appended it.
   for (const [key, item] of mineIdx) {
+    const id = idOf(item);
+    if (id && dupes.has(id)) continue; // never re-add an ambiguous id
     if (!takenFromMine.has(key) && !baseIdx.has(key)) out.push(item);
   }
   return out;
@@ -636,6 +876,12 @@ function mergeObject(base, mine, theirs) {
 // withWorkspaceMutation.
 function saveState(cwd, state) {
   const dir = projectDir(cwd);
+  // saveState is a PUBLIC write, not a private helper, so it answers to the same
+  // rules the boundary does. It used to be the softer second door: no authority
+  // check, no no-op detection — a propose-only agent could write through it and
+  // an identical resave still burned a revision, invalidating proof bound to the
+  // previous one.
+  assertMayWrite('saveState');
   if (_scope && _scope.dir === dir) {
     if (_scope.state) {
       // Deferred: one public mutation is one revision, so a command that saves
@@ -650,13 +896,40 @@ function saveState(cwd, state) {
 
 function rebaseAndCommit(cwd, state) {
   const disk = readJsonResilient(statePath(cwd));
-  const base = _base.get(state);
-  // No disk record, or a snapshot this process never loaded (so there is no
-  // delta to compute): the caller's object IS the record. Named, not hidden —
-  // an unloaded object cannot be rebased, only written.
-  if (!disk || !base || revOf(disk) === revOf(base)) return commitState(cwd, state, revOf(disk || state));
-  const merged = mergeObject(base, state, disk);
-  return commitState(cwd, Object.assign(state, merged), revOf(disk));
+  if (!disk) return commitState(cwd, state, revOf(state)); // nothing on disk to lose
+  const base = baseFor(cwd, state);
+  if (revOf(disk) !== revOf(state) && !base) {
+    // A snapshot at a revision that is no longer current, and nothing remembers
+    // what it was read from. There is no delta to rebase and no claim to honour,
+    // so the only options are to overwrite blindly — the v0.8 defect — or to
+    // refuse. Refuse.
+    const e = new Error(
+      `refused a blind overwrite (saveState): the snapshot is at rev ${revOf(state)}, the workspace is at ` +
+        `rev ${revOf(disk)}, and this process has no record of what rev ${revOf(state)} contained. ` +
+        'Reload the state and re-apply the change.'
+    );
+    e.code = 'ERATCHETSTALE';
+    e.expectedStateRev = revOf(state);
+    e.actualStateRev = revOf(disk);
+    throw e;
+  }
+  const next = base && revOf(disk) !== revOf(base) ? Object.assign(state, mergeObject(base, state, disk)) : state;
+  // A save that would not move the record is not a write. Bumping rev for it
+  // would invalidate every proof bound to the current revision for nothing. The
+  // volatile stamps are excluded because they are the write, not the change.
+  if (unchangedFrom(disk, next)) return next;
+  return commitState(cwd, next, revOf(disk));
+}
+
+// Same record? Compare everything except the two fields a commit stamps.
+function unchangedFrom(disk, next) {
+  const strip = (o) => {
+    const c = { ...o };
+    delete c.rev;
+    delete c.updatedAt;
+    return c;
+  };
+  return isDeepStrictEqual(strip(disk), strip(next));
 }
 
 // THE transaction boundary. One public mutation = acquire the lock → reload the
@@ -681,21 +954,39 @@ function withWorkspaceMutation(cwd, opts, mutate) {
     throw new Error(`expectedStateRev must be an integer revision (got ${JSON.stringify(o.expectedStateRev)})`);
   }
   const dir = projectDir(cwd);
-  const lockDir = acquireLock(path.join(dir, LOCK_DIR_NAME), action);
+  assertLockOrder(action);
+  const handle = acquireLock(path.join(dir, LOCK_DIR_NAME), action);
   _scope = { dir, action, state: null };
   try {
-    const s = loadState(cwd);
-    const baseRev = revOf(s);
-    if (o.expectedStateRev != null && o.expectedStateRev !== baseRev) {
-      const e = new Error(
-        `refused a stale write (${action}): expected rev ${o.expectedStateRev}, the workspace is at rev ${baseRev}. ` +
-          'Reload the state and re-apply the change against what is actually recorded.'
-      );
-      e.code = 'ERATCHETSTALE';
-      e.expectedStateRev = o.expectedStateRev;
-      e.actualStateRev = baseRev;
-      throw e;
+    // The revision check comes BEFORE the read that would create the store. A
+    // caller naming a revision on a store that does not exist is refusing to be
+    // told "there was nothing there, so I made you something" — and a refusal
+    // that leaves a freshly minted state.json behind is not a zero-byte refusal.
+    const onDisk = readJsonResilient(statePath(cwd));
+    if (o.expectedStateRev != null) {
+      if (!onDisk) {
+        const e = new Error(
+          `refused a stale write (${action}): expected rev ${o.expectedStateRev}, but this workspace has no ` +
+            'record yet — nothing can match a named revision on a store that does not exist. Initialize it first.'
+        );
+        e.code = 'ERATCHETSTALE';
+        e.expectedStateRev = o.expectedStateRev;
+        e.actualStateRev = null;
+        throw e;
+      }
+      if (o.expectedStateRev !== revOf(onDisk)) {
+        const e = new Error(
+          `refused a stale write (${action}): expected rev ${o.expectedStateRev}, the workspace is at rev ${revOf(onDisk)}. ` +
+            'Reload the state and re-apply the change against what is actually recorded.'
+        );
+        e.code = 'ERATCHETSTALE';
+        e.expectedStateRev = o.expectedStateRev;
+        e.actualStateRev = revOf(onDisk);
+        throw e;
+      }
     }
+    const s = onDisk ? rememberBase(cwd, onDisk) : loadState(cwd);
+    const baseRev = revOf(s);
     const before = JSON.stringify(s);
     _scope.state = s;
     const result = mutate(s);
@@ -708,19 +999,29 @@ function withWorkspaceMutation(cwd, opts, mutate) {
     return { committed: true, rev: s.rev, state: s, result };
   } finally {
     _scope = null;
-    releaseLock(lockDir);
+    releaseLock(handle);
   }
 }
 
 function loadLedger(cwd) {
   const existing = readJsonResilient(ledgerPath(cwd));
   if (existing) return existing;
-  const fresh = schemas.newLedger();
-  writeJson(ledgerPath(cwd), fresh);
-  return fresh;
+  // Same rule as the state record: creating it is a write, so it is locked and
+  // it never replaces a ledger that appeared while we queued.
+  return withWorkspaceLock(cwd, 'ledger init', () => {
+    const appeared = readJsonResilient(ledgerPath(cwd));
+    if (appeared) return appeared;
+    const fresh = schemas.newLedger();
+    if (!createJsonExclusive(ledgerPath(cwd), fresh)) {
+      const raced = readJsonResilient(ledgerPath(cwd));
+      if (raced) return raced;
+    }
+    return fresh;
+  });
 }
 
 function saveLedger(cwd, ledger) {
+  assertMayWrite('saveLedger'); // the ledger is canonical too — one door standard
   ledger.updatedAt = schemas.nowIso();
   writeJson(ledgerPath(cwd), ledger);
   return ledger;
@@ -746,6 +1047,7 @@ module.exports = {
   readJson,
   writeJson,
   writeFileAtomic,
+  createJsonExclusive,
   initProject,
   loadState,
   saveState,
