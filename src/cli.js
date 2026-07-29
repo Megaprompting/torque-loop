@@ -91,37 +91,18 @@ function strOpt(v) {
   return v == null || v === true ? '' : String(v).trim();
 }
 
-// ---------------------------------------------------------------------------
-// Agent memory isolation (propose-only). Registered agents get isolated memory
-// by ROLE, enforced at the CLI boundary: only the scribe writes canonical state.
-// A builder or auditor is a propose-only agent — it emits the mutation for the
-// caller (or the scribe) to run, and its own process is refused write access, so
-// two agents can never clobber each other's record. Identity comes from
-// RATCHET_AGENT; the writer set is the scribe (and the unset/main caller). This
-// is a guard, not a sandbox: it makes the propose-only contract the agents
-// already follow impossible to violate by accident.
-// ---------------------------------------------------------------------------
+// Agent memory isolation (propose-only) moved to the mutation boundary in 0.9
+// (src/state.js) so it guards the door every public write now comes through
+// instead of only the router. The CLI still asks first: refusing before the work
+// is cheaper, and the message names the verb the agent actually reached for.
+const { proposeOnlyAgent, assertMayWrite } = state;
 
-const WRITER_AGENTS = new Set(['scribe']);
-
-// Returns the propose-only agent name if one is active, else ''. The main caller
-// (RATCHET_AGENT unset) and the scribe both return '' — they may write.
-function proposeOnlyAgent() {
-  const a = (process.env.RATCHET_AGENT || '').trim().toLowerCase();
-  return a && !WRITER_AGENTS.has(a) ? a : '';
-}
-
-// Throw before any canonical-state mutation if a propose-only agent is driving.
-// The message tells the agent what to do instead — emit the command, don't run it.
-function assertMayWrite(action) {
-  const a = proposeOnlyAgent();
-  if (a) {
-    throw new Error(
-      `agent "${a}" has propose-only memory and may not mutate canonical state (${action}). ` +
-        'Emit the exact command for the caller or the ratchet-scribe to run instead. ' +
-        '(Only the scribe writes canonical state; unset RATCHET_AGENT for the main caller, or set it to scribe.)'
-    );
-  }
+// One public command is ONE transaction: the lock covers the whole verb, every
+// helper underneath mutates the transaction's state instead of saving its own,
+// and the commit is a single revision. `mutate` returns whatever the verb
+// returned, so a routed call reads exactly like the unrouted one it replaced.
+function mutate(cwd, action, fn) {
+  return state.withWorkspaceMutation(cwd, { action }, fn).result;
 }
 
 // Both doors onto the irreversible wipe (`state reset --force`, `init --force`)
@@ -173,7 +154,12 @@ function run(argv) {
       if (flags.has('--force')) {
         assertMayWrite('init --force');
         const wipe = authorizeWipe(args, 'ratchet init --force');
-        const forced = state.initProject(cwd, { force: true, resetBy: wipe.owner, resetReason: wipe.reason });
+        // A wipe REPLACES the record, under the lock — and CONTINUES the revision
+        // counter, so a snapshot of the previous generation can never match the
+        // fresh one and overwrite it (initProject owns that rule).
+        const forced = state.withWorkspaceLock(cwd, 'init --force', () =>
+          state.initProject(cwd, { force: true, resetBy: wipe.owner, resetReason: wipe.reason })
+        );
         return out(`Ratchet re-initialized at ${forced.dir} (owner: ${wipe.owner})`);
       }
       const res = state.initProject(cwd);
@@ -207,7 +193,8 @@ function run(argv) {
       if (sub === 'close') return cmdArtifactClose(cwd, args);
       if (sub !== 'add') throw new Error('usage: ratchet artifact add <json> | ratchet artifact close <id>');
       assertMayWrite('artifact add');
-      const rec = artifacts.addArtifact(cwd, readPayload(rest[0]));
+      const payload = readPayload(rest[0]);
+      const rec = mutate(cwd, 'artifact add', () => artifacts.addArtifact(cwd, payload));
       return out(`artifact ${rec.id} ${rec.rev > 1 ? `revised → rev ${rec.rev}` : 'added'}: ${rec.title} (${rec.status})`);
     }
 
@@ -256,10 +243,10 @@ function run(argv) {
       const file = sub;
       if (!file) throw new Error('usage: ratchet touch <file>');
       assertMayWrite('touch');
-      const s = state.loadState(cwd);
-      s.touchedFiles.push({ path: file, at: schemas.nowIso() });
-      s.dirty = true;
-      state.saveState(cwd, s);
+      mutate(cwd, 'touch', (s) => {
+        s.touchedFiles.push({ path: file, at: schemas.nowIso() });
+        s.dirty = true;
+      });
       return out(`touched ${file}`);
     }
 
@@ -293,11 +280,11 @@ function cmdState(cwd, sub, rest, asJson, flags = new Set(), argv = []) {
         throw new Error(`"${key}" is not a settable scalar. valid: ${[...schemas.STATE_SCALARS].join(', ')}`);
       }
       const value = valueParts.join(' ');
-      const s = state.loadState(cwd);
-      s[key] = coerceScalar(key, value);
-      if (key !== 'dirty') s.dirty = true;
-      s.history.push({ id: state.makeId('hist'), at: schemas.nowIso(), event: 'state.set', note: `${key} = ${value}` });
-      state.saveState(cwd, s);
+      mutate(cwd, 'state set', (s) => {
+        s[key] = coerceScalar(key, value);
+        if (key !== 'dirty') s.dirty = true;
+        s.history.push({ id: state.makeId('hist'), at: schemas.nowIso(), event: 'state.set', note: `${key} = ${value}` });
+      });
       return out(`${key} set`);
     }
     case 'append': {
@@ -317,29 +304,33 @@ function cmdState(cwd, sub, rest, asJson, flags = new Set(), argv = []) {
         );
       }
       const item = readPayload(payloadArg);
-      const s = state.loadState(cwd);
       // Birth status is forced, not accepted: an assumption born "tested" and a
       // loop born "closed" are exactly the two lies that make the drain lie.
       const BIRTH_STATUS = { assumptions: 'untested', openLoops: 'open' };
       const birth = BIRTH_STATUS[collection];
-      if (birth) {
-        const claimed = item.status == null ? '' : String(item.status);
-        if (claimed && claimed !== birth) {
-          throw new Error(
-            `${collection} are born "${birth}", never "${claimed}" — reaching any other status is a transition ` +
-              `(ratchet state close ${collection} <id> …), not a birth field`
-          );
+      const appended = mutate(cwd, 'state append', (s) => {
+        if (birth) {
+          const claimed = item.status == null ? '' : String(item.status);
+          if (claimed && claimed !== birth) {
+            throw new Error(
+              `${collection} are born "${birth}", never "${claimed}" — reaching any other status is a transition ` +
+                `(ratchet state close ${collection} <id> …), not a birth field`
+            );
+          }
+          item.status = birth;
+          const key = String(item.text || '').trim().toLowerCase();
+          const dup = key && (s[collection] || []).find((x) => String((x && x.text) || '').trim().toLowerCase() === key);
+          // The dedup runs UNDER the lock against the reloaded record, so two
+          // processes appending the same text produce one entry, not two.
+          if (dup) return { dup };
         }
-        item.status = birth;
-        const key = String(item.text || '').trim().toLowerCase();
-        const dup = key && (s[collection] || []).find((x) => String((x && x.text) || '').trim().toLowerCase() === key);
-        if (dup) return out(`already recorded in ${collection}: ${dup.id}`);
-      }
-      const record = { id: item.id || state.makeId(schemas.STATE_COLLECTIONS[collection]), at: schemas.nowIso(), ...item };
-      s[collection].push(record);
-      s.dirty = true;
-      state.saveState(cwd, s);
-      return out(`appended to ${collection}: ${record.id}`);
+        const record = { id: item.id || state.makeId(schemas.STATE_COLLECTIONS[collection]), at: schemas.nowIso(), ...item };
+        s[collection].push(record);
+        s.dirty = true;
+        return { record };
+      });
+      if (appended.dup) return out(`already recorded in ${collection}: ${appended.dup.id}`);
+      return out(`appended to ${collection}: ${appended.record.id}`);
     }
     case 'close':
       return cmdStateClose(cwd, argv);
@@ -358,7 +349,11 @@ function cmdState(cwd, sub, rest, asJson, flags = new Set(), argv = []) {
         );
       }
       const wipe = authorizeWipe(argv, 'state reset --force');
-      state.initProject(cwd, { force: true, resetBy: wipe.owner, resetReason: wipe.reason });
+      // Same door as `init --force`: a wipe replaces the record, so it holds the
+      // lock (nobody may be mid-write) but resets the revision counter.
+      state.withWorkspaceLock(cwd, 'state reset --force', () =>
+        state.initProject(cwd, { force: true, resetBy: wipe.owner, resetReason: wipe.reason })
+      );
       return out(`state reset (owner: ${wipe.owner})`);
     }
     default:
@@ -390,7 +385,17 @@ function cmdStateClose(cwd, argv) {
   }
   need(id, `usage: ratchet state close ${collection} <id> ...`);
 
-  const s = state.loadState(cwd);
+  const to = mutate(cwd, `state close ${collection}`, (s) => closeRecord(s, collection, id, opts));
+  return out(`${collection} ${id} → ${to}`);
+}
+
+// The transition itself, applied to the transaction's state. Split out only so
+// the boundary above owns the load/save and this owns the rules.
+function closeRecord(s, collection, id, opts) {
+  const need = (val, msg) => {
+    if (!val) throw new Error(msg);
+    return val;
+  };
   const record = (s[collection] || []).find((x) => x && x.id === id);
   if (!record) throw new Error(`no ${collection} entry with id "${id}"`);
   const now = schemas.nowIso();
@@ -432,8 +437,7 @@ function cmdStateClose(cwd, argv) {
     event: `${collection === 'openLoops' ? 'loop' : 'assumption'}.${to}`,
     note: `${id}: ${from} → ${to}${evidence ? ` — ${evidence}` : ''}`,
   });
-  state.saveState(cwd, s);
-  return out(`${collection} ${id} → ${to}`);
+  return to;
 }
 
 // The closure gate. `compile done` says the record is current; this says the
@@ -444,8 +448,21 @@ function cmdArtifactClose(cwd, argv) {
   const { positionals, opts } = parseArgv(argv, { booleans: ['waive-holes', 'json'] });
   const id = positionals[2];
   if (!id) throw new Error('usage: ratchet artifact close <id> [--waive-holes --owner "<who>" --reason "<why>"]');
+  // The blocker check and the certificate it authorizes run inside ONE
+  // transaction: a defect landing between them would otherwise be closed over.
+  // The journal lock is taken by the BOUNDARY so it spans the state commit too.
+  // Locking only the proof READ moved the window instead of closing it: a REVERT
+  // appended after the read but before the commit still landed on evidence this
+  // gate had stopped watching, and the artifact still closed on a revoked KEEP.
+  // Lock order: workspace → journal.
+  return out(
+    state.withWorkspaceMutation(cwd, { action: 'artifact close', alsoLockFile: journal.logPath(cwd) }, (s) =>
+      closeArtifact(cwd, s, id, opts)
+    ).result
+  );
+}
 
-  const s = state.loadState(cwd);
+function closeArtifact(cwd, s, id, opts) {
   const matches = (s.artifacts || []).filter((a) => a && a.id === id);
   if (matches.length > 1) {
     throw new Error(
@@ -459,19 +476,31 @@ function cmdArtifactClose(cwd, argv) {
   // Idempotent: a second close of an already-certified artifact is a no-op, not
   // an error. Re-running a serialize block must never be punished.
   if (lifecycle.isClosed(artifact)) {
-    return out(`artifact ${id} is already closed (rev ${artifact.closedRev}, by ${artifact.closedBy}) — no change`);
+    return `artifact ${id} is already closed (rev ${artifact.closedRev}, by ${artifact.closedBy}) — no change`;
   }
 
   const owner = strOpt(opts.owner);
   const reason = strOpt(opts.reason);
   const waiveHoles = opts['waive-holes'] === true;
 
-  let events = [];
+  // FAIL CLOSED on a damaged proof record. A malformed line is a dropped event,
+  // and a dropped REVERT reads exactly like no REVERT — so a mangled log used to
+  // make this gate CERTIFY where it should refuse. Absence of evidence is not
+  // evidence of absence when the record itself is known to be short.
+  let read = { events: [], malformed: 0, file: journal.logPath(cwd) };
   try {
-    events = journal.readEvents(cwd);
+    read = journal.readEventsWithHealth(cwd);
   } catch (_e) {
-    events = [];
+    /* unreadable log → no events → the blockers below refuse for want of proof */
   }
+  if (read.malformed) {
+    throw new Error(
+      `cannot close artifact "${id}": proof record damaged — ${read.malformed} unreadable line(s) in ${read.file}. ` +
+        'A dropped event is indistinguishable from no event, so this closure cannot be certified. ' +
+        'Repair or archive the log, then re-run.'
+    );
+  }
+  const events = read.events;
   const blockers = lifecycle.closureBlockers(s, events, artifact, cwd, { waiveHoles, owner, reason });
   if (blockers.length) {
     throw new Error(
@@ -509,21 +538,23 @@ function cmdArtifactClose(cwd, argv) {
     event: 'artifact.closed',
     note: `${id} closed at rev ${fp.rev} on ${bound.id || 'bound proof'}${owner ? ` (owner: ${owner})` : ''}`,
   });
-  state.saveState(cwd, s);
-  return out(`artifact ${id} closed — rev ${fp.rev}, ${fp.hashScope} hash ${String(fp.hash).slice(0, 8)}, proof ${bound.id || '—'}`);
+  return `artifact ${id} closed — rev ${fp.rev}, ${fp.hashScope} hash ${String(fp.hash).slice(0, 8)}, proof ${bound.id || '—'}`;
 }
 
 function cmdLedger(cwd, sub, rest, asJson) {
   switch (sub) {
     case 'create': {
       assertMayWrite('ledger create');
-      const l = ledger.create(cwd);
+      // The ledger is a second file in the same store, so it takes the same lock
+      // — but it is not a state revision, so it never bumps rev.
+      const l = state.withWorkspaceLock(cwd, 'ledger create', () => ledger.create(cwd));
       return out(`ledger ready (${md.dash(l.updatedAt)})`);
     }
     case 'update': {
       assertMayWrite('ledger update');
       const [collection, payloadArg] = rest;
-      const res = ledger.upsert(cwd, collection, readPayload(payloadArg));
+      const payload = readPayload(payloadArg);
+      const res = state.withWorkspaceLock(cwd, 'ledger update', () => ledger.upsert(cwd, collection, payload));
       return out(`${res.action} ${collection}: ${res.item.id}`);
     }
     case undefined:
@@ -560,7 +591,8 @@ function cmdDefect(cwd, argv, asJson) {
 
   switch (sub) {
     case 'add': {
-      const rec = artifacts.addDefect(cwd, readPayload(positionals[2]));
+      const payload = readPayload(positionals[2]);
+      const rec = mutate(cwd, 'defect add', () => artifacts.addDefect(cwd, payload));
       return out(`defect ${rec.state.id} added: [${rec.state.severity}] ${rec.state.summary}`);
     }
     case 'list': {
@@ -580,14 +612,14 @@ function cmdDefect(cwd, argv, asJson) {
       // Proof gate, same spirit as the evolve KEEP gate: a defect cannot be
       // marked fixed without stating the proof that it is actually fixed.
       need(evidence, 'defect resolve requires --evidence "<proof it is actually fixed>" — no proof, no resolve');
-      artifacts.transitionDefect(cwd, id, 'resolved', { evidence, note: `resolved: ${evidence}` });
+      mutate(cwd, 'defect resolve', () => artifacts.transitionDefect(cwd, id, 'resolved', { evidence, note: `resolved: ${evidence}` }));
       return out(`defect ${id} → resolved`);
     }
     case 'reopen': {
       need(id, 'usage: ratchet defect reopen <id> --reason "<why>"');
       const reason = strOpt(opts.reason);
       need(reason, 'defect reopen requires --reason "<why it is not actually fixed>"');
-      artifacts.transitionDefect(cwd, id, 'reopened', { reason, note: `reopened: ${reason}` });
+      mutate(cwd, 'defect reopen', () => artifacts.transitionDefect(cwd, id, 'reopened', { reason, note: `reopened: ${reason}` }));
       return out(`defect ${id} → reopened`);
     }
     case 'waive': {
@@ -596,7 +628,9 @@ function cmdDefect(cwd, argv, asJson) {
       const reason = strOpt(opts.reason);
       need(owner, 'defect waive requires --owner "<who accepts the risk>"');
       need(reason, 'defect waive requires --reason "<why shipping anyway is acceptable>"');
-      artifacts.transitionDefect(cwd, id, 'waived', { owner, reason, note: `waived by ${owner}: ${reason}` });
+      mutate(cwd, 'defect waive', () =>
+        artifacts.transitionDefect(cwd, id, 'waived', { owner, reason, note: `waived by ${owner}: ${reason}` })
+      );
       return out(`defect ${id} → waived (owner: ${owner})`);
     }
     case 'supersede': {
@@ -604,11 +638,13 @@ function cmdDefect(cwd, argv, asJson) {
       const by = strOpt(opts.by);
       need(by, 'defect supersede requires --by <artifact-or-defect-id>');
       const reason = strOpt(opts.reason);
-      artifacts.transitionDefect(cwd, id, 'superseded', {
-        by,
-        reason,
-        note: `superseded by ${by}${reason ? `: ${reason}` : ''}`,
-      });
+      mutate(cwd, 'defect supersede', () =>
+        artifacts.transitionDefect(cwd, id, 'superseded', {
+          by,
+          reason,
+          note: `superseded by ${by}${reason ? `: ${reason}` : ''}`,
+        })
+      );
       return out(`defect ${id} → superseded (by: ${by})`);
     }
     default:
@@ -629,7 +665,7 @@ function cmdRetract(cwd, argv) {
   const reason = strOpt(opts.reason);
   if (!reason) throw new Error("retract requires --reason \"<why this artifact's claim is false or obsolete>\"");
   const supersededBy = strOpt(opts['superseded-by']);
-  artifacts.retractArtifact(cwd, id, { reason, supersededBy });
+  mutate(cwd, 'retract', () => artifacts.retractArtifact(cwd, id, { reason, supersededBy }));
   return out(`artifact ${id} retracted${supersededBy ? ` (superseded by ${supersededBy})` : ''}`);
 }
 
@@ -639,27 +675,38 @@ function cmdRetract(cwd, argv) {
 // loop or a live unknown-map means the fog is already on the record. The loop
 // closes itself when the unknown-map artifact lands (artifacts.js). Returns
 // true only when a fog loop was actually written.
-function recordApertureFog(cwd, result) {
-  if (!result.mapRequired || proposeOnlyAgent()) return false;
-  const s = state.loadState(cwd);
+function fogAlreadyOnRecord(s) {
   const openFog = (s.openLoops || []).some(
     (l) => l.status !== 'closed' && String(l.text || '').startsWith(schemas.FOG_LOOP_PREFIX)
   );
   const liveMap = (s.artifacts || []).some(
     (a) => a.kind === 'unknown-map' && a.status !== 'retracted' && a.status !== 'superseded'
   );
-  if (openFog || liveMap) return false;
-  const now = schemas.nowIso();
-  s.openLoops.push({
-    id: state.makeId('loop'),
-    at: now,
-    text: `${schemas.FOG_LOOP_PREFIX} (aperture ${result.level}, score ${result.score}/10) — run /ratchet:map; closes when the unknown-map artifact lands`,
-    status: 'open',
+  return openFog || liveMap;
+}
+
+function recordApertureFog(cwd, result) {
+  if (!result.mapRequired || proposeOnlyAgent()) return false;
+  // Double-checked on purpose. The common case is "already on the record", and
+  // taking the workspace lock for a read that will write nothing would make an
+  // aperture score queue behind every unrelated writer. The check that DECIDES
+  // runs under the lock, against the state reloaded there.
+  if (fogAlreadyOnRecord(state.loadState(cwd))) return false;
+  let recorded = false;
+  state.withWorkspaceMutation(cwd, { action: 'fog.recorded' }, (s) => {
+    if (fogAlreadyOnRecord(s)) return; // the racer that got here first recorded it
+    const now = schemas.nowIso();
+    s.openLoops.push({
+      id: state.makeId('loop'),
+      at: now,
+      text: `${schemas.FOG_LOOP_PREFIX} (aperture ${result.level}, score ${result.score}/10) — run /ratchet:map; closes when the unknown-map artifact lands`,
+      status: 'open',
+    });
+    s.dirty = true;
+    s.history.push({ id: state.makeId('hist'), at: now, event: 'fog.recorded', note: `aperture ${result.level} raised mapRequired` });
+    recorded = true;
   });
-  s.dirty = true;
-  s.history.push({ id: state.makeId('hist'), at: now, event: 'fog.recorded', note: `aperture ${result.level} raised mapRequired` });
-  state.saveState(cwd, s);
-  return true;
+  return recorded;
 }
 
 function cmdScore(cwd, sub, rest, asJson) {
@@ -682,12 +729,11 @@ function cmdScore(cwd, sub, rest, asJson) {
       // it ships beside the scores so a high number can never read as "done".
       const closure = lifecycle.workflowClosed(s, events, cwd);
       if (asJson) return out(JSON.stringify({ ...layers, closure }, null, 2));
-      // Cache the session score back into state (a write). A propose-only agent
-      // still gets the read — it just leaves no footprint.
-      if (!proposeOnlyAgent()) {
-        s.confidence = layers.session.score;
-        state.saveState(cwd, s);
-      }
+      // No cache write. Until 0.9 the markdown branch wrote the session score
+      // back into state, so the SAME read moved bytes on one output mode and not
+      // the other — a read that revises the record it is reporting on can lose a
+      // concurrent write and can never be trusted as a read. Confidence is
+      // derived on every call; nothing needs it stored.
       return out(md.confidenceLayers(layers, closure));
     }
     case 'aperture': {
@@ -739,10 +785,14 @@ function cmdHook(cwd, sub) {
           /* ignore malformed */
         }
         if (file) {
-          const s = state.loadState(cwd);
-          s.touchedFiles.push({ path: file, at: schemas.nowIso() });
-          s.dirty = true;
-          state.saveState(cwd, s);
+          // A hook fires while the session's own commands are running, so this
+          // is the write most likely to race one. It goes through the boundary
+          // like every other mutation — and, like every other mutation, it is
+          // refused for a propose-only agent (which leaves no footprint at all).
+          mutate(cwd, 'hook post-edit', (s) => {
+            s.touchedFiles.push({ path: file, at: schemas.nowIso() });
+            s.dirty = true;
+          });
         }
         return; // silent, non-blocking
       }
@@ -771,12 +821,20 @@ function cmdHook(cwd, sub) {
       default:
         return;
     }
-  } catch (_e) {
+  } catch (e) {
     // Hooks fail closed: never break the session — but silence here reads as
     // "nothing to do", which is the one thing an unreadable closure state must
     // never imply. Say it cannot be trusted, then exit 0 like every hook.
+    //
+    // A propose-only agent hitting the write guard is NOT an unreadable state,
+    // and reporting it as one sends the reader looking for corruption that is
+    // not there. Name the actual refusal.
     try {
-      err('[ratchet] closure state unreadable — do not claim closed.');
+      if (e && e.code === 'ERATCHETPROPOSEONLY') {
+        err(`[ratchet] ${proposeOnlyAgent()} is propose-only — this hook's edit was not recorded (no footprint by design).`);
+      } else {
+        err('[ratchet] closure state unreadable — do not claim closed.');
+      }
     } catch (_e2) {
       /* nothing left to try */
     }
@@ -790,11 +848,12 @@ function cmdHook(cwd, sub) {
 // current, not that the work is finished.
 function cmdCompileDone(cwd, asJson) {
   const now = schemas.nowIso();
-  const s = state.loadState(cwd);
-  s.lastCompileAt = now;
-  s.dirty = false;
-  s.history.push({ id: state.makeId('hist'), at: now, event: 'compile.done', note: 'state serialized' });
-  state.saveState(cwd, s);
+  const s = mutate(cwd, 'compile done', (st) => {
+    st.lastCompileAt = now;
+    st.dirty = false;
+    st.history.push({ id: state.makeId('hist'), at: now, event: 'compile.done', note: 'state serialized' });
+    return st;
+  });
 
   let events = [];
   try {

@@ -321,24 +321,49 @@ ok('corrupt state.json is backed up, not silently lost', () => {
 
 // --- store integrity (0.8 Closure Gate) -------------------------------------
 
-ok('state carries a monotonic rev that increments on every write and survives load', () => {
-  // Dormant in 0.8: nothing reads it. It exists so a later version can detect a
-  // lost update without a migration — which is only possible if it starts now.
-  state.initProject(cwd, { force: true });
-  const fresh = state.loadState(cwd);
-  assert.strictEqual(fresh.rev, 0, 'a fresh state opens at rev 0');
-  state.saveState(cwd, fresh);
-  assert.strictEqual(state.loadState(cwd).rev, 1, 'the first write is rev 1');
-  const second = state.loadState(cwd);
-  state.saveState(cwd, second);
-  assert.strictEqual(state.loadState(cwd).rev, 2, 'rev increments across writes and survives a reload');
+ok('state carries a monotonic rev that increments on every CHANGE and survives load', () => {
+  // 0.8 wrote this counter and read nothing from it; 0.9 compares against it, so
+  // what counts as an increment tightened. It used to be "every saveState call",
+  // which this test drove with unmodified resaves. A save that would not move the
+  // record is not a write in 0.9 — it costs no revision, because bumping rev
+  // invalidates every proof bound to the current one for nothing. The sequence
+  // below is unchanged; each step now makes a real change to earn its revision,
+  // and the no-op law it used to contradict is asserted at the end.
+  // Its own store, because rev 0 now means "this record has never existed
+  // before" — a force reset CONTINUES the counter (asserted at the end), so
+  // running this against a store the rest of the suite has been resetting all
+  // day would be asserting an accident.
+  const proj = path.join(tmp, 'rev-counter');
+  fs.rmSync(proj, { recursive: true, force: true });
+  state.initProject(proj, { force: true });
+  const fresh = state.loadState(proj);
+  assert.strictEqual(fresh.rev, 0, 'a genuinely new store opens at rev 0');
+  fresh.tags.push('rev-1');
+  state.saveState(proj, fresh);
+  assert.strictEqual(state.loadState(proj).rev, 1, 'the first write is rev 1');
+  const second = state.loadState(proj);
+  second.tags.push('rev-2');
+  state.saveState(proj, second);
+  assert.strictEqual(state.loadState(proj).rev, 2, 'rev increments across writes and survives a reload');
+  // an identical resave is not a write: no revision, no timestamp churn
+  const bytes = fs.readFileSync(state.statePath(proj));
+  state.saveState(proj, state.loadState(proj));
+  assert.strictEqual(state.loadState(proj).rev, 2, 'a save that changes nothing costs no revision');
+  assert.ok(fs.readFileSync(state.statePath(proj)).equals(bytes), 'a save that changes nothing writes no bytes');
+  // A wipe does not restart the count. A pre-reset snapshot would otherwise match
+  // the fresh generation's revision exactly and overwrite it — erasing an
+  // authorized reset with stale work. One ordered truth per store.
+  state.initProject(proj, { force: true, resetBy: 'test', resetReason: 'rev continuity' });
+  assert.strictEqual(state.loadState(proj).rev, 3, 'a reset is one more revision of the same store, not a restart');
   // a legacy (pre-0.8) state file has no rev — it is read as 0, lazily, never migrated
-  const legacy = state.loadState(cwd);
+  const legacy = state.loadState(proj);
   delete legacy.rev;
-  state.writeJson(state.statePath(cwd), legacy);
-  assert.strictEqual(state.loadState(cwd).rev, undefined, 'load does not rewrite a legacy file');
-  state.saveState(cwd, state.loadState(cwd));
-  assert.strictEqual(state.loadState(cwd).rev, 1, 'a missing rev counts as 0, so the next write is 1');
+  state.writeJson(state.statePath(proj), legacy);
+  assert.strictEqual(state.loadState(proj).rev, undefined, 'load does not rewrite a legacy file');
+  const migrating = state.loadState(proj);
+  migrating.tags.push('rev-1-again');
+  state.saveState(proj, migrating);
+  assert.strictEqual(state.loadState(proj).rev, 1, 'a missing rev counts as 0, so the next write is 1');
 });
 
 ok('a corrupt state file is never clobbered when its backup fails', () => {
@@ -580,6 +605,26 @@ ok('cold-start scanner flags retracted steering + unqualified git counts', () =>
   assert.strictEqual(lvl('base-qualified-git'), 'fail');
   assert.strictEqual(lvl('valid-as-of'), 'warn');
   assert.strictEqual(lvl('no-retracted-claims'), 'fail');
+});
+
+ok('cold-start names the residue an interrupted write left in the store', () => {
+  // The 0.9 write path cannot corrupt the record, but it CAN die between the
+  // scratch file and the rename. Silence there reads as "nothing happened",
+  // which is the one thing an interrupted commit must never imply.
+  const proj = path.join(tmp, 'cold-residue');
+  fs.mkdirSync(path.join(proj, '.ratchet'), { recursive: true });
+  state.initProject(proj, { force: true });
+  const clean = coldStart.scan(proj).checks.find((c) => c.name.includes('interrupted-write residue'));
+  assert.strictEqual(clean.level, 'ok', 'a clean store says so');
+
+  fs.writeFileSync(path.join(state.projectDir(proj), 'state.json.tmp-abc-1234'), '{"half":');
+  fs.mkdirSync(path.join(state.projectDir(proj), '.lock'), { recursive: true });
+  const dirty = coldStart.scan(proj).checks.find((c) => c.name.includes('interrupted-write residue'));
+  assert.strictEqual(dirty.level, 'warn', 'residue is named, not hidden');
+  assert.match(dirty.detail, /scratch file/, `the scratch file is named: ${dirty.detail}`);
+  assert.match(dirty.detail, /lock is held/, `the held lock is named: ${dirty.detail}`);
+  assert.strictEqual(coldStart.scan(proj).ok, true, 'residue is not a steering contradiction — it warns, it does not fail');
+  fs.rmSync(path.join(state.projectDir(proj), '.lock'), { recursive: true, force: true });
 });
 
 ok('cold-start scanner is clean on healthy state and flags unimplemented checks transparently', () => {
@@ -918,6 +963,29 @@ ok('the scribe is the sole writer — it may mutate canonical state', () => {
   } finally {
     delete process.env.RATCHET_AGENT;
   }
+});
+
+ok('a propose-only hook says it is propose-only, not that the state is unreadable', () => {
+  // The hook catch-all reports "closure state unreadable — do not claim closed",
+  // which sends the reader looking for corruption. A propose-only agent hitting
+  // the write guard is a refusal by design, and misreporting it as a damaged
+  // record is the more expensive lie of the two.
+  // Spawned, because the hook reads its payload from stdin — the file path is
+  // what makes it attempt a write at all.
+  const { spawnSync } = require('child_process');
+  const proj = path.join(tmp, 'hook-propose-only');
+  fs.rmSync(proj, { recursive: true, force: true });
+  fs.mkdirSync(proj, { recursive: true });
+  const r = spawnSync(process.execPath, [path.resolve(__dirname, '..', 'bin', 'ratchet'), 'hook', 'post-edit'], {
+    cwd: proj,
+    env: { ...process.env, RATCHET_DATA_DIR: path.join(proj, '.data'), RATCHET_AGENT: 'ratchet-builder' },
+    input: JSON.stringify({ tool_input: { file_path: 'README.md' } }),
+    encoding: 'utf8',
+  });
+  const text = String(r.stderr || '');
+  assert.strictEqual(r.status, 0, 'a hook never breaks the session, whatever it hits');
+  assert.ok(/propose-only/.test(text), `the refusal must name itself; got: ${text.trim() || '(silence)'}`);
+  assert.ok(!/closure state unreadable/.test(text), `and must not claim the record is unreadable; got: ${text.trim()}`);
 });
 
 ok('score confidence leaves no write footprint for a propose-only agent', () => {

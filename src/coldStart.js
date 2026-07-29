@@ -136,6 +136,30 @@ function runSurfaceChecks(cwd, file, surface, retracted, add) {
 
 // --- scanner ----------------------------------------------------------------
 
+// Name what an interrupted write left behind. Returns an `add(...)` triple.
+function interruptedWriteResidue(cwd) {
+  let entries = [];
+  try {
+    entries = fs.readdirSync(state.projectDir(cwd));
+  } catch (_e) {
+    return ['store has no interrupted-write residue', 'ok', 'store not created yet'];
+  }
+  const scratch = entries.filter((f) => /\.tmp-/.test(f));
+  const locks = entries.filter((f) => f === '.lock');
+  if (!scratch.length && !locks.length) return ['store has no interrupted-write residue', 'ok'];
+  const parts = [];
+  if (scratch.length) {
+    parts.push(
+      `${scratch.length} unrenamed scratch file(s) (${scratch.slice(0, 2).join(', ')}) — a commit died before its rename; ` +
+        'the record itself is intact, the scratch is safe to delete'
+    );
+  }
+  if (locks.length) {
+    parts.push('a lock is held — either a write is in flight right now, or the process holding it died (the next writer recovers it by age + liveness)');
+  }
+  return ['store has no interrupted-write residue', 'warn', parts.join('; ')];
+}
+
 function scan(cwd = process.cwd()) {
   const checks = [];
   const add = (name, level, detail) => checks.push({ name, level, detail: detail || '' });
@@ -211,6 +235,13 @@ function scan(cwd = process.cwd()) {
   } else {
     add('active defects have live premises', 'ok');
   }
+
+  // A write that died leaves evidence in the store: the scratch file it never
+  // renamed over the record, or the lock it never released. Neither is a
+  // contradiction in the steering, so neither fails the scan — but a cold
+  // session that opens on somebody's interrupted write should be TOLD, not left
+  // to wonder why the record looks a revision behind.
+  add(...interruptedWriteResidue(cwd));
 
   // Opt-in project-surface checks (adapter) ----------------------------------
   const config = loadConfig(cwd);
