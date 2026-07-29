@@ -18,7 +18,10 @@ multi-process races, run on `process.execPath` with sentinel-file barriers so th
 interleavings are the operating system's, not a simulation. Traced by: claude-opus-5.
 
 - **One shared mutation primitive.** `state.withWorkspaceMutation(cwd, { expectedStateRev,
-  action }, mutate)` is now the only door onto a state revision: resolve the store →
+  action }, mutate)` is the only door onto a state REVISION — the wipe and the corrupt-record
+  repair publish outside it, deliberately (they replace a record rather than revising one), and
+  both hold the workspace lock and pass the same publish-time ownership fence. "Only door" is
+  scoped to revisions, not to every byte that reaches the store: resolve the store →
   acquire the cross-process lock → **reload the state under the lock** → compare
   `expectedStateRev` when supplied → apply → commit **exactly one revision** → release in
   a `finally` on every path. CLI-enforced. `expectedStateRev` is optional (the CLI does not
@@ -60,27 +63,43 @@ interleavings are the operating system's, not a simulation. Traced by: claude-op
   and action, the age, and the remedy (delete the `.lock` directory once you have confirmed the
   process is not a ratchet writer).
 
-  **Release removes our holding or nothing.** The card carries a per-acquisition random
-  **token**; a blind `rmdir` is how a process whose lock was broken as stale deletes its
-  *successor's* live lock on the way out. The token is checked first, and a mismatch is left
-  alone and reported loudly. A removal that fails is **neutralized** (renamed aside with the
-  same atomic primitive) rather than shrugged off — a `.lock` nobody owns and nobody can delete
-  blocks every future writer until the timeout.
+  **Release removes our holding or nothing, and it verifies by MOVING.** The card carries a
+  per-acquisition random **token**; a blind `rmdir` is how a process whose lock was broken as
+  stale deletes its *successor's* live lock on the way out. Checking the card and *then* deleting
+  the directory was still two steps, so a successor that acquired in between was deleted by a
+  process that had already "checked" — release now renames the directory aside first (atomic:
+  after it, what we hold is ours alone to inspect and nobody else can be inside it), verifies the
+  moved card is ours, and only then deletes. A mismatch is restored if the slot is free and named
+  as an incident otherwise. Where the rename cannot be done at all (Windows refuses to move a
+  directory another process has open; the retries are bounded) it falls back to the older
+  verify-in-place delete rather than wedge every future writer — that fallback carries the
+  original TOCTOU and is named here rather than hidden.
   **The break verifies what it moved, whatever shape the card is.** The decision reads one owner
   and the rename moves whatever occupies `.lock` at that instant, which may already be a new
   live generation (ABA). After the rename the moved card is compared against the owner that was
   judged stale — by token where there is one, and **by whole-card bytes where there is not**,
   because a verification that only runs for tokenized cards is not a verification: a tokenless
-  judgment used to skip it entirely and could carry off a live successor. On a mismatch the
-  holding is put back if the slot is still free, and otherwise named as an incident on stderr
-  rather than destroyed.
+  judgment used to skip it entirely and could carry off a live successor. An **unreadable** card
+  now matches nothing at all, including another unreadable one: mapping every read failure to an
+  empty string made two unrelated invisible holdings compare equal. (A provably ABSENT card is a
+  different fact and two absences do compare equal — otherwise a lock whose owner died between
+  `mkdir` and the card write would be permanently unbreakable. That narrowing is deliberate and
+  the residual window is covered by the publish-time fence.) On a mismatch the holding is put back
+  if the slot is still free, and if it cannot be put back the acquisition **fails stop**: the call
+  that stranded a holding it could not verify does not go on to take the lock it freed
+  (`ERATCHETLOCKINCIDENT`). A later command may retry; that one is over.
 
-  **And every commit re-verifies ownership before it publishes.** The residual windows above —
-  a break that stranded a live holding, an ABA steal, a writer that ignored the lock — all end
-  in the same state: two processes each believing they hold one lock. Re-reading the owner card
-  in the instant before the canonical write turns every one of them into a **loser-side refusal
-  that writes nothing** (`ERATCHETLOCKLOST`) instead of a silent double write. That is what
-  shrinks the remaining protocol races from data-loss hazards to logged incidents.
+  **And every publish re-verifies ownership in the instant before it lands.** The residual
+  windows above — a break that stranded a live holding, an ABA steal — all end in the same state:
+  two processes each believing they hold one lock. The check sits inside the atomic writer,
+  between "the new bytes are on disk" and "the new bytes ARE the record", because a check any
+  earlier leaves the whole write-flush-close window unguarded and the rename publishes anyway. It
+  applies to **every** canonical publish under a lock — the state commit, the wipe, the
+  corrupt-record repair, the ledger, and the create-or-fail link — by living in `writeJson`
+  rather than at each call site, since three of those five had already forgotten it. A holding
+  that is no longer ours turns the publish into a **loser-side refusal that writes nothing**
+  (`ERATCHETLOCKLOST`). That is what shrinks the remaining protocol races from data-loss hazards
+  to logged incidents.
 - **Reentrancy is decided, not discovered.** A nested `withWorkspaceMutation` is refused
   loudly (never a silent self-deadlock); a nested lock scope on the *same* workspace joins
   the open one; a second *different* workspace is refused.
@@ -104,7 +123,9 @@ interleavings are the operating system's, not a simulation. Traced by: claude-op
   that bypass the lock, which no advisory lock can stop anyway.
 - **A malformed record is repaired, once, under the lock.** The corrupt-bytes backup is a WRITE
   and used to happen before the lock, in a read. Backup and repair now both run inside the
-  workspace lock, and the unusable file is REPLACED (its bytes are already preserved) instead of
+  workspace lock, and the unusable file is REPLACED (its bytes are already preserved — including
+  documents that PARSE but are not records: `null`, `false`, `0`, `""`, `[]` were replaced with no
+  backup at all, because the repair tested truthiness rather than shape) instead of
   being refused as "already exists" — which had left the bad file in place forever, so every
   future read backed it up again and the store could never be opened.
 - **A CAS refusal on an absent store leaves the store absent.** Naming `expectedStateRev`
@@ -122,10 +143,12 @@ interleavings are the operating system's, not a simulation. Traced by: claude-op
   artifact's revision and hash was checked before any lock, then (cycle 1) under the journal
   lock — which excluded the wrong processes: the writers that can move an artifact from rev 1 to
   rev 2 take the *workspace* lock and never touch the journal. A bound append now holds the
-  workspace lock and then the journal lock, and validates inside both. Unbound events bind to
-  nothing and keep the journal lock alone. (The store is materialized before either lock,
-  deliberately: that read can create the store, which takes the workspace lock, and the order
-  rule forbids acquiring it from inside a file lock.)
+  workspace lock and then the journal lock, and validates inside both — and the state read that
+  materializes the store happens INSIDE the workspace lock, where it simply joins the open scope.
+  **Unbound events take the journal lock ALONE**, which is now true rather than merely claimed:
+  the state read was unconditional, and on a fresh store that read IS the locked init transition,
+  so an unbound append queued behind (and on a busy store died on) a workspace lock it never
+  needed. An unbound event reads nothing from state, so it no longer touches it.
 - **A half-written journal line no longer eats the next event, and a damaged log cannot certify
   a closure.** An append that died mid-line left the file not ending in a newline, and the
   following append concatenated itself onto the fragment — one unreadable line where there
@@ -171,11 +194,21 @@ interleavings are the operating system's, not a simulation. Traced by: claude-op
   its pre-reset record straight over the fresh one — erasing an authorized wipe with a stale
   snapshot. A reset now commits as one more revision of the same store; a genuinely new store
   still opens at rev 0. Paired with a second rule, because rev arithmetic alone was not enough:
-  **a rebase is only valid within one generation of the record.** `createdAt` names the
-  generation, and a delta computed against a previous one is refused (`ERATCHETSTALE`) rather than
-  merged — otherwise the merge cheerfully replayed the pre-reset objective onto the new record,
-  which is the same resurrection by a different route. The 0.8 assertion "a fresh state opens at
-  rev 0" after a force reset was moved to its own store, where rev 0 still means what it says.
+  **a rebase is only valid within one generation of the record.** A delta computed against a
+  previous generation is refused (`ERATCHETSTALE`) rather than merged — otherwise the merge
+  cheerfully replayed the pre-reset objective onto the new record, which is the same resurrection
+  by a different route. The 0.8 assertion "a fresh state opens at rev 0" after a force reset was
+  moved to its own store, where rev 0 still means what it says.
+
+  The generation is a new state field, `gen`, minted from **CSPRNG entropy** at every creation and
+  every wipe — deliberately *not* a timestamp. It was `createdAt` for one cycle and that was a
+  hole: `createdAt` comes from `nowIso`, which honours `RATCHET_NOW`, so under a frozen clock — a
+  supported mode, used by hooks and by deterministic tests — both generations stamped identically,
+  the check compared equal, and the wiped objective came back. Generation identity follows the
+  lock owner card's precedent: identity that a supported configuration can make collide is not
+  identity. A record written before `gen` existed has none, and two such records compare equal —
+  the pre-0.9 boundary, named rather than papered over. *(The `gen` field completes the ratified
+  reset ruling and ships under the same authority grant.)*
 - **Every branch of `score confidence` is a pure derived read** *(on an initialized store)*. The
   markdown branch used to
   cache the session score back into state, so the *same* read moved bytes on one output mode
@@ -254,9 +287,11 @@ The boundaries the reviews of this gate named explicitly:
 
 - **Hard-linked journal aliases are not covered.** A file lock is keyed by path, and the path is
   resolved with `realpath` — which now resolves the FILE, so a symlinked log and its target share
-  one lock (they did not in the first cut). Two hard links to one inode are still two paths, so
-  they are still two locks: keying a lock by inode is not buildable dependency-free. Parked,
-  owner Danny.
+  one lock (they did not in the first cut). A **dangling** symlink is resolved by following the
+  link by hand, because `realpath` fails on one and falling back to the link's own name changed
+  the lock identity the moment the target appeared — one file, two keys, both held. Two hard links
+  to one inode are still two paths, so they are still two locks: keying a lock by inode is not
+  buildable dependency-free. Parked, owner Danny.
 - **Windows path casing is not normalized by the file lock.** `realpath` returns the spelling it
   was given on Windows, so `LOG.jsonl` and `log.jsonl` are two lock keys for one file. (The
   workspace store is unaffected — its slug is case-normalized by a `readdir` walk, which is why

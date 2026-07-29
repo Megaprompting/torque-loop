@@ -1656,6 +1656,369 @@ ok('N8 backing up a corrupt record happens under the workspace lock', () => {
   assert.strictEqual(backups[0], true, 'and the backup — a write — must happen under the workspace lock');
 });
 
+// ===========================================================================
+// Round 3 — the final verification cycle. Whatever is still red after this ships
+// as a NAMED DEFECT rather than a fourth attempt.
+// Traced by: claude-opus-5
+// ===========================================================================
+
+// Freeze the record clock the way a hook or a deterministic test does. This is a
+// SUPPORTED mode, so nothing may depend on wall-clock uniqueness underneath it.
+function withFrozenClock(iso, fn) {
+  const prev = process.env.RATCHET_NOW;
+  process.env.RATCHET_NOW = iso;
+  try {
+    return fn();
+  } finally {
+    if (prev === undefined) delete process.env.RATCHET_NOW;
+    else process.env.RATCHET_NOW = prev;
+  }
+}
+
+// --- R1: a generation cannot be identified by a timestamp -------------------
+
+ok('R1 a reset under a frozen clock is still a new generation', () => {
+  const proj = freshProject('r1');
+  withFrozenClock('2026-07-29T00:00:00.000Z', () => {
+    // The generation was named by createdAt. Under a frozen clock the reset
+    // stamps the SAME createdAt, so the pre-reset snapshot compares equal, the
+    // rebase proceeds, and the objective somebody deliberately wiped comes back.
+    // Identity has to come from entropy, exactly like the lock's owner token.
+    //
+    // The store is (re)created INSIDE the frozen window on purpose: both
+    // generations have to carry the same stamp for the collapse to be reachable.
+    state.initProject(proj, { force: true });
+    const snapshot = state.loadState(proj);
+    const s = state.loadState(proj);
+    s.objective = 'pre-reset work';
+    state.saveState(proj, s);
+    state.initProject(proj, { force: true, resetBy: 'danny', resetReason: 'new run' });
+
+    snapshot.objective = 'resurrected under a frozen clock';
+    let refusal = null;
+    try {
+      state.saveState(proj, snapshot);
+    } catch (e) {
+      refusal = e;
+    }
+    const final = state.loadState(proj);
+    assert.ok(refusal, `a previous generation must be refused even when both stamps read alike — objective is ${JSON.stringify(final.objective)}`);
+    assert.strictEqual(refusal.code, 'ERATCHETSTALE', `coded stale; got ${refusal.code}: ${refusal.message}`);
+    assert.strictEqual(final.objective, '', 'the authorized wipe survives');
+  });
+});
+
+ok('R1 the generation is entropy, not a clock reading', () => {
+  const a = freshProject('r1-gen-a');
+  const b = freshProject('r1-gen-b');
+  withFrozenClock('2026-07-29T00:00:00.000Z', () => {
+    state.initProject(a, { force: true });
+    state.initProject(b, { force: true });
+    const ga = state.loadState(a).gen;
+    const gb = state.loadState(b).gen;
+    assert.ok(ga && gb, `every generation must be named; got ${JSON.stringify(ga)} / ${JSON.stringify(gb)}`);
+    assert.notStrictEqual(ga, gb, 'two records created in the same frozen instant are still two generations');
+    state.initProject(a, { force: true });
+    assert.notStrictEqual(state.loadState(a).gen, ga, 'and a reset is a new generation of the same store');
+  });
+});
+
+// --- R2: an identity nobody can read equals nothing -------------------------
+
+ok('R2 two unreadable owner cards are not the same holding', () => {
+  const proj = freshProject('r2');
+  const lockDir = workspaceLockDir(proj);
+  plantLock(lockDir, { pid: deadPid(), ageMs: 600000, token: 'unreadableA' });
+  // Age the DIRECTORY too: with the card unreadable, age falls back to mtime, and
+  // a fresh directory would never reach hard-stale.
+  const old = new Date(Date.now() - 600000);
+  fs.utimesSync(lockDir, old, old);
+
+  // Every read failure was mapped to raw:'' — so two DIFFERENT holdings nobody
+  // can read compared equal, and the break carried off a live successor while
+  // believing it had verified it.
+  // Keyed on the lock path itself: a guess about how the store slug is spelled
+  // would make the injection silently not fire, and a falsifier that does not
+  // fire is a green light for the defect it was written to catch.
+  const realReadFile = fs.readFileSync;
+  fs.readFileSync = function (file, ...rest) {
+    if (String(file).startsWith(lockDir) && String(file).endsWith('owner.json')) {
+      throw Object.assign(new Error('EACCES: simulated unreadable owner card'), { code: 'EACCES' });
+    }
+    return realReadFile.call(fs, file, ...rest);
+  };
+  const realRename = fs.renameSync;
+  let swapped = false;
+  fs.renameSync = function (from, to) {
+    if (!swapped && String(from) === lockDir) {
+      swapped = true;
+      realRename.call(fs, from, `${lockDir}.decoy`);
+      fs.mkdirSync(lockDir, { recursive: true });
+      // The successor's card is unreadable too — that is the whole point: two
+      // DIFFERENT holdings, neither of them verifiable.
+      fs.writeFileSync(path.join(lockDir, 'owner.json'), JSON.stringify({ token: 'liveSuccessor' }), 'utf8');
+    }
+    return realRename.call(fs, from, to);
+  };
+  let refusal = null;
+  try {
+    state.withWorkspaceLock(proj, 'breaker', () => {});
+  } catch (e) {
+    refusal = e;
+  } finally {
+    fs.readFileSync = realReadFile;
+    fs.renameSync = realRename;
+  }
+
+  assert.ok(swapped, 'the injection must fire');
+  assert.ok(fs.existsSync(lockDir), 'an unverifiable identity must never be treated as a match — the successor survives');
+  assert.ok(refusal, 'and the breaker must be refused rather than holding a lock it stole');
+  fs.rmSync(lockDir, { recursive: true, force: true });
+  fs.rmSync(`${lockDir}.decoy`, { recursive: true, force: true });
+});
+
+// --- R3: the fence sits on the rename, and on every publisher ---------------
+
+ok('R3 the ownership fence guards the rename itself, not the write before it', () => {
+  const proj = freshProject('r3-fence');
+  const s0 = state.loadState(proj);
+  s0.objective = 'the record before';
+  state.saveState(proj, s0);
+  const before = stateBytes(proj);
+  const lockDir = workspaceLockDir(proj);
+
+  // The fence ran before the scratch write, which leaves the whole
+  // write-flush-close window unguarded: a successor that appears in there is
+  // invisible and the rename publishes anyway. fsync is the last step before the
+  // swap, so a theft injected there is exactly the case the early fence misses.
+  const realFsync = fs.fsyncSync;
+  let stolen = false;
+  fs.fsyncSync = function (fd) {
+    if (!stolen) {
+      stolen = true;
+      fs.writeFileSync(
+        path.join(lockDir, 'owner.json'),
+        JSON.stringify({ token: 'thief', pid: process.pid, host: os.hostname(), at: new Date().toISOString(), action: 'thief' }),
+        'utf8'
+      );
+    }
+    return realFsync.call(fs, fd);
+  };
+  let refusal = null;
+  try {
+    state.withWorkspaceMutation(proj, { action: 'r3' }, (s) => {
+      s.objective = 'must never land';
+    });
+  } catch (e) {
+    refusal = e;
+  } finally {
+    fs.fsyncSync = realFsync;
+  }
+  assert.ok(stolen, 'the injection must fire');
+  assert.ok(refusal, 'a publish must re-verify ownership at the rename, not before the scratch write');
+  assert.strictEqual(refusal.code, 'ERATCHETLOCKLOST', `coded lock-lost; got ${refusal.code}: ${refusal.message}`);
+  assert.ok(stateBytes(proj).equals(before), 'and must publish zero bytes');
+  fs.rmSync(lockDir, { recursive: true, force: true });
+});
+
+ok('R3 reset and ledger publishes are fenced too, not just the state commit', () => {
+  const proj = freshProject('r3-publishers');
+  const s0 = state.loadState(proj);
+  s0.objective = 'the record before';
+  state.saveState(proj, s0);
+  const before = stateBytes(proj);
+  const lockDir = workspaceLockDir(proj);
+  const steal = () =>
+    fs.writeFileSync(
+      path.join(lockDir, 'owner.json'),
+      JSON.stringify({ token: 'thief', pid: process.pid, host: os.hostname(), at: new Date().toISOString(), action: 'thief' }),
+      'utf8'
+    );
+
+  // A fence on one publisher is not a fence. The wipe and the ledger write are
+  // canonical publishes too, and both skipped it entirely.
+  let resetRefusal = null;
+  state.withWorkspaceLock(proj, 'holder', () => {
+    steal();
+    try {
+      state.initProject(proj, { force: true });
+    } catch (e) {
+      resetRefusal = e;
+    }
+  });
+  assert.ok(resetRefusal, 'a reset must not publish over a lock it no longer holds');
+  assert.strictEqual(resetRefusal.code, 'ERATCHETLOCKLOST', `coded lock-lost; got ${resetRefusal.code}`);
+  assert.ok(stateBytes(proj).equals(before), 'and the record must be untouched');
+  // The thief's card is still in the slot — our release correctly refused to
+  // remove somebody else's holding. Clear it so the next phase can take the lock.
+  fs.rmSync(lockDir, { recursive: true, force: true });
+
+  const ledger = state.loadLedger(proj);
+  const ledgerBytes = fs.readFileSync(state.ledgerPath(proj));
+  let ledgerRefusal = null;
+  state.withWorkspaceLock(proj, 'holder', () => {
+    steal();
+    try {
+      ledger.features.push({ id: 'f-stolen', name: 'published past a lost lock' });
+      state.saveLedger(proj, ledger);
+    } catch (e) {
+      ledgerRefusal = e;
+    }
+  });
+  assert.ok(ledgerRefusal, 'a ledger publish must be fenced as well');
+  assert.strictEqual(ledgerRefusal.code, 'ERATCHETLOCKLOST', `coded lock-lost; got ${ledgerRefusal.code}`);
+  assert.ok(fs.readFileSync(state.ledgerPath(proj)).equals(ledgerBytes), 'and the ledger must be untouched');
+  fs.rmSync(lockDir, { recursive: true, force: true });
+});
+
+ok('R3 release verifies by moving, so a successor cannot be deleted by us', () => {
+  const proj = freshProject('r3-release');
+  const lockDir = workspaceLockDir(proj);
+  // Release read the owner card and THEN deleted the directory: two steps, and a
+  // successor that acquires in between is deleted by a process that already
+  // checked. Verify by moving — after an atomic rename, what we hold is ours to
+  // inspect and nobody else can be inside it.
+  const realRm = fs.rmSync;
+  let planted = false;
+  fs.rmSync = function (target, ...rest) {
+    if (!planted && String(target).startsWith(lockDir)) {
+      planted = true;
+      plantLock(lockDir, { ageMs: 0, token: 'successorAfterCheck', action: 'legitimate successor' });
+    }
+    return realRm.call(fs, target, ...rest);
+  };
+  try {
+    state.withWorkspaceLock(proj, 'overrunner', () => {});
+  } finally {
+    fs.rmSync = realRm;
+  }
+  assert.ok(planted, 'the injection must fire');
+  assert.ok(fs.existsSync(lockDir), "a successor that acquired after our check must survive our release");
+  assert.strictEqual(readToken(lockDir), 'successorAfterCheck', 'and must still be the successor holding');
+  fs.rmSync(lockDir, { recursive: true, force: true });
+});
+
+// --- R4: a break that cannot be undone is fail-stop -------------------------
+
+ok('R4 a failed restore refuses the acquisition instead of profiting from it', () => {
+  const proj = freshProject('r4');
+  const lockDir = workspaceLockDir(proj);
+  plantLock(lockDir, { pid: deadPid(), ageMs: 600000, token: 'judgedStale' });
+
+  // The break moves a live successor by mistake AND cannot put it back. Returning
+  // "did not break" then let the retry loop find the slot empty and take it — the
+  // same invocation that stranded somebody else's holding walked away with the
+  // lock. A call that broke something it could not verify must not profit from it.
+  const realRename = fs.renameSync;
+  let phase = 0;
+  fs.renameSync = function (from, to) {
+    if (phase === 0 && String(from) === lockDir) {
+      phase = 1;
+      realRename.call(fs, from, `${lockDir}.decoy`);
+      plantLock(lockDir, { ageMs: 0, token: 'liveSuccessor', action: 'fresh holding' });
+      return realRename.call(fs, lockDir, to); // the break carries off the SUCCESSOR
+    }
+    if (phase === 1 && String(to) === lockDir) {
+      phase = 2;
+      throw Object.assign(new Error('EPERM: restore blocked'), { code: 'EPERM' });
+    }
+    return realRename.call(fs, from, to);
+  };
+  let refusal = null;
+  let entered = false;
+  try {
+    state.withWorkspaceLock(proj, 'breaker', () => {
+      entered = true;
+    });
+  } catch (e) {
+    refusal = e;
+  } finally {
+    fs.renameSync = realRename;
+  }
+  assert.strictEqual(phase, 2, 'both injections must fire');
+  assert.strictEqual(entered, false, 'the caller must never get the lock it failed to restore');
+  assert.ok(refusal, 'the acquisition must be refused');
+  assert.match(refusal.message, /could not (be )?restore|stranded|incident/i, `the refusal must name the incident; got: ${refusal.message}`);
+  fs.rmSync(lockDir, { recursive: true, force: true });
+  fs.rmSync(`${lockDir}.decoy`, { recursive: true, force: true });
+});
+
+// --- R5: a dangling symlink is still one file -------------------------------
+
+ok('R5 a symlink locks the same file before and after its target exists', () => {
+  const proj = freshProject('r5');
+  const real = path.join(proj, 'r5-real.jsonl');
+  const alias = path.join(proj, 'r5-alias.jsonl');
+  let linked = true;
+  try {
+    fs.symlinkSync(real, alias, 'file'); // target deliberately absent
+  } catch (_e) {
+    linked = false;
+  }
+  assert.ok(linked, 'this platform must allow file symlinks for this falsifier to mean anything');
+
+  // realpath fails on a dangling link, so the key fell back to the alias name —
+  // and the moment the target appeared the same file was locked under a different
+  // key. Two locks over one file, held at once, each believing it is exclusive.
+  const res = state.withFileLock(alias, 'holding the dangling alias', () => {
+    fs.writeFileSync(real, '', 'utf8'); // the target appears mid-hold
+    return childRun(
+      proj,
+      `  const journal = require(path.join(SRC, 'evolve', 'journal.js'));
+  journal.appendEvent(process.cwd(), { target: 'r5', verdict: 'ASK' });
+  out.extra = 'appended through the real path';`,
+      { RATCHET_EVOLVE_LOG: real, RATCHET_LOCK_TIMEOUT_MS: '600', RATCHET_LOCK_STALE_MS: '600000' }
+    );
+  });
+  assert.notStrictEqual(res.extra, 'appended through the real path', `one file is one lock — child: ${JSON.stringify(res)}`);
+  assert.ok(/could not acquire/i.test(String(res.error)), `and the refusal must be the lock; child said: ${res.error}`);
+});
+
+// --- R6: valid-but-unusable bytes are still bytes ---------------------------
+
+ok('R6 a record replaced because it is unusable is backed up first', () => {
+  for (const bad of ['null\n', '0\n', '""\n']) {
+    const proj = freshProject(`r6-${bad.trim().replace(/[^a-z0-9]/gi, '') || 'empty'}`);
+    fs.writeFileSync(state.statePath(proj), bad, 'utf8');
+    // These PARSE. The repair path tested truthiness, so a syntactically valid
+    // falsey document counted as "no record at all" and was replaced with no
+    // backup — the one thing the store's whole promise forbids.
+    state.loadState(proj);
+    const backups = fs.readdirSync(state.projectDir(proj)).filter((f) => f.includes('.corrupt.'));
+    assert.strictEqual(backups.length, 1, `${JSON.stringify(bad)} must be preserved before replacement; found ${backups.length} backup(s)`);
+    assert.strictEqual(
+      fs.readFileSync(path.join(state.projectDir(proj), backups[0]), 'utf8'),
+      bad,
+      'and the backup must hold the original bytes'
+    );
+    assert.strictEqual(state.loadState(proj).rev, 0, 'and the store opens clean afterwards');
+  }
+});
+
+// --- R7: an unbound append needs one lock, not two -------------------------
+
+ok('R7 an unbound append does not queue behind the workspace lock', () => {
+  const proj = fs.mkdtempSync(path.join(os.tmpdir(), 'ratchet-r7-'));
+  projects.push(proj);
+  const log = path.join(proj, 'r7-log.jsonl');
+  // No store yet, and the workspace lock is held. An unbound event binds to
+  // nothing in state, so it has no business waiting on the workspace — but it
+  // read state unconditionally, which on a fresh store IS the locked init
+  // transition, so it queued and died on a lock it never needed.
+  const res = state.withWorkspaceLock(proj, 'holding the store', () =>
+    childRun(
+      proj,
+      `  const journal = require(path.join(SRC, 'evolve', 'journal.js'));
+  const e = journal.appendEvent(process.cwd(), { target: 'r7', verdict: 'ASK' });
+  out.extra = e.id;`,
+      { RATCHET_EVOLVE_LOG: log, RATCHET_LOCK_TIMEOUT_MS: '900', RATCHET_LOCK_STALE_MS: '600000' }
+    )
+  );
+  assert.strictEqual(res.error, null, `an unbound append must not need the workspace lock — child said: ${res.error}`);
+  assert.ok(res.extra, 'and must actually append');
+  assert.strictEqual(fs.readFileSync(log, 'utf8').split('\n').filter((l) => l.length).length, 1, 'exactly one event on the log');
+});
+
 fs.rmSync(tmp, { recursive: true, force: true });
 for (const p of projects) fs.rmSync(p, { recursive: true, force: true });
 process.stdout.write(`\n${passed} passed, ${failures.length} failed\n`);
