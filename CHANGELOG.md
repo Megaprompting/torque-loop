@@ -190,6 +190,25 @@ proven red before its fix; all are CLI-enforced unless marked.
   evidence of which revision it attacked. It is now kept and detached loudly
   (`attachedBy:'error'` + `attachError`).
 
+A second review pass closed four residuals in the fixes themselves:
+
+- **Path casing comes from the filesystem, not the caller.** Deriving the legacy Windows
+  slug from the caller's spelling meant a caller who typed the path in lowercase produced
+  `normalized === legacy`, the migration check short-circuited, and the mixed-case store
+  stranded *permanently* — no later call could recover a casing nobody supplied. Both slugs
+  now derive from `fs.realpathSync.native(cwd)`, which makes the caller's spelling
+  irrelevant and the short-circuit case vanish.
+- **`source` is refused if mentioned at all** on a bound event. Refusing only a *different*
+  value let the forgery that matters — the right-looking `source:"evolve"` — through.
+- **A scalar `holes` value is a real hole.** Canonicalization made `holes:"TODO"` compare
+  equal to `["TODO"]`, so the repair no-opped and the scalar survived in the store, where
+  every `Array.isArray` guard read it as ZERO holes and the artifact closed over an
+  invisible hole. Only an *absent* value is equivalent to `[]`; a present non-array value is
+  persisted as a real revision, and `closureBlockers` normalizes defensively.
+- **Clearing a lineage link is a revision.** An explicit `revises:""` was dropped from the
+  canonical patch and the old link survived. Absent (leave alone) and explicitly-empty
+  (retract the claim) are now distinct intents.
+
 ### Trust boundary
 
 The proof binding is **machine-authored but forgeable by filesystem writers**. It stops in-band laundering by
