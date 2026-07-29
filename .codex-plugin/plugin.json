@@ -4,10 +4,10 @@
   "description": "Torque Loop evolves ambiguous work into shipped, tested, serialized artifacts through evidence-gated loops.",
   "author": {
     "name": "Danny Gillespie",
-    "url": "https://github.com/TheLucidTech"
+    "url": "https://github.com/Megaprompting"
   },
-  "homepage": "https://github.com/TheLucidTech/torque-loop",
-  "repository": "https://github.com/TheLucidTech/torque-loop",
+  "homepage": "https://github.com/Megaprompting/torque-loop",
+  "repository": "https://github.com/Megaprompting/torque-loop",
   "license": "MIT",
   "keywords": [
     "workflow",
@@ -35,7 +35,7 @@
       "Run an evidence-gated evolve pass on this file.",
       "Attack this plan and patch only what fails."
     ],
-    "websiteURL": "https://github.com/TheLucidTech/torque-loop",
+    "websiteURL": "https://github.com/Megaprompting/torque-loop",
     "brandColor": "#111827"
   }
 }

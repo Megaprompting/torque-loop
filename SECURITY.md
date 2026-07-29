@@ -17,7 +17,7 @@ Report privately through GitHub's confidential channel:
 
 1. Go to the repository's **Security** tab.
 2. Click **Report a vulnerability** (or use
-   [this link](https://github.com/TheLucidTech/torque-loop/security/advisories/new)).
+   [this link](https://github.com/Megaprompting/torque-loop/security/advisories/new)).
 3. Describe the issue with enough detail to reproduce it.
 
 You should get an acknowledgement within a few days. We'll confirm the issue, work on a fix,

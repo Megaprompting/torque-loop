@@ -52,7 +52,7 @@ account, or acting as an appointed representative at an online or offline event.
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be reported to the
 community leaders responsible for enforcement privately through GitHub — open a
-[private security advisory](https://github.com/TheLucidTech/torque-loop/security/advisories/new)
+[private security advisory](https://github.com/Megaprompting/torque-loop/security/advisories/new)
 (which supports confidential reports to the maintainers) or contact a maintainer directly.
 All complaints will be reviewed and investigated promptly and fairly.
 
