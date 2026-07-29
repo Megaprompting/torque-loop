@@ -2019,8 +2019,20 @@ ok('R7 an unbound append does not queue behind the workspace lock', () => {
   assert.strictEqual(fs.readFileSync(log, 'utf8').split('\n').filter((l) => l.length).length, 1, 'exactly one event on the log');
 });
 
-fs.rmSync(tmp, { recursive: true, force: true });
-for (const p of projects) fs.rmSync(p, { recursive: true, force: true });
+// Teardown cannot be allowed to fail a green run. On Windows a just-exited
+// child's directory handle can outlive the process for a beat, so a plain
+// recursive rm throws ENOTEMPTY on Node 18/20 (Node 22 retries internally).
+// Retry, then name the leaked temp dir instead of crashing — it lives under
+// os.tmpdir(), the OS owns its eventual death.
+function rmTempTree(p) {
+  try {
+    fs.rmSync(p, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  } catch (e) {
+    process.stdout.write(`  warn  teardown left ${p} behind (${e.code || e.message})\n`);
+  }
+}
+rmTempTree(tmp);
+for (const p of projects) rmTempTree(p);
 process.stdout.write(`\n${passed} passed, ${failures.length} failed\n`);
 if (failures.length) {
   process.stdout.write(`RED (expected until the concurrency gate ships): ${failures.map((f) => f.name).join(', ')}\n`);
