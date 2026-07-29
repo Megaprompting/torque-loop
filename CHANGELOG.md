@@ -47,23 +47,40 @@ interleavings are the operating system's, not a simulation. Traced by: claude-op
   adds a second writer to the record it still has open, so a wedged live holder produces a
   perpetual named refusal instead. An honest refusal beats a stolen lock.
   `RATCHET_LOCK_HARD_STALE_MS` (120s) therefore applies **only where liveness cannot be
-  established at all**: a dead pid, a foreign host, or an owner card nobody can read. Under
-  `RATCHET_LOCK_STALE_MS` (5s) nothing is broken regardless. `process.kill(pid, 0)` is never
-  trusted alone either — pids are recycled — so the card carries a per-acquisition random
-  **token**, and both release and stale-break compare it.
+  established at all**: a dead pid, a foreign host, an unreadable owner card, or a card whose
+  timestamp is in the future (an unbelievable clock makes the holding unprovable, not sacred —
+  age used to clamp to 0 there, which turned one bad timestamp into a permanently unbreakable
+  lock). Under `RATCHET_LOCK_STALE_MS` (5s) nothing is broken regardless.
 
-  **Release removes our holding or nothing.** A blind `rmdir` is how a process whose lock was
-  broken as stale deletes its *successor's* live lock on the way out; the token is checked
-  first, and a mismatch is left alone and reported loudly. A removal that fails is
-  **neutralized** (renamed aside with the same atomic primitive) rather than shrugged off — a
-  `.lock` nobody owns and nobody can delete blocks every future writer until the timeout.
-  **The break verifies what it moved.** The decision reads one owner and the rename moves
-  whatever occupies `.lock` at that instant, which may already be a new live generation (ABA).
-  After the rename the moved card is compared against the owner that was judged stale; on a
-  mismatch it is put back if the slot is still free, and otherwise named as an incident on
-  stderr rather than destroyed. The residual window needs a dead-or-foreign card to be
-  replaced in the instant between the verdict and the rename — narrowed, not closed, and said
-  so in the code.
+  Liveness is established by `process.kill(pid, 0)` plus host match, and that is a **deliberate
+  trade with a named cost**: the OS can recycle a pid, so a dead holding whose pid number has
+  been reused by an unrelated live process is protected indefinitely — a **pid-reuse wedge**.
+  The alternative is stealing locks from live writers, which is worse. The operator is the
+  recovery path, so every `ERATCHETLOCK` refusal names the lock directory, the owner pid, host
+  and action, the age, and the remedy (delete the `.lock` directory once you have confirmed the
+  process is not a ratchet writer).
+
+  **Release removes our holding or nothing.** The card carries a per-acquisition random
+  **token**; a blind `rmdir` is how a process whose lock was broken as stale deletes its
+  *successor's* live lock on the way out. The token is checked first, and a mismatch is left
+  alone and reported loudly. A removal that fails is **neutralized** (renamed aside with the
+  same atomic primitive) rather than shrugged off — a `.lock` nobody owns and nobody can delete
+  blocks every future writer until the timeout.
+  **The break verifies what it moved, whatever shape the card is.** The decision reads one owner
+  and the rename moves whatever occupies `.lock` at that instant, which may already be a new
+  live generation (ABA). After the rename the moved card is compared against the owner that was
+  judged stale — by token where there is one, and **by whole-card bytes where there is not**,
+  because a verification that only runs for tokenized cards is not a verification: a tokenless
+  judgment used to skip it entirely and could carry off a live successor. On a mismatch the
+  holding is put back if the slot is still free, and otherwise named as an incident on stderr
+  rather than destroyed.
+
+  **And every commit re-verifies ownership before it publishes.** The residual windows above —
+  a break that stranded a live holding, an ABA steal, a writer that ignored the lock — all end
+  in the same state: two processes each believing they hold one lock. Re-reading the owner card
+  in the instant before the canonical write turns every one of them into a **loser-side refusal
+  that writes nothing** (`ERATCHETLOCKLOST`) instead of a silent double write. That is what
+  shrinks the remaining protocol races from data-loss hazards to logged incidents.
 - **Reentrancy is decided, not discovered.** A nested `withWorkspaceMutation` is refused
   loudly (never a silent self-deadlock); a nested lock scope on the *same* workspace joins
   the open one; a second *different* workspace is refused.
@@ -78,31 +95,47 @@ interleavings are the operating system's, not a simulation. Traced by: claude-op
   could publish its fresh rev-0 record over a revision a locked writer had already committed —
   a read erasing a write. Creation now runs under the workspace lock, re-reads there (if the
   store appeared while we queued, that record wins), and publishes with a **create-or-fail**
-  primitive (hard-link the temp file into place, `wx` open where links are unavailable) so
-  even a caller that arrives believing the file is absent cannot replace the record that
-  exists now.
+  primitive — the record is written to a temp file and **hard-linked** into place, so it both
+  refuses an existing destination and lands whole. Where hard links are unavailable the fallback
+  is a temp file plus rename (atomic, existence-checked under the lock): the earlier `wx` open
+  wrote the canonical path **in place**, so an interrupted creation left a permanently malformed
+  `state.json` that creation then refused to repair while every reader minted another `.corrupt`
+  backup. Atomicity beats exclusivity here — the exclusivity given up is only against writers
+  that bypass the lock, which no advisory lock can stop anyway.
+- **A malformed record is repaired, once, under the lock.** The corrupt-bytes backup is a WRITE
+  and used to happen before the lock, in a read. Backup and repair now both run inside the
+  workspace lock, and the unusable file is REPLACED (its bytes are already preserved) instead of
+  being refused as "already exists" — which had left the bad file in place forever, so every
+  future read backed it up again and the store could never be opened.
 - **A CAS refusal on an absent store leaves the store absent.** Naming `expectedStateRev`
   against a workspace with no record used to auto-create `state.json` on the way to throwing.
   The revision check now happens before the read that would create anything: nothing can match
   a named revision on a store that does not exist, and a zero-byte refusal means zero bytes.
-- **`artifact close` reads its proof under the journal lock.** The closure gate's evidence
+- **`artifact close` holds the journal lock across its own commit.** The closure gate's evidence
   lives in the journal, and the read was unlocked while the workspace lock was held — so a
   `REVERT` appended between the read and the commit was invisible and the artifact closed on a
-  KEEP the record had already revoked. The proof read now runs inside the journal lock, inside
-  the close transaction, in the declared order.
-- **The evolution journal validates under the lock it appends under.** Binding an event to an
-  artifact revision and hash used to be checked *before* the lock, leaving a window in which
-  the artifact was revised, closed, or re-bound — evidence true when checked and false when
-  written. Validation moved inside the lock. (The store is materialized before the lock is
-  taken, deliberately: that read can create the store, and creating it takes the workspace
-  lock, which the order rule forbids from inside a file lock.)
-- **A half-written journal line no longer eats the next event.** An append that died mid-line
-  left the file not ending in a newline, and the following append concatenated itself onto the
-  fragment — one unreadable line where there should have been a damaged one and a good one, so
-  the *new* event was lost too. The fragment is now terminated first and stays on the log as
-  its own unreadable line. And `readEvents` no longer drops malformed lines in silence: it
-  counts them and says so once per read, because a silently short trail makes every count
-  derived from it wrong with no sign that it is.
+  KEEP the record had already revoked. Locking only the *read* moved that window instead of
+  closing it, so the boundary now takes the second lock (`alsoLockFile`) and holds it until the
+  state revision has landed: a verb whose decision depends on another file cannot release that
+  file before it publishes. Acquired inside the workspace lock, so the declared order holds.
+- **The evolution journal validates under BOTH locks for a bound event.** Binding an event to an
+  artifact's revision and hash was checked before any lock, then (cycle 1) under the journal
+  lock — which excluded the wrong processes: the writers that can move an artifact from rev 1 to
+  rev 2 take the *workspace* lock and never touch the journal. A bound append now holds the
+  workspace lock and then the journal lock, and validates inside both. Unbound events bind to
+  nothing and keep the journal lock alone. (The store is materialized before either lock,
+  deliberately: that read can create the store, which takes the workspace lock, and the order
+  rule forbids acquiring it from inside a file lock.)
+- **A half-written journal line no longer eats the next event, and a damaged log cannot certify
+  a closure.** An append that died mid-line left the file not ending in a newline, and the
+  following append concatenated itself onto the fragment — one unreadable line where there
+  should have been a damaged one and a good one, so the *new* event was lost too. The fragment is
+  now terminated first and stays on the log as its own unreadable line. And the damage is part of
+  the reader's **result** (`readEventsWithHealth` → `{ events, malformed, file }`), not merely a
+  stderr warning: a dropped `REVERT` reads exactly like no `REVERT`, so `artifact close` now
+  **fails CLOSED** on any unreadable line and names the log. The stderr warning remains, and is
+  explicitly *not* the mechanism any decision rests on — it dedupes per file and count, so an
+  earlier read could otherwise silence the one a gate needed.
 - **One identity, one event.** A caller-supplied event id that is already on the log is
   refused rather than silently regenerated — a caller that supplies an id is naming a specific
   event, and quietly renaming it leaves the caller holding an id that means something else.
@@ -131,7 +164,19 @@ interleavings are the operating system's, not a simulation. Traced by: claude-op
 
 ### Changed
 
-- **Every branch of `score confidence` is a pure derived read.** The markdown branch used to
+- **A `state reset --force` continues the revision line; it does not restart at 0.** *(Deliberate
+  semantics change — flagged for Danny's veto.)* Reusing rev 0 meant a writer that had loaded the
+  previous generation at rev 0 came back, found rev 0 again, matched, took the fast path and wrote
+  its pre-reset record straight over the fresh one — erasing an authorized wipe with a stale
+  snapshot. A reset now commits as one more revision of the same store; a genuinely new store
+  still opens at rev 0. Paired with a second rule, because rev arithmetic alone was not enough:
+  **a rebase is only valid within one generation of the record.** `createdAt` names the
+  generation, and a delta computed against a previous one is refused (`ERATCHETSTALE`) rather than
+  merged — otherwise the merge cheerfully replayed the pre-reset objective onto the new record,
+  which is the same resurrection by a different route. The 0.8 assertion "a fresh state opens at
+  rev 0" after a force reset was moved to its own store, where rev 0 still means what it says.
+- **Every branch of `score confidence` is a pure derived read** *(on an initialized store)*. The
+  markdown branch used to
   cache the session score back into state, so the *same* read moved bytes on one output mode
   and not the other. A read that revises the record it reports on can lose a concurrent
   write and can never be trusted as a read; the cache is removed (nothing consumed the
@@ -139,6 +184,12 @@ interleavings are the operating system's, not a simulation. Traced by: claude-op
   family is now exactly one: the fog-recording branch of `score aperture`, which is
   double-checked (cheap unlocked pre-check, authoritative re-check under the lock) so two
   concurrent scores record one fog loop, one history entry, one revision.
+
+  The qualifier is load-bearing: `status`, `receipt`, `score confidence` and the inspection verbs
+  move zero bytes **on a store that exists**. A first read of a store that does not exist yet
+  performs the init transition — which is a locked, no-clobber write, deliberately, so that a
+  read can never publish an empty record over a committed one. "Pure read" means "adds no
+  revision to an existing record", not "never touches the filesystem".
 - **A `saveState` that names no expected revision now performs an ADDITIVE rebase instead of
   an overwrite.** It takes the lock, re-reads what is actually on disk, and replays the
   caller's delta onto it. Scoped honestly, because "both keep their work" was an overclaim:
@@ -154,16 +205,26 @@ interleavings are the operating system's, not a simulation. Traced by: claude-op
   `WeakMap` keyed by the loaded object, so anything that copied a snapshot — a JSON round trip,
   `structuredClone`, an IPC hop — dropped the base and fell through to a blind overwrite: the
   v0.8 lost update wearing a 0.9 lock. Snapshots are now also remembered by
-  `<statePath>@<rev>` in a bounded cache, and a snapshot at a revision nothing remembers is
-  **refused** (`ERATCHETSTALE`) rather than written blind.
+  `<statePath>@<rev>` in a **process-local, bounded (64-entry) cache**, and a snapshot at a
+  revision nothing remembers is **refused** (`ERATCHETSTALE`) rather than written blind. Revision
+  identity is safe across generations because a reset no longer reuses revision numbers and
+  `createdAt` is checked besides; the cache is a convenience for rebasing, never the thing that
+  decides whether a write is allowed.
 - **`saveState` and `saveLedger` are the same door as the boundary, not softer ones.** Both now
-  enforce the propose-only write guard (a propose-only agent could write canonical state
-  through `saveState`), and `saveState` detects a no-op: a save that would not move the record
-  costs zero revisions, because burning a revision invalidates every proof bound to the current
-  one for nothing. **This tightened what `rev` counts**, and the 0.8 test that asserted
-  "increments on every write" by resaving unmodified snapshots was updated to earn each
-  revision with a real change — its sequence is unchanged and the new no-op law is asserted
-  beside it.
+  enforce the propose-only write guard (a propose-only agent could write canonical state through
+  `saveState`), `saveLedger` takes the workspace lock (it wrote directly, so two stale ledger
+  snapshots simply lost one save — note the ledger has no revision counter, so this serializes
+  writes rather than rebasing them: the last writer under the lock still wins), and `saveState`
+  detects a no-op: a save that would not move the record costs zero revisions, because burning a
+  revision invalidates every proof bound to the current one for nothing. **This tightened what
+  `rev` counts**, and the 0.8 test that asserted "increments on every write" by resaving
+  unmodified snapshots was updated to earn each revision with a real change — its sequence is
+  unchanged and the new no-op law is asserted beside it.
+- **`initProject({ force: true })` is guarded like the CLI verb it backs.** The library entry
+  point performed the irreversible wipe with no authority check, so a propose-only agent could
+  reset the store by calling it directly — the CLI's guard only ever covered the CLI. A plain
+  `initProject` stays open: it creates nothing that exists and wipes nothing, and a propose-only
+  agent must still be able to orient.
 - **`hook post-edit` writes through the boundary** like every other mutation, and is
   therefore now refused for a propose-only agent (which by contract leaves no footprint) — and
   the refusal now says *that*, instead of the generic "closure state unreadable" the hook
@@ -184,18 +245,28 @@ between them can leave an orphan ledger mirror); durability against power loss (
 fsynced, the containing directory is not); correctness on network filesystems, where `mkdir`
 atomicity and pid liveness both stop meaning what they mean locally; protection against a
 writer that bypasses the boundary (the lock is advisory — anyone who can write the store can
-write the store); authenticated human approval; or distributed transactions of any kind.
+write the store, and a lock-bypassing writer is exactly what commit-time ownership
+re-verification cannot see); authenticated human approval; or distributed transactions of any
+kind.
 
-Two more boundaries the review of this gate named explicitly:
+The boundaries the reviews of this gate named explicitly:
 
-- **Hard-linked journal aliases are not covered.** A file lock is keyed by path. The parent
-  directory is resolved through `realpath`, which makes symlinked directories and Windows path
-  casing agree on one lock — but two hard links to one inode in two directories are two names,
-  therefore two lock keys, therefore no mutual exclusion. Keying a lock by inode is not
-  buildable dependency-free. Parked, owner Danny.
+- **Hard-linked journal aliases are not covered.** A file lock is keyed by path, and the path is
+  resolved with `realpath` — which now resolves the FILE, so a symlinked log and its target share
+  one lock (they did not in the first cut). Two hard links to one inode are still two paths, so
+  they are still two locks: keying a lock by inode is not buildable dependency-free. Parked,
+  owner Danny.
+- **Windows path casing is not normalized by the file lock.** `realpath` returns the spelling it
+  was given on Windows, so `LOG.jsonl` and `log.jsonl` are two lock keys for one file. (The
+  workspace store is unaffected — its slug is case-normalized by a `readdir` walk, which is why
+  that code deliberately does not use `realpath`.) Parked, owner Danny.
+- **The pid-reuse wedge.** A dead holding whose pid the OS has reused by an unrelated live process
+  is never auto-broken, by policy. Operator-resolvable, and every refusal says how.
 - **Merge delete/reorder preservation is parked, not built.** Committed order wins for both, as
   scoped in the rebase entry above. Building delete tracking means a delete verb and a tombstone
   in the schema — a product decision, not a defect fix. Owner Danny.
+- **The ledger has no revision counter.** Its writes are serialized by the workspace lock but not
+  rebased, so two concurrent ledger edits are last-writer-wins. Owner Danny.
 
 - **Hook drift guard.** `cmdHook`'s default case returns silently by design (a hook
   must never break the session), which means a renamed or misspelled subcommand in
