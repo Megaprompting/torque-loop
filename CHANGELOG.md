@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`src/mcp/handles.js` — opaque, connection-scoped workspace handles** (Torque MCP
+  build-order step 2.2). A handle is a **capability, not a shorter spelling of a
+  pathname**. It is minted only by the server, only from a path step 2.1 already judged
+  contained, and the registry entry keeps the facts established at that moment rather
+  than a string to re-interpret later: the connection it was issued to, the workspace
+  root it belongs to, its canonical name within that workspace, its kind, the exact
+  operations granted, and an issuance nonce distinguishing it from any other grant over
+  the same target.
+  - 256 CSPRNG bits per handle. The client cannot choose one (a supplied `handle`/`id`
+    is ignored, not honored), cannot predict one, and cannot derive one — two grants of
+    the same file are two different capabilities.
+  - Scoped to exactly one live connection: useless on another connection *even from the
+    same client*, dead the instant its connection closes, and never minted by a closed
+    one. A revoked value is never reissued, so a dead capability cannot become someone
+    else's live one.
+  - **The registry is not an existence oracle.** Unknown, malformed, wrong-typed,
+    revoked, closed, and belonging-to-another-connection all raise one identical
+    refusal. Presenting a handle you *do* hold and asking for an operation it lacks is a
+    different, specific refusal — naming the missing authority reveals nothing you had
+    not already proven.
+  - Kinds are `file`, `directory`, `create-file`, `create-directory`, checked against
+    what is actually there at issue time. This is also where the trailing-separator
+    limitation from step 2.1 is answered: a "create" intent survives in the capability
+    instead of being lost in a returned pathname. Unknown kinds and unknown or empty
+    operation sets are refused at grant.
+  - A returned grant is a copy, so a holder cannot edit its own record into more
+    authority.
+  - **Boundaries named, not closed:** a handle does not eliminate the race between
+    validation and use — the filesystem underneath can still change; what it removes is
+    client-controlled path substitution and repeated authority interpretation at the
+    protocol boundary. Lookup is a `Map` get and therefore not constant-time, which is
+    not claimed as a timing-attack defence. And "handles are the *only* accepted
+    workspace authority" is enforced by the tool surface that does not exist yet
+    (step 2.4); what this step proves is that a raw path is not accepted *as a handle*.
+- **`test/mcp-handles.test.js` — 16-case capability suite**, written red against an
+  absent module and wired into `npm test`.
 - **`src/mcp/workspace.js` — the root allowlist and canonical path containment**
   (Torque MCP build-order step 2.1). The invariant, **with its boundary named**: no
   client-controlled path is accepted unless the components this module observed, as it
