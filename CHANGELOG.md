@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Hook drift guard.** `cmdHook`'s default case returns silently by design (a hook
+  must never break the session), which means a renamed or misspelled subcommand in
+  `hooks/hooks.json` would no-op forever in every installed copy with no error
+  anywhere. `plugin-shape` now asserts every hooks.json command is a
+  `ratchet hook <sub>` invocation whose subcommand `cmdHook` actually handles, and
+  that at least the three known hooks stay wired. CI-enforced (drift guard in the
+  test suite); proven red against a simulated rename before landing.
+
+- **README product thesis — verified guardrails lift cognitive load.** The README now
+  states the payoff the execution framing only implied: externalized state lets the agent
+  run on a smaller working set and spend its scarce attention on judgment, not bookkeeping.
+  It names the precondition out loud — *a guardrail only lifts load in proportion to how
+  far you can trust it without re-checking it; an unverified guardrail is a liability
+  wearing the costume of relief* — and reframes the existing **no proof → no keep** /
+  **wrong proof → no ship** gates as the price of being allowed to stop re-checking, not
+  ceremony. Guarded against silent drift by a `plugin-shape` assertion (the thesis is
+  load-bearing, so its removal fails CI like a stale version) — docs + drift guard, no
+  runtime change.
+
+- **Skill graph, derived not remembered.** The first knowledge-graph pass at this plugin's
+  skills was hand-authored — a one-night snapshot with nothing tying it back to source, the
+  exact liability the README names (a guardrail you trust without re-checking). Replaced with
+  a generator (`scripts/graph-gen.js`, zero-dep, does not ship): it reads `skills/*/SKILL.md`
+  frontmatter + `reference/PROMPTS.md` and emits deterministic Cypher to
+  `reference/graph/torque-loop.cypher` (21 skill nodes, the canonical phase sequence,
+  skill→prompt IMPLEMENTS edges). The load script opens with a namespace-scoped
+  `DETACH DELETE` — a **delete-and-rebuild**, so a shrunk or reordered graph can never leave a
+  stale node or STEP edge behind (the earlier MERGE-only reload was additive-idempotent only).
+  `plugin-shape` byte-matches the committed file against a fresh generation, so a drifted graph
+  fails CI like a stale version — CI-enforced (drift guard in the test suite), proven red
+  against a mutated skill description before landing. The aperture mechanism cross-links from
+  the first pass are **deliberately parked, not shipped**: their far endpoint is a separate
+  repo and the pairings were never adversarially attacked — documented with an owner and route
+  in `reference/graph/README.md` (convention 15), not smuggled in as if derived.
+
 ## [0.8.0] - 2026-07-29 — Closure Gate
 
 0.7 gated the fog. It left the loop able to *stop* but not to *finish*: `compile done`

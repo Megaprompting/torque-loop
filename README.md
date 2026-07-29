@@ -35,6 +35,28 @@ restarting. *Ambiguity in. Artifact out. Failure tested. State advanced.*
 
 ---
 
+## The thesis — verified guardrails lift cognitive load
+
+Most "process" *adds* load: another checklist to hold, another gate to satisfy. Torque Loop
+does the inverse. It externalizes state — the ledger holds the open defects, the map holds
+"don't overwrite that", the receipt is the one cold read — so the agent runs on a smaller
+working set and spends its scarce **cognitive load** on the irreducible judgment (the taste
+call, the design fork) instead of the bookkeeping it can't reliably hold anyway.
+
+But the lift is conditional, and the condition is the whole product:
+
+> A guardrail only lifts load in proportion to how far you can trust it **without
+> re-checking it**. An **unverified guardrail** is a **liability** wearing the costume of
+> relief — it doesn't remove the load, it hides it, because now you carry a false belief
+> that bites three moves later.
+
+So the gates are not ceremony. **No proof → no keep** and **wrong proof → no ship** are the
+*price of being allowed to stop re-checking* — the up-front cost, paid in verification, that
+makes the offload real instead of imaginary. Everything below is the machinery that charges
+that price.
+
+---
+
 ## Install
 
 Torque Loop has two halves: the **agent plugin** (skills/commands, agents, and Claude-only
