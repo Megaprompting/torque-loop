@@ -463,6 +463,40 @@ ok('a legacy-cased store migrates even when the FIRST call spells the cwd lowerc
   assert.strictEqual(state.loadState(onDisk).objective, 'written under the old casing');
 });
 
+ok('a junction cwd keeps its own identity instead of forking into the target store', () => {
+  if (process.platform !== 'win32') return;
+  // Recovering casing via realpath DEREFERENCES aliases: `C:\Users\All Users`
+  // resolves to `C:\ProgramData`, so a session run through a junction silently
+  // adopts the target's store — and the alias-keyed store it used to write is
+  // neither migrated nor conflict-detected, because nothing ever computes its
+  // slug again. Casing must be recovered without following the link.
+  const target = path.join(tmp, 'JunctionTarget', 'Repo');
+  const link = path.join(tmp, 'JunctionAlias');
+  fs.mkdirSync(target, { recursive: true });
+  try {
+    fs.symlinkSync(target, link, 'junction');
+  } catch (e) {
+    process.stdout.write(`      (skipped: junction creation denied — ${e.code})\n`);
+    return;
+  }
+  assert.notStrictEqual(
+    state.projectSlug(link), state.projectSlug(target),
+    'an alias must keep its own store, not silently resolve into the target'
+  );
+  // its identity is the LEXICAL path's, casing-corrected but never dereferenced
+  assert.strictEqual(state.projectSlug(link), state.normalizedSlugFor(link));
+});
+
+ok('case recovery survives a path segment that does not exist', () => {
+  if (process.platform !== 'win32') return;
+  // A store dir is computed before the project dir necessarily exists; an
+  // unreadable or missing segment must fall back to the lexical spelling rather
+  // than throw or silently produce a different identity.
+  const missing = path.join(tmp, 'NoSuchParent', 'NoSuchChild');
+  assert.doesNotThrow(() => state.projectSlug(missing));
+  assert.strictEqual(state.projectSlug(missing), state.projectSlug(missing), 'and it is stable across calls');
+});
+
 ok('two stores for one path is a conflict to name, never a guess to make', () => {
   if (process.platform !== 'win32') return;
   const proj = path.join(tmp, 'SlugConflict', 'Repo');
@@ -1167,7 +1201,41 @@ ok('a scalar holes value is a real hole, and repairing it is a real revision', (
   const codes = lifecycle.closureBlockers(state.loadState(cwd), [], scalar, cwd).map((b) => b.code);
   assert.ok(codes.includes('holes'), `a scalar hole still blocks closure, got: ${codes.join(',')}`);
 
-  // and repairing the shape is a REVISION, not a silent no-op
+  // EVERY present non-array is at least one hole — including the falsey shapes,
+  // which is where "anything present" quietly stopped being true.
+  for (const shape of ['', null, 0, false]) {
+    state.initProject(cwd, { force: true });
+    const st = state.loadState(cwd);
+    st.artifacts = [{ id: 'art-falsey-hole', at: '2026-07-01T00:00:00.000Z', kind: 'spec', title: 'x', status: 'v1', holes: shape, rev: 1 }];
+    state.saveState(cwd, st);
+    const art = state.loadState(cwd).artifacts[0];
+    const c = lifecycle.closureBlockers(state.loadState(cwd), [], art, cwd).map((b) => b.code);
+    assert.ok(c.includes('holes'), `holes:${JSON.stringify(shape)} is a present value and must block, got: ${c.join(',')}`);
+  }
+  // absence, and only absence, is zero holes
+  state.initProject(cwd, { force: true });
+  const st2 = state.loadState(cwd);
+  st2.artifacts = [{ id: 'art-no-holes', at: '2026-07-01T00:00:00.000Z', kind: 'spec', title: 'x', status: 'v1', rev: 1 }];
+  state.saveState(cwd, st2);
+  const absent = lifecycle.closureBlockers(state.loadState(cwd), [], state.loadState(cwd).artifacts[0], cwd).map((b) => b.code);
+  assert.ok(!absent.includes('holes'), 'an absent holes field is genuinely zero holes');
+
+  // a nested array is also the wrong shape: stringification made [["TODO"]]
+  // compare equal to ["TODO"], so the repair false-no-opped and the nesting stayed
+  state.initProject(cwd, { force: true });
+  const st3 = state.loadState(cwd);
+  st3.artifacts = [{ id: 'art-nested', at: '2026-07-01T00:00:00.000Z', kind: 'spec', title: 'x', status: 'v1', holes: [['TODO']], rev: 1 }];
+  state.saveState(cwd, st3);
+  const flattened = artifacts.addArtifact(cwd, { id: 'art-nested', holes: ['TODO'] });
+  assert.strictEqual(flattened.rev, 2, 'repairing a nested holes array is a real revision');
+  assert.deepStrictEqual(flattened.holes, ['TODO'], 'and the flat shape is what persists');
+  assert.ok(flattened.holes.every((h) => typeof h === 'string'), 'every hole is a string');
+
+  // and repairing the scalar shape is a REVISION, not a silent no-op
+  state.initProject(cwd, { force: true });
+  const s2 = state.loadState(cwd);
+  s2.artifacts = [{ id: 'art-scalar', at: '2026-07-01T00:00:00.000Z', kind: 'spec', title: 'legacy', status: 'v1', holes: 'TODO', rev: 1 }];
+  state.saveState(cwd, s2);
   const repaired = artifacts.addArtifact(cwd, { id: 'art-scalar', holes: ['TODO'] });
   assert.strictEqual(repaired.rev, 2, 'normalizing a present non-array holes value is a real revision');
   assert.deepStrictEqual(repaired.holes, ['TODO'], 'and the array shape is what persists');

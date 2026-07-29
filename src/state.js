@@ -35,23 +35,43 @@ function slugFor(root, lowercase) {
   return `${name}-${hash}`;
 }
 
-// The one authority on how this path is really spelled. A caller may type
-// `d:\repo` for a directory stored as `D:\Repo`, and on Windows both open it —
-// so the caller's casing is not evidence of anything. realpathSync.native asks
-// the filesystem, which knows. Falls back to the plain resolve when the path
-// does not exist yet or native is unavailable.
+// Recovering the true casing must NOT follow aliases. realpath dereferences:
+// `C:\Users\All Users` comes back as `C:\ProgramData`, so a session run through
+// a junction silently adopts the target's store — and the alias-keyed store it
+// used to write is never migrated or conflict-detected, because nothing computes
+// its slug again. readdir returns the junction's OWN name, so walking segment by
+// segment corrects the casing while leaving the alias its own identity.
+//
+// A segment whose parent is unreadable, or that does not exist yet, keeps its
+// lexical spelling — a store dir is often computed before the project exists.
+const _caseCache = new Map();
+
 function caseExactPath(cwd) {
-  const root = path.resolve(cwd || process.cwd());
-  try {
-    if (typeof fs.realpathSync.native === 'function') return fs.realpathSync.native(root);
-  } catch (_e) {
-    /* not on disk yet, or no native impl — fall through */
+  const lexical = path.resolve(cwd || process.cwd());
+  if (process.platform !== 'win32') return lexical;
+  const cached = _caseCache.get(lexical);
+  if (cached) return cached;
+
+  const parsed = path.parse(lexical);
+  // Drive letters are case-insensitive and readdir cannot report their casing,
+  // so canonicalize them; otherwise `c:\x` and `C:\x` fork into two stores.
+  let current = parsed.root.toUpperCase();
+  for (const seg of lexical.slice(parsed.root.length).split(path.sep).filter(Boolean)) {
+    let actual = seg;
+    try {
+      const lower = seg.toLowerCase();
+      const match = fs.readdirSync(current).find((e) => e.toLowerCase() === lower);
+      if (match) actual = match;
+    } catch (_e) {
+      /* unreadable or missing parent — keep the lexical spelling */
+    }
+    current = path.join(current, actual);
   }
-  try {
-    return fs.realpathSync(root);
-  } catch (_e) {
-    return root;
-  }
+  // The hook path calls this on every invocation; the walk is one readdir per
+  // segment, so memoize it. A CLI process is short-lived enough that a rename
+  // mid-run is not a case worth invalidating for.
+  _caseCache.set(lexical, current);
+  return current;
 }
 
 // The slug a pre-0.8 store was created under: hashed from the path's TRUE

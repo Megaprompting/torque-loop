@@ -57,13 +57,16 @@ function canonicalFields(kind, item, fallback) {
   return out;
 }
 
-// Only an ABSENT holes value is equivalent to []. A PRESENT non-array value
-// (a legacy `holes: "TODO"`) is a real hole in the wrong shape: canonicalizing
-// it silently made the repair compare equal to the stored scalar, so the no-op
-// path kept the scalar — and every `Array.isArray` guard downstream then read it
-// as zero holes. Repairing the shape is a genuine revision.
+// Only an ABSENT holes value is equivalent to []. Anything PRESENT that is not
+// already a flat array of strings is a real hole in the wrong shape:
+// canonicalizing it made the repair compare equal to what was stored, so the
+// no-op path kept the bad shape — and every `Array.isArray`/string guard
+// downstream then misread it (a scalar as zero holes, a nested `[["TODO"]]` as
+// an unusable hole). Repairing the shape is a genuine revision.
 function hasLegacyHolesShape(record) {
-  return record.holes !== undefined && !Array.isArray(record.holes);
+  if (!Object.prototype.hasOwnProperty.call(record, 'holes')) return false;
+  const h = record.holes;
+  return !Array.isArray(h) || !h.every((x) => typeof x === 'string');
 }
 
 function assertArtifactInput(item) {

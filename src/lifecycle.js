@@ -188,12 +188,17 @@ function closureBlockers(state, events, artifact, cwd, request = {}) {
     });
   }
 
-  // Defensive normalization: a legacy record can carry holes as a bare string,
-  // and `Array.isArray(...) ? ... : []` reads that as ZERO holes — closing an
-  // artifact over an open hole nobody can see. Absent means none; anything
-  // present is at least one.
-  const raw = artifact.holes;
-  const holes = Array.isArray(raw) ? raw : raw == null || raw === '' ? [] : [raw];
+  // Defensive normalization. A legacy record can carry holes in any shape, and
+  // `Array.isArray(...) ? ... : []` reads every one of them as ZERO holes —
+  // closing an artifact over an open hole nobody can see. ABSENCE is the only
+  // thing that means none: `hasOwnProperty`, not falsiness, because `holes: ""`
+  // and `holes: null` are values somebody wrote, and a value somebody wrote is
+  // at least one unexplained hole.
+  const holes = !Object.prototype.hasOwnProperty.call(artifact, 'holes')
+    ? []
+    : Array.isArray(artifact.holes)
+      ? artifact.holes
+      : [String(artifact.holes)];
   const waived = Boolean(request.waiveHoles && String(request.owner || '').trim() && String(request.reason || '').trim());
   if (holes.length && !waived) {
     out.push({
