@@ -954,6 +954,29 @@ ok('the scribe is the sole writer — it may mutate canonical state', () => {
   }
 });
 
+ok('a propose-only hook says it is propose-only, not that the state is unreadable', () => {
+  // The hook catch-all reports "closure state unreadable — do not claim closed",
+  // which sends the reader looking for corruption. A propose-only agent hitting
+  // the write guard is a refusal by design, and misreporting it as a damaged
+  // record is the more expensive lie of the two.
+  // Spawned, because the hook reads its payload from stdin — the file path is
+  // what makes it attempt a write at all.
+  const { spawnSync } = require('child_process');
+  const proj = path.join(tmp, 'hook-propose-only');
+  fs.rmSync(proj, { recursive: true, force: true });
+  fs.mkdirSync(proj, { recursive: true });
+  const r = spawnSync(process.execPath, [path.resolve(__dirname, '..', 'bin', 'ratchet'), 'hook', 'post-edit'], {
+    cwd: proj,
+    env: { ...process.env, RATCHET_DATA_DIR: path.join(proj, '.data'), RATCHET_AGENT: 'ratchet-builder' },
+    input: JSON.stringify({ tool_input: { file_path: 'README.md' } }),
+    encoding: 'utf8',
+  });
+  const text = String(r.stderr || '');
+  assert.strictEqual(r.status, 0, 'a hook never breaks the session, whatever it hits');
+  assert.ok(/propose-only/.test(text), `the refusal must name itself; got: ${text.trim() || '(silence)'}`);
+  assert.ok(!/closure state unreadable/.test(text), `and must not claim the record is unreadable; got: ${text.trim()}`);
+});
+
 ok('score confidence leaves no write footprint for a propose-only agent', () => {
   state.initProject(cwd, { force: true });
   const s = state.loadState(cwd);

@@ -634,6 +634,74 @@ function deadPid() {
   return done.pid;
 }
 
+// --- C1: the close reads its proof under the journal lock --------------------
+
+ok('C1 artifact close reads the journal under the journal lock, inside the workspace lock', () => {
+  const proj = freshProject('c1');
+  const art = artifacts.addArtifact(proj, { title: 'c1', kind: 'code', path: 'x.js', holes: [] });
+
+  // The proof this gate reads lives in the journal. Reading it unlocked leaves a
+  // window in which a REVERT lands after the read and before the commit, and the
+  // artifact closes on a KEEP the record had already revoked.
+  const realRead = journal.readEvents;
+  const observed = [];
+  journal.readEvents = function (cwd) {
+    observed.push({
+      journalLocked: fs.existsSync(journalLockDir(proj)),
+      workspaceLocked: fs.existsSync(workspaceLockDir(proj)),
+    });
+    return realRead.call(journal, cwd);
+  };
+  const prevCwd = process.cwd();
+  try {
+    process.chdir(proj);
+    // It will refuse to close (no bound proof) — the refusal is not the point.
+    // The point is where the journal read happened.
+    try {
+      cli.run(['node', 'ratchet', 'artifact', 'close', art.id]);
+    } catch (_e) {
+      /* blockers — expected */
+    }
+  } finally {
+    process.chdir(prevCwd);
+    journal.readEvents = realRead;
+  }
+
+  assert.ok(observed.length, 'the close must actually read the journal');
+  const unlocked = observed.filter((o) => !o.journalLocked);
+  assert.strictEqual(
+    unlocked.length,
+    0,
+    `every proof read inside artifact close must hold the journal lock — ${unlocked.length} of ${observed.length} did not`
+  );
+  assert.ok(
+    observed.every((o) => o.workspaceLocked),
+    'and it must hold the workspace lock too — the order is workspace → journal, never the reverse'
+  );
+});
+
+ok('C1 the lock order is enforced, not merely documented', () => {
+  const proj = freshProject('c1-order');
+  // Taking the workspace lock while holding a file lock is the ABBA wedge. It
+  // must fail by name, not resolve into two mysterious timeouts.
+  assert.throws(
+    () =>
+      state.withFileLock(journal.logPath(proj), 'test', () => {
+        state.withWorkspaceLock(proj, 'inverted', () => {});
+      }),
+    /lock order/i,
+    'workspace-inside-file must be refused by name'
+  );
+  // The permitted direction still works.
+  let ran = false;
+  state.withWorkspaceLock(proj, 'outer', () => {
+    state.withFileLock(journal.logPath(proj), 'inner', () => {
+      ran = true;
+    });
+  });
+  assert.ok(ran, 'workspace → file is the allowed order and must still run');
+});
+
 // --- C2: a first read never publishes over a committed record ----------------
 
 ok('C2 creating the store on first read takes the lock instead of racing it', () => {

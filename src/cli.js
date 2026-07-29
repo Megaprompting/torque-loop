@@ -449,7 +449,15 @@ function cmdArtifactClose(cwd, argv) {
   if (!id) throw new Error('usage: ratchet artifact close <id> [--waive-holes --owner "<who>" --reason "<why>"]');
   // The blocker check and the certificate it authorizes run inside ONE
   // transaction: a defect landing between them would otherwise be closed over.
-  return out(mutate(cwd, 'artifact close', (s) => closeArtifact(cwd, s, id, opts)));
+  // The journal is read under ITS lock inside that transaction, because the
+  // proof this gate reads lives there — a REVERT appended between the read and
+  // the commit would otherwise be invisible and the artifact would close on a
+  // KEEP the record had already revoked. Lock order: workspace → journal.
+  return out(
+    mutate(cwd, 'artifact close', (s) =>
+      state.withFileLock(journal.logPath(cwd), 'artifact close (proof read)', () => closeArtifact(cwd, s, id, opts))
+    )
+  );
 }
 
 function closeArtifact(cwd, s, id, opts) {
@@ -799,12 +807,20 @@ function cmdHook(cwd, sub) {
       default:
         return;
     }
-  } catch (_e) {
+  } catch (e) {
     // Hooks fail closed: never break the session — but silence here reads as
     // "nothing to do", which is the one thing an unreadable closure state must
     // never imply. Say it cannot be trusted, then exit 0 like every hook.
+    //
+    // A propose-only agent hitting the write guard is NOT an unreadable state,
+    // and reporting it as one sends the reader looking for corruption that is
+    // not there. Name the actual refusal.
     try {
-      err('[ratchet] closure state unreadable — do not claim closed.');
+      if (e && e.code === 'ERATCHETPROPOSEONLY') {
+        err(`[ratchet] ${proposeOnlyAgent()} is propose-only — this hook's edit was not recorded (no footprint by design).`);
+      } else {
+        err('[ratchet] closure state unreadable — do not claim closed.');
+      }
     } catch (_e2) {
       /* nothing left to try */
     }
