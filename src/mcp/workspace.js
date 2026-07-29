@@ -51,11 +51,14 @@ function describe(value) {
 // a SIBLING of /srv/work — into a path inside it.
 const SEPARATORS = WIN ? /[\\/]/ : /\//;
 
-function isDirectory(p) {
+// Three answers, not two: "not a directory" and "could not be examined" are
+// different facts, and a refusal that reports the wrong one sends whoever reads
+// it looking in the wrong place. Both still fail closed.
+function directoryState(p) {
   try {
-    return fs.statSync(p).isDirectory();
+    return fs.statSync(p).isDirectory() ? 'directory' : 'file';
   } catch (_e) {
-    return false; // unreadable or gone counts as "cannot prove it is a directory"
+    return 'unknown';
   }
 }
 
@@ -146,8 +149,14 @@ function canonicalize(candidate) {
       }
       // A link to a FILE cannot be walked through either — including by a `..`
       // that would otherwise climb out of it as if it had been a directory.
-      if (i !== parts.length - 1 && !isDirectory(current)) {
-        throw escaped('a link on this path leads to a file, and a file has no contents to descend into');
+      if (i !== parts.length - 1) {
+        const state = directoryState(current);
+        if (state === 'file') {
+          throw escaped('a link on this path leads to a file, and a file has no contents to descend into');
+        }
+        if (state === 'unknown') {
+          throw escaped('a link on this path leads somewhere that could not be examined');
+        }
       }
     } else if (!stat.isDirectory() && i !== parts.length - 1) {
       // A file cannot contain the rest of the path; accepting it would return a
@@ -216,9 +225,11 @@ function createRoots(list) {
     // Zero roots is a closed allowlist, not an open one — the loop below finds
     // nothing and the refusal fires, which is the safe direction to fail.
     const canonical = canonicalize(candidate);
-    if (SEPARATORS.test(candidate[candidate.length - 1]) && fs.existsSync(canonical) && !isDirectory(canonical)) {
+    if (SEPARATORS.test(candidate[candidate.length - 1]) && directoryState(canonical) === 'file') {
       // A trailing separator asserts "this is a directory". The OS answers
-      // ENOTDIR when it is not, and so does this.
+      // ENOTDIR when it is not, and so does this. A target that does not exist
+      // yet cannot be judged either way — see the known limitation in the
+      // CHANGELOG: the assertion is not carried in the returned name.
       throw escaped('this path ends in a separator but does not name a directory');
     }
     for (const root of roots) {

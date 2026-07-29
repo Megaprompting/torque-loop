@@ -185,7 +185,11 @@ ok('W9 a not-yet-existing file inside a root resolves; its escaping twin does no
   const roots = workspace.createRoots([root]);
   const fresh = path.join(root, 'new-dir', 'new-file.txt');
   assert.strictEqual(roots.resolve(fresh), fresh, 'a file that does not exist yet is still a legal target');
-  refuses(roots, path.join(root, 'new-dir', '..', '..', 'outside', 'new.txt'), 'a non-existent path that escapes');
+  // Literal: path.join would collapse the dot segments and the missing
+  // component would never reach the module.
+  const sep = path.sep;
+  refuses(roots, `${root}${sep}new-dir${sep}..${sep}..${sep}outside${sep}new.txt`,
+    'a non-existent path that escapes');
 });
 
 ok('W12 a root resolves to itself and its parent does not', () => {
@@ -293,7 +297,11 @@ ok('W21 a component that cannot be examined is refused, not treated as absent', 
   // returning it as a legal future target would be a lie.
   refuses(roots, path.join(root, 'inside.txt', 'child.txt'), 'a path descending through a file');
   // Literal, not path.join: join would normalize this to a plain outside path
-  // and the file component would never reach the module.
+  // and the file component would never reach the module. It must also LAND
+  // inside the root — a path ending outside is refused for that reason alone,
+  // which is not the rule under test.
+  refuses(roots, `${root}${sep}inside.txt${sep}..${sep}inside.txt`,
+    'a traversal through a file component that lands back inside');
   refuses(roots, `${root}${sep}inside.txt${sep}..${sep}..${sep}outside${sep}secret.txt`,
     'a traversal laundered through a file component');
 });
@@ -329,7 +337,11 @@ ok('W26 a UNC path without a share is not a location', () => {
   const firstSegment = here.slice(path.parse(here).root.length).split(path.sep)[0];
   const driveRelative = `${path.sep}${path.sep}${firstSegment}${path.sep}`;
   assert.ok(fs.existsSync(driveRelative), `the fixture must resolve to be worth refusing: ${driveRelative}`);
-  refuses(roots, driveRelative, 'a UNC-shaped path naming no share');
+  const err = refuses(roots, driveRelative, 'a UNC-shaped path naming no share');
+  // It must be refused for BEING drive-dependent, not merely for landing
+  // outside the fixture root — otherwise the assertion passes against an
+  // implementation that never checked the shape at all.
+  assert.match(err.message, /fully qualified/i, 'the refusal must name the shape, not just the destination');
   refuses(roots, '\\\\?\\UNC\\server\\share\\x', 'an extended UNC path this module does not handle');
   for (const bad of [driveRelative, '\\\\?\\UNC\\server\\share']) {
     let err = null;
@@ -365,9 +377,9 @@ ok('W28 two names that only a lowercase() would confuse stay distinct', () => {
   // indistinguishable by eye, and a case-VARIANT pair would prove nothing
   // because Windows correctly treats those as one name.
   const base = fixture('w28');
-  const dotted = path.join(base, 'İ-root');
-  const decomposed = path.join(base, 'i̇-root');
-  assert.strictEqual('İ-root'.toLowerCase(), 'i̇-root'.toLowerCase(),
+  const dotted = path.join(base, '\u0130-root');
+  const decomposed = path.join(base, 'i\u0307-root');
+  assert.strictEqual('\u0130-root'.toLowerCase(), 'i\u0307-root'.toLowerCase(),
     'the fixture only means something if JavaScript folds these together');
   fs.mkdirSync(dotted, { recursive: true });
   assert.ok(!fs.existsSync(decomposed),

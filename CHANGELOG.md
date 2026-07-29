@@ -52,6 +52,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     equivalent spellings have already converged. Lowercasing would be worse than useless
     — JavaScript's case mapping is not the filesystem's, and `"İ".toLowerCase()` is two
     code points, so distinct directories could be judged the same one.
+  - **Known limitation, named not fixed:** a trailing separator on a target that does
+    not exist yet (`<root>/new-dir/`) asserts "this is a directory", and the returned
+    name does not carry that assertion — a caller could create a file there instead.
+    Refusing it outright would break the legitimate case of naming a directory you are
+    about to create, and carrying it would change the return contract, so the fix belongs
+    with the typed handles in the next sub-step rather than here. Containment is not
+    affected. (Open loop, owner Danny.)
   - Zero roots is a **closed** allowlist: every path is refused. Roots must be fully
     qualified, existing directories, and are canonicalized at construction. Links that
     stay *inside* a root are followed normally — containment is not achieved by refusing
@@ -59,10 +66,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     would answer the question the traversal was asking.
 - **`test/mcp-workspace.test.js` — 28-case containment suite**, written red against an
   absent module and wired into `npm test` (the plugin-shape unwired-suite guard was
-  verified red against it first). Two independent Codex review rounds, both returning
-  "do not ship" (12 findings then 7), with every accepted finding reproduced before its
-  fix. **Six of the nineteen were defects in the tests themselves**, which is the point
-  of running the review at all: cases that built their `..` paths with `path.join`, which
+  verified red against it first). Three independent Codex review rounds — "do not ship",
+  "do not ship", then **containment holds** — with every accepted finding reproduced
+  before its fix.
+  **Ten of the twenty-five findings were defects in the tests themselves**, which is the
+  point of running the review at all: falsifiers whose escape landed outside the root, so
+  they passed against a broken implementation for a reason unrelated to the rule under
+  test; cases that built their `..` paths with `path.join`, which
   normalizes the dot segments away before the module ever sees them; a case-comparison
   test the reviewer defeated by loading the *old* implementation and watching it pass; an
   assertion that could not fail; a UNC fixture that refused because the path did not
