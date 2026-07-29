@@ -567,3 +567,5 @@ Then find:
 
 Finally, produce the upgraded library as a sequenced workflow, not a pile of prompts.
 ```
+
+<!-- Traced by: claude-opus-5[1m] · 2026-07-29 (0.8 Closure Gate: canonical path gains verify; the ending rule) -->
