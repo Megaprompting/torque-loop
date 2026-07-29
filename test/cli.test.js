@@ -975,7 +975,10 @@ ok('probe retraction must state its outcome: disposed or promoted (+ superseded-
     () => cli.run(['node', 'ratchet', 'retract', probe.id, '--reason', 'promoted: kept the fixture']),
     /superseded-by/
   );
-  cli.run(['node', 'ratchet', 'retract', probe.id, '--reason', 'promoted: rebuilt under proof gates', '--superseded-by', 'art-keep-1']);
+  // 0.8: a promotion must point at a REAL, non-probe replacement — "art-keep-1"
+  // used to be an id nobody recorded, which is residue shipping under a label.
+  const keep = artifacts.addArtifact(cwd, { id: 'art-keep-1', kind: 'code', title: 'build-for-keep' });
+  cli.run(['node', 'ratchet', 'retract', probe.id, '--reason', 'promoted: rebuilt under proof gates', '--superseded-by', keep.id]);
   const after = state.loadState(cwd).artifacts.find((a) => a.id === probe.id);
   assert.strictEqual(after.status, 'retracted');
   assert.strictEqual(after.retracted.supersededBy, 'art-keep-1');
@@ -984,6 +987,135 @@ ok('probe retraction must state its outcome: disposed or promoted (+ superseded-
 ok('session confidence names recorded pressure, not correctness', () => {
   const conf = scoring.scoreConfidence(state.loadState(cwd));
   assert.ok(/recorded loop pressure, not correctness/.test(conf.scope), 'the scope says what the number is not');
+});
+
+// --- artifact integrity + idempotency (0.8 Closure Gate) --------------------
+
+ok('an artifact cannot be born or revised into a terminal status, or carry a reserved field', () => {
+  state.initProject(cwd, { force: true });
+  for (const status of ['closed', 'retracted', 'superseded']) {
+    assert.throws(() => artifacts.addArtifact(cwd, { title: 'x', status }), /terminal statuses are earned/);
+  }
+  for (const field of ['rev', 'closedAt', 'closedBy', 'closedRev', 'closedHash', 'holesWaiver', 'retracted', 'supersededBy']) {
+    assert.throws(() => artifacts.addArtifact(cwd, { title: 'x', [field]: 'forged' }), /written by the CLI/);
+  }
+  assert.strictEqual(state.loadState(cwd).artifacts.length, 0, 'nothing was written by a refused add');
+});
+
+ok('re-adding the same id revises in place; an identical retry is a true no-op', () => {
+  state.initProject(cwd, { force: true });
+  const first = artifacts.addArtifact(cwd, { id: 'art-fixed', title: 'spec', kind: 'spec', path: '', holes: [] });
+  assert.strictEqual(first.rev, 1, 'birth is rev 1');
+
+  const before = fs.readFileSync(state.statePath(cwd), 'utf8');
+  const retry = artifacts.addArtifact(cwd, { id: 'art-fixed', title: 'spec', kind: 'spec', path: '', holes: [] });
+  assert.strictEqual(retry.rev, 1, 'an identical retry does not bump rev — that would invalidate bound proof');
+  assert.strictEqual(fs.readFileSync(state.statePath(cwd), 'utf8'), before, 'and writes nothing at all');
+
+  const revised = artifacts.addArtifact(cwd, { id: 'art-fixed', title: 'spec v2', kind: 'spec' });
+  assert.strictEqual(revised.rev, 2, 'a real change is a revision');
+  const s = state.loadState(cwd);
+  assert.strictEqual(s.artifacts.filter((a) => a.id === 'art-fixed').length, 1, 'one id, one record');
+  assert.ok(s.history.some((h) => h.event === 'artifact.revised'));
+});
+
+ok('kind is immutable on an update in place', () => {
+  state.initProject(cwd, { force: true });
+  artifacts.addArtifact(cwd, { id: 'art-probe', kind: 'probe', title: 'probe: x' });
+  assert.throws(() => artifacts.addArtifact(cwd, { id: 'art-probe', kind: 'code' }), /immutable/);
+  assert.strictEqual(state.loadState(cwd).artifacts[0].kind, 'probe', 'a probe cannot become closable in place');
+});
+
+ok('an ambiguous id refuses every lifecycle verb, repair-ably', () => {
+  state.initProject(cwd, { force: true });
+  const s = state.loadState(cwd);
+  s.artifacts = [
+    { id: 'dup', kind: 'spec', title: 'one', status: 'v0', holes: [], rev: 1 },
+    { id: 'dup', kind: 'spec', title: 'two', status: 'v0', holes: [], rev: 1 },
+  ];
+  state.saveState(cwd, s);
+  assert.throws(() => artifacts.addArtifact(cwd, { id: 'dup', title: 'three' }), /share the id "dup"/);
+  assert.throws(() => cli.run(['node', 'ratchet', 'retract', 'dup', '--reason', 'x']), /share the id "dup"/);
+});
+
+ok('"revises" is provenance only — the prior artifact stays live', () => {
+  state.initProject(cwd, { force: true });
+  const a = artifacts.addArtifact(cwd, { id: 'art-old', title: 'v1', kind: 'spec' });
+  const b = artifacts.addArtifact(cwd, { id: 'art-new', title: 'v2', kind: 'spec', revises: 'art-old' });
+  assert.strictEqual(b.revises, 'art-old', 'the link is recorded');
+  assert.strictEqual(state.loadState(cwd).artifacts.find((x) => x.id === a.id).status, 'v0', 'no lifecycle side effect');
+});
+
+ok('a promoted probe must name an existing, non-probe replacement', () => {
+  state.initProject(cwd, { force: true });
+  const probe = artifacts.addArtifact(cwd, { kind: 'probe', title: 'probe: promotion gate' });
+  assert.throws(
+    () => cli.run(['node', 'ratchet', 'retract', probe.id, '--reason', 'promoted: x', '--superseded-by', 'art-does-not-exist']),
+    /names no artifact/
+  );
+  const other = artifacts.addArtifact(cwd, { kind: 'probe', title: 'probe: not a replacement' });
+  assert.throws(
+    () => cli.run(['node', 'ratchet', 'retract', probe.id, '--reason', 'promoted: x', '--superseded-by', other.id]),
+    /itself a probe/
+  );
+});
+
+ok('defects attach to exactly one live artifact, or refuse and name the candidates', () => {
+  state.initProject(cwd, { force: true });
+  // ZERO live artifacts → unattached, stated
+  const orphan = artifacts.addDefect(cwd, { severity: 'low', summary: 'no home' });
+  assert.strictEqual(orphan.state.artifact, '');
+  assert.strictEqual(orphan.state.attachedBy, 'none');
+
+  // exactly ONE → auto-attach, stamped with the artifact identity it attacks
+  state.initProject(cwd, { force: true });
+  const only = artifacts.addArtifact(cwd, { title: 'only', kind: 'spec' });
+  const auto = artifacts.addDefect(cwd, { severity: 'high', summary: 'boom' });
+  assert.strictEqual(auto.state.artifact, only.id);
+  assert.strictEqual(auto.state.attachedBy, 'auto');
+  assert.strictEqual(auto.state.artifactRev, 1, 'the defect records which revision it attacks');
+  assert.ok(auto.state.artifactHash, 'and that revision\'s hash');
+
+  // TWO+ → refuse, naming them
+  artifacts.addArtifact(cwd, { title: 'second', kind: 'spec' });
+  assert.throws(() => artifacts.addDefect(cwd, { severity: 'high', summary: 'ambiguous' }), /2 live artifacts/);
+});
+
+ok('a repeat defect report dedups and escalates in place', () => {
+  state.initProject(cwd, { force: true });
+  artifacts.addArtifact(cwd, { title: 'only', kind: 'spec' });
+  const first = artifacts.addDefect(cwd, { severity: 'low', summary: '  Flaky Under Load  ' });
+  const again = artifacts.addDefect(cwd, { severity: 'critical', summary: 'flaky under load' });
+  assert.strictEqual(again.state.id, first.state.id, 'same artifact + same summary = the same defect');
+  assert.strictEqual(state.loadState(cwd).defects.length, 1, 'no duplicate record');
+  assert.strictEqual(again.state.severity, 'critical', 'severity escalates in place');
+  // de-escalation never happens silently
+  artifacts.addDefect(cwd, { severity: 'info', summary: 'flaky under load' });
+  assert.strictEqual(state.loadState(cwd).defects[0].severity, 'critical', 'a milder repeat cannot downgrade it');
+  // a resolved defect is out of the dedup window — a regression is a new record
+  cli.run(['node', 'ratchet', 'defect', 'resolve', first.state.id, '--evidence', 'fixed and verified']);
+  const fresh = artifacts.addDefect(cwd, { severity: 'high', summary: 'flaky under load' });
+  assert.notStrictEqual(fresh.state.id, first.state.id, 'a terminal defect does not absorb a fresh report');
+});
+
+ok('a defect cannot be born terminal', () => {
+  state.initProject(cwd, { force: true });
+  for (const status of ['resolved', 'waived', 'superseded', 'closed']) {
+    assert.throws(() => artifacts.addDefect(cwd, { summary: 'x', status }), /cannot be born/);
+  }
+});
+
+ok('the defect transition engine enforces its own proof, not just the CLI', () => {
+  state.initProject(cwd, { force: true });
+  artifacts.addArtifact(cwd, { title: 'only', kind: 'spec' });
+  const { state: d } = artifacts.addDefect(cwd, { severity: 'high', summary: 'engine gate' });
+  // Called directly — bypassing cmdDefect's own checks entirely.
+  assert.throws(() => artifacts.transitionDefect(cwd, d.id, 'resolved', {}), /no proof/i);
+  assert.throws(() => artifacts.transitionDefect(cwd, d.id, 'waived', { owner: 'danny' }), /reason/i);
+  assert.throws(() => artifacts.transitionDefect(cwd, d.id, 'waived', { reason: 'x' }), /owner/i);
+  assert.throws(() => artifacts.transitionDefect(cwd, d.id, 'reopened', {}), /reason/i);
+  assert.throws(() => artifacts.transitionDefect(cwd, d.id, 'superseded', {}), /by/i);
+  assert.strictEqual(state.loadState(cwd).defects.find((x) => x.id === d.id).status, 'open', 'nothing leaked through');
 });
 
 // --- closure derivation (0.8 Closure Gate) ----------------------------------

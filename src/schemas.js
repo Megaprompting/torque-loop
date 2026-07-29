@@ -101,6 +101,23 @@ const PHASES = ['idle', 'lock', 'auction', 'cut', 'build', 'attack', 'patch', 'c
 const DEFECT_STATUSES = ['open', 'patched', 'reopened', 'resolved', 'waived', 'superseded', 'closed'];
 const DEFECT_TERMINAL_STATUSES = ['resolved', 'closed', 'waived', 'superseded'];
 
+// Artifact lifecycle exits. Each is reached by a gated verb (`artifact close`,
+// `retract`) and none may be asserted in an `artifact add` payload — a status
+// that can be typed is not a gate.
+const ARTIFACT_TERMINAL_STATUSES = ['closed', 'retracted', 'superseded'];
+// Fields the CLI writes as the record of a gated transition. A caller that
+// could supply them could forge a closure certificate in a JSON payload.
+const ARTIFACT_RESERVED_FIELDS = [
+  'rev',
+  'closedAt',
+  'closedBy',
+  'closedRev',
+  'closedHash',
+  'holesWaiver',
+  'retracted',
+  'supersededBy',
+];
+
 module.exports = {
   STATE_VERSION,
   LEDGER_VERSION,
@@ -115,4 +132,6 @@ module.exports = {
   PHASES,
   DEFECT_STATUSES,
   DEFECT_TERMINAL_STATUSES,
+  ARTIFACT_TERMINAL_STATUSES,
+  ARTIFACT_RESERVED_FIELDS,
 };
