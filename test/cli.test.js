@@ -1134,7 +1134,42 @@ ok('the defect transition engine enforces its own proof, not just the CLI', () =
   assert.throws(() => artifacts.transitionDefect(cwd, d.id, 'waived', { reason: 'x' }), /owner/i);
   assert.throws(() => artifacts.transitionDefect(cwd, d.id, 'reopened', {}), /reason/i);
   assert.throws(() => artifacts.transitionDefect(cwd, d.id, 'superseded', {}), /by/i);
+  // 'closed' is the pre-0.3 alias for resolved and is TERMINAL to the scorer, so
+  // transitioning into it with no evidence cleared the drain with no proof at
+  // all — the one unguarded door in an otherwise gated set.
+  assert.throws(() => artifacts.transitionDefect(cwd, d.id, 'closed', {}), /resolve|waive|supersede/i);
+  assert.throws(() => artifacts.transitionDefect(cwd, d.id, 'closed', { evidence: 'even with proof' }), /resolve|waive|supersede/i);
+  assert.throws(() => cli.run(['node', 'ratchet', 'defect', 'closed', d.id]), /usage|resolve/i);
   assert.strictEqual(state.loadState(cwd).defects.find((x) => x.id === d.id).status, 'open', 'nothing leaked through');
+});
+
+ok('a legacy "closed" defect still reads as terminal, it just cannot be written', () => {
+  // Read-only alias: stores written before 0.3 carry status:'closed' and must
+  // keep scoring as terminal. Only the WRITE path is closed.
+  const legacy = { id: 'd-legacy', severity: 'critical', summary: 'old', status: 'closed' };
+  assert.strictEqual(scoring.isDefectOpen(legacy), false, 'a legacy closed defect does not drain');
+});
+
+ok('init --force is the same irreversible wipe as state reset, and gated the same', () => {
+  state.initProject(cwd, { force: true });
+  const s = state.loadState(cwd);
+  s.objective = 'do not lose me through the other door';
+  state.saveState(cwd, s);
+
+  assert.throws(() => cli.run(['node', 'ratchet', 'init', '--force']), /owner/);
+  assert.throws(() => cli.run(['node', 'ratchet', 'init', '--force', '--owner', 'danny']), /reason/);
+  assert.strictEqual(
+    state.loadState(cwd).objective, 'do not lose me through the other door',
+    'an unauthorized init --force must not wipe what state reset --force refuses to wipe'
+  );
+
+  cli.run(['node', 'ratchet', 'init', '--force', '--owner', 'danny', '--reason', 'fresh run']);
+  const after = state.loadState(cwd);
+  assert.strictEqual(after.objective, '');
+  const tomb = (after.history || []).find((h) => h.event === 'state.reset');
+  assert.ok(tomb && /danny/.test(tomb.note) && /fresh run/.test(tomb.note), 'the same tombstone, through either door');
+  // plain init still just ensures the dir exists
+  assert.doesNotThrow(() => cli.run(['node', 'ratchet', 'init']));
 });
 
 // --- write-boundary gates (0.8 Closure Gate) --------------------------------

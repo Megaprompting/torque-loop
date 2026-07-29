@@ -124,6 +124,18 @@ function assertMayWrite(action) {
   }
 }
 
+// Both doors onto the irreversible wipe (`state reset --force`, `init --force`)
+// ask the same two questions, so neither becomes the cheap way past the other.
+// Returns the owner + reason that go into the tombstone.
+function authorizeWipe(argv, verb) {
+  const { opts } = parseArgv(argv, { booleans: ['force', 'json'] });
+  const owner = strOpt(opts.owner);
+  const reason = strOpt(opts.reason);
+  if (!owner) throw new Error(`${verb} requires --owner "<who authorized the wipe>"`);
+  if (!reason) throw new Error(`${verb} requires --reason "<why the record is being destroyed>"`);
+  return { owner, reason };
+}
+
 // ---------------------------------------------------------------------------
 // Command table.
 // ---------------------------------------------------------------------------
@@ -154,10 +166,17 @@ function run(argv) {
       return out(`ratchet ${VERSION}`);
 
     case 'init': {
-      // `init --force` resets the store — a canonical mutation. Plain init only
-      // ensures the dir exists, so a propose-only agent may still orient.
-      if (flags.has('--force')) assertMayWrite('init --force');
-      const res = state.initProject(cwd, { force: flags.has('--force') });
+      // `init --force` is the SAME irreversible wipe as `state reset --force` —
+      // it just used to be the door with no lock on it. One authority check, one
+      // tombstone, whichever verb the caller reached for. Plain init only ensures
+      // the dir exists, so a propose-only agent may still orient.
+      if (flags.has('--force')) {
+        assertMayWrite('init --force');
+        const wipe = authorizeWipe(args, 'ratchet init --force');
+        const forced = state.initProject(cwd, { force: true, resetBy: wipe.owner, resetReason: wipe.reason });
+        return out(`Ratchet re-initialized at ${forced.dir} (owner: ${wipe.owner})`);
+      }
+      const res = state.initProject(cwd);
       return out(`Ratchet initialized at ${res.dir}${res.created ? '' : ' (already existed)'}`);
     }
 
@@ -338,13 +357,9 @@ function cmdState(cwd, sub, rest, asJson, flags = new Set(), argv = []) {
             'this is irreversible. Re-run with --force to authorize.'
         );
       }
-      const { opts } = parseArgv(argv, { booleans: ['force', 'json'] });
-      const owner = strOpt(opts.owner);
-      const reason = strOpt(opts.reason);
-      if (!owner) throw new Error('state reset --force requires --owner "<who authorized the wipe>"');
-      if (!reason) throw new Error('state reset --force requires --reason "<why the record is being destroyed>"');
-      state.initProject(cwd, { force: true, resetBy: owner, resetReason: reason });
-      return out(`state reset (owner: ${owner})`);
+      const wipe = authorizeWipe(argv, 'state reset --force');
+      state.initProject(cwd, { force: true, resetBy: wipe.owner, resetReason: wipe.reason });
+      return out(`state reset (owner: ${wipe.owner})`);
     }
     default:
       throw new Error(`unknown state subcommand: ${sub}`);
@@ -960,7 +975,9 @@ function help() {
       '                                    --save writes .ratchet/current.json + .md (the source-of-truth index)',
       '',
       'STATE',
-      '  ratchet init [--force]              create/reset project data dir',
+      '  ratchet init                        create the project data dir',
+      '  ratchet init --force --owner "<n>" --reason "<r>"',
+      '                                     RE-init: the same irreversible wipe as state reset --force',
       '  ratchet status [--json]            render current state',
       '  ratchet state get [key] [--json]   read state (or one key)',
       '  ratchet state set <key> <value>    set objective|title|bottleneck|phase|nextAction|nextCommand|...',

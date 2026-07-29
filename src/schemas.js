@@ -101,6 +101,11 @@ const PHASES = ['idle', 'lock', 'auction', 'cut', 'build', 'attack', 'patch', 'c
 // for `resolved`. A defect only leaves the terminal set by being reopened.
 const DEFECT_STATUSES = ['open', 'patched', 'reopened', 'resolved', 'waived', 'superseded', 'closed'];
 const DEFECT_TERMINAL_STATUSES = ['resolved', 'closed', 'waived', 'superseded'];
+// `closed` is READ-ONLY: it stays terminal for stores written before 0.3, but it
+// is not a status anything may transition INTO. It was the one terminal status
+// with no proof attached to it, so writing it cleared the drain with no evidence
+// while `resolved` next door demanded --evidence.
+const DEFECT_WRITABLE_STATUSES = DEFECT_STATUSES.filter((s) => s !== 'closed');
 
 // Artifact lifecycle exits. Each is reached by a gated verb (`artifact close`,
 // `retract`) and none may be asserted in an `artifact add` payload — a status
@@ -133,6 +138,7 @@ module.exports = {
   PHASES,
   DEFECT_STATUSES,
   DEFECT_TERMINAL_STATUSES,
+  DEFECT_WRITABLE_STATUSES,
   ARTIFACT_TERMINAL_STATUSES,
   ARTIFACT_RESERVED_FIELDS,
 };

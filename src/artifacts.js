@@ -256,8 +256,14 @@ function addDefect(cwd, item, { alsoLedger = true } = {}) {
 // confidence-blocking forever. The scorer already honors terminal statuses
 // (scoring.isDefectOpen); this is what finally lets a defect *reach* one.
 function transitionDefect(cwd, id, toStatus, meta = {}) {
-  if (!schemas.DEFECT_STATUSES.includes(toStatus)) {
-    throw new Error(`unknown defect status "${toStatus}". valid: ${schemas.DEFECT_STATUSES.join(', ')}`);
+  if (toStatus === 'closed') {
+    throw new Error(
+      '"closed" is a read-only legacy alias (pre-0.3) and cannot be transitioned into — it is terminal with no ' +
+        'proof attached. Use resolve (--evidence), waive (--owner + --reason), or supersede (--by).'
+    );
+  }
+  if (!schemas.DEFECT_WRITABLE_STATUSES.includes(toStatus)) {
+    throw new Error(`unknown defect status "${toStatus}". valid: ${schemas.DEFECT_WRITABLE_STATUSES.join(', ')}`);
   }
   // The proof each clearing verb owes, enforced HERE rather than only in the
   // CLI: cmdDefect is one caller, and a gate that lives in one caller is a
