@@ -99,7 +99,11 @@ interleavings are the operating system's, not a simulation. Traced by: claude-op
   rather than at each call site, since three of those five had already forgotten it. A holding
   that is no longer ours turns the publish into a **loser-side refusal that writes nothing**
   (`ERATCHETLOCKLOST`). That is what shrinks the remaining protocol races from data-loss hazards
-  to logged incidents.
+  to logged incidents. One window survives and is claimed as a **known defect, not covered**: the
+  verification and the rename are two instructions, so a steal landing in the instant between
+  them still publishes. No user-space check can fuse them — closing it needs an OS-level
+  verify-and-rename primitive that does not exist — and reaching it at all requires a lock steal
+  the rest of this section already makes fail-stop or verified. Shrunk, named, not eliminated.
 - **Reentrancy is decided, not discovered.** A nested `withWorkspaceMutation` is refused
   loudly (never a silent self-deadlock); a nested lock scope on the *same* workspace joins
   the open one; a second *different* workspace is refused.
@@ -124,8 +128,10 @@ interleavings are the operating system's, not a simulation. Traced by: claude-op
 - **A malformed record is repaired, once, under the lock.** The corrupt-bytes backup is a WRITE
   and used to happen before the lock, in a read. Backup and repair now both run inside the
   workspace lock, and the unusable file is REPLACED (its bytes are already preserved — including
-  documents that PARSE but are not records: `null`, `false`, `0`, `""`, `[]` were replaced with no
-  backup at all, because the repair tested truthiness rather than shape) instead of
+  FALSEY documents that parse but are not records: `null`, `false`, `0`, `""` were replaced with
+  no backup at all, because the repair tested truthiness rather than shape; a TRUTHY non-record
+  such as `[]` or a bare scalar still slips past the shape check — a **known defect**: `[]` is
+  returned as-is and a scalar throws instead of repairing) instead of
   being refused as "already exists" — which had left the bad file in place forever, so every
   future read backed it up again and the store could never be opened.
 - **A CAS refusal on an absent store leaves the store absent.** Naming `expectedStateRev`
@@ -200,8 +206,10 @@ interleavings are the operating system's, not a simulation. Traced by: claude-op
   by a different route. The 0.8 assertion "a fresh state opens at rev 0" after a force reset was
   moved to its own store, where rev 0 still means what it says.
 
-  The generation is a new state field, `gen`, minted from **CSPRNG entropy** at every creation and
-  every wipe — deliberately *not* a timestamp. It was `createdAt` for one cycle and that was a
+  The generation is a new state field, `gen`, minted from **CSPRNG entropy** at every
+  `newState`-backed creation and every wipe — deliberately *not* a timestamp. (Scoped: the
+  exported raw `saveState` can still create an absent store from a caller-supplied legacy object
+  without `gen`; no shipped caller does.) It was `createdAt` for one cycle and that was a
   hole: `createdAt` comes from `nowIso`, which honours `RATCHET_NOW`, so under a frozen clock — a
   supported mode, used by hooks and by deterministic tests — both generations stamped identically,
   the check compared equal, and the wiped objective came back. Generation identity follows the
@@ -242,7 +250,7 @@ interleavings are the operating system's, not a simulation. Traced by: claude-op
   `<statePath>@<rev>` in a **process-local, bounded (64-entry) cache**, and a snapshot at a
   revision nothing remembers is **refused** (`ERATCHETSTALE`) rather than written blind. Revision
   identity is safe across generations because a reset no longer reuses revision numbers and
-  `createdAt` is checked besides; the cache is a convenience for rebasing, never the thing that
+  `gen` is checked besides; the cache is a convenience for rebasing, never the thing that
   decides whether a write is allowed.
 - **`saveState` and `saveLedger` are the same door as the boundary, not softer ones.** Both now
   enforce the propose-only write guard (a propose-only agent could write canonical state through
@@ -273,7 +281,9 @@ interleavings are the operating system's, not a simulation. Traced by: claude-op
 
 Named because an over-claimed guardrail is worse than none. Within **one workspace, on the
 tested platform (Windows/NTFS, Node 24, local filesystem)**, v0.9 guarantees ordered mutation
-and lost-update prevention for writes that go through the boundary. It does **not** claim:
+and lost-update prevention for writes that go through the boundary — less the named
+verify-to-rename instant in the publish fence, which is a known defect, reachable only through
+an already-failed lock protocol, and stated where the fence is described. It does **not** claim:
 multi-file crash atomicity (`state.json` and `ledger.json` commit separately — a crash
 between them can leave an orphan ledger mirror); durability against power loss (the file is
 fsynced, the containing directory is not); correctness on network filesystems, where `mkdir`
@@ -289,7 +299,10 @@ The boundaries the reviews of this gate named explicitly:
   resolved with `realpath` — which now resolves the FILE, so a symlinked log and its target share
   one lock (they did not in the first cut). A **dangling** symlink is resolved by following the
   link by hand, because `realpath` fails on one and falling back to the link's own name changed
-  the lock identity the moment the target appeared — one file, two keys, both held. Two hard links
+  the lock identity the moment the target appeared — one file, two keys, both held. The hand
+  resolution is bounded at **32 hops**; a longer (or cyclic) dangling chain gets a partial path
+  as its key — split-lock identity past that bound is a **known defect**, kept because refusing
+  outright would make a pathological chain unlockable rather than merely unshared. Two hard links
   to one inode are still two paths, so they are still two locks: keying a lock by inode is not
   buildable dependency-free. Parked, owner Danny.
 - **Windows path casing is not normalized by the file lock.** `realpath` returns the spelling it
