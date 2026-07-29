@@ -146,9 +146,53 @@ no-op), duplicate ids (refused repair-ably), an unattached open defect (blocks
 no `artifactId` (permanently unbound), and no `rev` fields — and asserts the store loads,
 scores, renders, and accepts every new verb without corruption.
 
+### Hardened after adversarial review
+
+A second model reviewed the gate by full source + diff inspection. Every finding below was
+proven red before its fix; all are CLI-enforced unless marked.
+
+- **Scope is part of the binding.** Record scope hashes `record:<kind>\n<title>\n<holes>`,
+  so a FILE containing exactly those bytes collides — and rev does not move when a path
+  goes from "not a file" to "a file". An old record/manual KEEP could therefore close a new
+  code file, skipping both the seam gate and the record-owner gate. `bindingEvent` now
+  requires the event's `hashScope` to match.
+- **The fingerprint hashes bytes, not a text decode.** `readFileSync(…, 'utf8')` maps every
+  invalid byte to U+FFFD, so `0x80` and `0x81` hashed identically. Valid UTF-8 is
+  unaffected, so no existing text binding moves.
+- **Proof must name the revision it ran against.** A metadata-only revision leaves the file
+  untouched, so `verifiedHash` still matched while the artifact had moved on — rev-1
+  evidence could be stamped onto rev 2. `verifiedRev` is now required and matched
+  (`ratchet-evolve verify` already emitted it; nothing consumed it). The verify skill
+  carries both fields (prompt-level).
+- **A bound event cannot claim its own provenance** — `source` is stamped, not supplied.
+- **A workflow with live work left is not closed.** `workflowClosed` keyed off the most
+  recent record, so closing B and then building A read CLOSED while `nextTransition`
+  demanded A's verification. It now prefers any remaining live artifact, and once none
+  remain an open defect attached to the certified artifact still blocks: a certificate
+  covers the revision it was granted against, not work raised since.
+- **`closed` is a read-only legacy alias.** Transitioning into it cleared the drain with no
+  evidence while `resolved` next door required `--evidence`. Legacy records still score as
+  terminal; only the write path closed.
+- **`init --force` is gated like `state reset --force`** — same `--owner` + `--reason`, same
+  tombstone, one shared code path, so neither is the cheap way past the other.
+- **Unreadable is not missing.** Only `ENOENT` means "no record yet"; any other read error
+  (ACL, lock, EIO) now throws instead of reinitializing over a record that exists and
+  cannot be seen.
+- **A legacy-cased Windows store is migrated, not borrowed.** The fallback returned the old
+  dir per call and never moved it, so a differently-cased cwd stranded the real store and
+  opened an empty one beside it. It is now renamed once to the normalized slug; if BOTH
+  exist the CLI refuses and names both paths rather than guessing.
+- **One normalization for birth and revision.** The two paths coerced differently, so a
+  legacy record acquiring a missing `holes: []` counted as a change and bumped rev —
+  invalidating bound proof for a write that changed nothing.
+- **A defect whose artifact cannot be fingerprinted is recorded, not half-attached.** The
+  stamp used to fail silently, leaving an attachment that blocked closure while carrying no
+  evidence of which revision it attacked. It is now kept and detached loudly
+  (`attachedBy:'error'` + `attachError`).
+
 ### Trust boundary
 
-The proof binding is **machine-authored, not unforgeable**. It stops in-band laundering by
+The proof binding is **machine-authored but forgeable by filesystem writers**. It stops in-band laundering by
 the model — the path the loop itself runs through — by refusing caller-supplied identity,
 caller-chosen mode, and stale verification. It is **not** filesystem tampering protection:
 the journal is plaintext at a caller-selectable path (`RATCHET_EVOLVE_LOG`), so anyone who
