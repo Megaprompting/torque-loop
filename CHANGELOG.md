@@ -165,7 +165,8 @@ interleavings are the operating system's, not a simulation. Traced by: claude-op
 ### Changed
 
 - **A `state reset --force` continues the revision line; it does not restart at 0.** *(Deliberate
-  semantics change — flagged for Danny's veto.)* Reusing rev 0 meant a writer that had loaded the
+  semantics change — ratified by Danny, 2026-07-29: a store's revision line never restarts while
+  the store exists.)* Reusing rev 0 meant a writer that had loaded the
   previous generation at rev 0 came back, found rev 0 again, matched, took the fast path and wrote
   its pre-reset record straight over the fresh one — erasing an authorized wipe with a stale
   snapshot. A reset now commits as one more revision of the same store; a genuinely new store
