@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`src/mcp/rpc.js` — the Torque MCP RPC kernel with era pinning** (CLI-enforced at the
+  kernel boundary; Torque MCP 1.0 build-order step 1 of the ratified spec). A connection
+  speaks exactly one protocol era: `server/discover` pins **modern** (MCP `2026-07-28` —
+  stateless, version and capabilities in `_meta` on **every** request, required
+  `resultType`, `serverInfo` answered in result `_meta`), `initialize` pins **legacy**
+  (`2025-11-25` handshake, answered in its own shape with no modern fields leaked), and
+  after the pin the other era's surface is a named `-32010` refusal carrying the remedy
+  (reconnect) — never a silent downgrade, never a mixed connection. A missing or
+  unsupported protocol version is `-32022` (`UnsupportedProtocolVersion`, MCP-allocated
+  range) naming both supported doors; a method that exists only in the other era refuses
+  by era rather than lying with `-32601`. Handlers register per-era in a declarative
+  table; a throwing handler answers `-32603` and the connection survives. Scope: the
+  kernel judges envelopes and eras only — no tools, resources, state access, or transport
+  policy live here (those are later build-order steps).
+- **`src/mcp/stdio.js` — newline-delimited JSON framing for local stdio** (Phase 1
+  transport). Framing only: split and coalesced chunks reassemble, a garbage line answers
+  `-32700` instead of killing the stream, an unterminated line past `maxLineBytes`
+  (default 8 MiB) is refused once and discarded rather than buffered forever, and every
+  protocol judgment defers to the kernel. No `bin/` entry point yet — exposing `ratchet-mcp` is a public-surface decision
+  parked for Danny (open loop).
+- **`test/mcp-rpc.test.js` — 22-case contract suite**, wired into `npm test` (the
+  plugin-shape unwired-suite guard was verified red against it first).
+
 ## [0.9.0] - 2026-07-29 — Concurrency Gate
 
 0.2 gated proof; 0.3 the seam; 0.6 the fog; 0.7 the probe; 0.8 closure — and every one
