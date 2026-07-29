@@ -106,13 +106,16 @@ function createKernel({ serverInfo, capabilities, methods }) {
           throw rpcError(ERR_INVALID_REQUEST,
             'this request proves both eras — a legacy initialize cannot carry the modern protocol marker');
         }
+        const info_ = params && params.clientInfo;
         const shaped = params && typeof params === 'object' && !Array.isArray(params) &&
           typeof params.protocolVersion === 'string' &&
           typeof params.capabilities === 'object' && params.capabilities !== null && !Array.isArray(params.capabilities) &&
-          typeof params.clientInfo === 'object' && params.clientInfo !== null && !Array.isArray(params.clientInfo);
+          typeof info_ === 'object' && info_ !== null && !Array.isArray(info_) &&
+          typeof info_.name === 'string' && typeof info_.version === 'string';
         if (!shaped) {
           throw rpcError(ERR_INVALID_PARAMS,
-            'initialize params carry protocolVersion (string), capabilities (object), and clientInfo (object) — an incomplete handshake pins nothing');
+            'initialize params carry protocolVersion (string), capabilities (object), and clientInfo ' +
+              '{name, version} (strings) — an incomplete handshake pins nothing');
         }
         era = 'legacy'; // pinned only after the handshake proves its shape
         return {
@@ -176,20 +179,22 @@ function createKernel({ serverInfo, capabilities, methods }) {
       if (Array.isArray(msg)) {
         return errorResponse(null, ERR_INVALID_REQUEST, 'batch requests were removed from MCP; send one message per line');
       }
-      // An id is echoable only as a string, a finite number, or null — anything
-      // else answers as null on EVERY refusal path, so a malformed envelope can
-      // never round-trip an object id (an invalid response in its own right).
-      const idEchoable = msg && typeof msg === 'object' && (
-        typeof msg.id === 'string' || (typeof msg.id === 'number' && Number.isFinite(msg.id)) || msg.id === null
-      );
+      // Read the id ONCE and judge that value: re-reading lets an accessor
+      // validate as one id and echo as another. Echoable means a string, a
+      // faithfully round-trippable number, or null — an unsafe integer comes
+      // back as a different number, which is not the id the client sent.
+      const id = msg && typeof msg === 'object' ? msg.id : undefined;
+      const idEchoable = typeof id === 'string' || id === null ||
+        (typeof id === 'number' && Number.isFinite(id) && (!Number.isInteger(id) || Number.isSafeInteger(id)));
       if (!msg || typeof msg !== 'object' || msg.jsonrpc !== JSONRPC || typeof msg.method !== 'string') {
-        return errorResponse(idEchoable ? msg.id : null, ERR_INVALID_REQUEST, 'not a JSON-RPC 2.0 request');
+        return errorResponse(idEchoable ? id : null, ERR_INVALID_REQUEST, 'not a JSON-RPC 2.0 request');
       }
-      if (msg.id !== undefined && !idEchoable) {
-        return errorResponse(null, ERR_INVALID_REQUEST, 'a JSON-RPC id is a string, a finite number, or null');
+      if (id !== undefined && !idEchoable) {
+        return errorResponse(null, ERR_INVALID_REQUEST,
+          'a JSON-RPC id is a string, null, or a number this server can echo back unchanged');
       }
 
-      const isNotification = msg.id === undefined;
+      const isNotification = id === undefined;
       if (isNotification && (msg.method === 'initialize' || msg.method === 'server/discover')) {
         // A handshake needs an answer to exist; a notification-shaped one can
         // only pin an era silently, which poisons the connection. Dropped.
@@ -208,11 +213,21 @@ function createKernel({ serverInfo, capabilities, methods }) {
           if (typeof result !== 'object' || result === null || Array.isArray(result)) {
             throw rpcError(ERR_INTERNAL, `handler for ${msg.method} returned a non-object result`);
           }
-          // A toJSON would rewrite the wire shape AFTER decoration, silently
-          // erasing resultType and _meta — the wire shape is the kernel's to
-          // guarantee, so a result that reserves the right to change it is bad.
-          if (typeof result.toJSON === 'function') {
-            throw rpcError(ERR_INTERNAL, `handler for ${msg.method} returned a result carrying toJSON`);
+          // Normalize to inert data BEFORE decorating. Inspecting a result for
+          // hazards loses: a `toJSON` can hide behind a getter that answers
+          // differently on the second read, or sit one level down in `_meta`,
+          // and either way JSON.stringify runs it AFTER the kernel decorated —
+          // erasing resultType and serverInfo on the wire. Serializing once
+          // here settles every such trick (and a getter that throws, or a value
+          // JSON cannot carry, becomes -32603 inside this boundary); what comes
+          // back is plain data that cannot rewrite itself later.
+          try {
+            result = JSON.parse(JSON.stringify(result));
+          } catch (e) {
+            throw rpcError(ERR_INTERNAL, `handler for ${msg.method} returned a result that cannot be serialized`);
+          }
+          if (typeof result !== 'object' || result === null || Array.isArray(result)) {
+            throw rpcError(ERR_INTERNAL, `handler for ${msg.method} returned a result that does not serialize to an object`);
           }
           if (era === 'modern') {
             // Modern results always name themselves: resultType is required by
@@ -226,7 +241,7 @@ function createKernel({ serverInfo, capabilities, methods }) {
             if (result.resultType === undefined) result.resultType = 'complete';
             result._meta = { ...result._meta, [META + 'serverInfo']: info };
           }
-          response = { jsonrpc: JSONRPC, id: msg.id, result };
+          response = { jsonrpc: JSONRPC, id, result };
         }
       } catch (e) {
         if (isNotification) {
@@ -234,7 +249,7 @@ function createKernel({ serverInfo, capabilities, methods }) {
           return null;
         }
         const rpc = e && e.rpc ? e.rpc : { code: ERR_INTERNAL, message: 'internal error' };
-        return errorResponse(msg.id, rpc.code, rpc.message, rpc.data);
+        return errorResponse(id, rpc.code, rpc.message, rpc.data);
       }
       return isNotification ? null : response;
     }

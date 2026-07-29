@@ -628,5 +628,95 @@ ok('D8 invalid UTF-8 is a named refusal, and a legitimate U+FFFD still passes', 
   assert.match(parsed[1].error.message, /UTF-8/);
 });
 
+// --- Codex round 3 (2026-07-29) — the ship-blocking residue ------------------
+// Round 3 returned "one connection, one era: YES" with a patch-then-ship list.
+// These are that list; the invariant itself was not in question.
+
+ok('E1 no result can rewrite its own WIRE shape — getter, nested, or plain', () => {
+  // Asserted on the serialized bytes, not the kernel's return value: the whole
+  // defect is that JSON.stringify runs code the kernel already inspected.
+  let reads = 0;
+  const input = new PassThrough();
+  const output = new PassThrough();
+  const lines = [];
+  output.on('data', (chunk) => lines.push(...String(chunk).split('\n').filter((l) => l.length)));
+  stdio.attach(kernel({
+    // A toJSON that hides from the guard and appears during serialization.
+    'sneak/getter': {
+      eras: ['modern'],
+      handler: () => Object.defineProperty({ ok: true }, 'toJSON', {
+        enumerable: true,
+        get() { return reads++ === 0 ? undefined : () => 42; },
+      }),
+    },
+    // A nested toJSON needs no accessor trickery at all.
+    'sneak/nested': { eras: ['modern'], handler: () => ({ _meta: { toJSON() { return 'gone'; } } }) },
+  }), { input, output });
+
+  input.write(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'sneak/getter', params: { _meta: modernMeta() } }) + '\n');
+  input.write(JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'sneak/nested', params: { _meta: modernMeta() } }) + '\n');
+  const [a, b] = lines.map((l) => JSON.parse(l));
+
+  if (a.error) {
+    assert.strictEqual(a.error.code, -32603);
+  } else {
+    assert.strictEqual(a.result.resultType, 'complete', 'decoration must survive a shape-shifting toJSON');
+    assert.ok(a.result._meta && a.result._meta[META + 'serverInfo'], 'serverInfo must survive it too');
+  }
+  if (b.error) {
+    assert.strictEqual(b.error.code, -32603);
+  } else {
+    assert.strictEqual(b.result.resultType, 'complete');
+    assert.ok(b.result._meta && b.result._meta[META + 'serverInfo'], 'a nested toJSON must not erase serverInfo');
+  }
+});
+
+ok('E2 a handshake whose clientInfo has no name or version is incomplete', () => {
+  for (const clientInfo of [{}, { name: 'c' }, { version: '1' }, { name: 1, version: '1' }]) {
+    const conn = kernel().createConnection();
+    const res = conn.handleMessage({
+      jsonrpc: '2.0', id: 1, method: 'initialize',
+      params: { protocolVersion: LEGACY, capabilities: {}, clientInfo },
+    });
+    assert.strictEqual(res.error && res.error.code, -32602, `must refuse clientInfo ${JSON.stringify(clientInfo)}`);
+    assert.strictEqual(conn.era(), null);
+  }
+});
+
+ok('E3 an id that cannot survive the round trip is refused, not silently rounded', () => {
+  const conn = kernel().createConnection();
+  const res = conn.handleMessage('{"jsonrpc":"2.0","id":9007199254740993,"method":"server/discover"}');
+  assert.strictEqual(res.error && res.error.code, -32600, 'an unsafe integer id is echoed as a different number');
+  assert.strictEqual(res.id, null);
+  const fine = conn.handleMessage('{"jsonrpc":"2.0","id":1.5,"method":"server/discover"}');
+  assert.strictEqual(fine.error, undefined, 'a fractional id round-trips fine and stays legal');
+  assert.strictEqual(fine.id, 1.5);
+});
+
+ok('E4 an oversized line leaves no backing storage behind it', () => {
+  const input = new PassThrough();
+  const output = new PassThrough();
+  output.resume();
+  const api = stdio.attach(kernel(), { input, output, maxLineBytes: 8 });
+  const huge = 1024 * 1024;
+  input.write('x'.repeat(huge) + '\n{');
+  // Node hands small buffers slices of a shared 8 KiB pool, so the floor here
+  // is the pool, not zero. What must NOT survive is an allocation that scales
+  // with the refused line.
+  assert.ok(api.retainedBytes() < huge / 8,
+    `a refused line must not retain its allocation — retained ${api.retainedBytes()} bytes of a ${huge}-byte line`);
+});
+
+ok('E5 an id is read once — validation and echo cannot disagree', () => {
+  const conn = kernel().createConnection();
+  let reads = 0;
+  const msg = { jsonrpc: '1.0', method: 'server/discover' };
+  Object.defineProperty(msg, 'id', { enumerable: true, get() { return reads++ === 0 ? 1 : { changed: true }; } });
+  const res = conn.handleMessage(msg);
+  assert.strictEqual(res.error.code, -32600);
+  assert.ok(res.id === null || res.id === 1, `an echoed id must be the validated one, got ${JSON.stringify(res.id)}`);
+  assert.ok(reads <= 1, `the id must be read once and reused, not re-read ${reads} times`);
+});
+
 process.stdout.write(`\n${passed} passed, ${failures.length} failed\n`);
 if (failures.length) process.exitCode = 1;

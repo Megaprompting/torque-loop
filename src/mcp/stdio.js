@@ -71,10 +71,20 @@ function attach(kernel, { input, output, maxLineBytes }) {
       overflowing = true;
       refuse(`line exceeds ${cap} bytes without a newline`);
       buffer = Buffer.alloc(0);
+      return;
+    }
+    // subarray keeps its parent's allocation alive, so the tail of a huge line
+    // would hold that whole line's memory for as long as the tail lives. Copy
+    // the remainder off it: the cap must bound what we actually retain, not
+    // just what we count.
+    if (buffer.buffer.byteLength > cap && buffer.length < buffer.buffer.byteLength) {
+      buffer = Buffer.from(buffer);
     }
   });
 
-  return { connection: conn };
+  // Diagnostic: bytes this adapter is actually holding, allocation included.
+  // Exposed so the cap's real invariant is checkable from outside.
+  return { connection: conn, retainedBytes: () => buffer.buffer.byteLength };
 }
 
 module.exports = { attach };

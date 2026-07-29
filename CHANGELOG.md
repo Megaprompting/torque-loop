@@ -34,31 +34,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resources, state access, or transport policy live here (those are later build-order
   steps).
 - **`src/mcp/stdio.js` — newline-delimited JSON framing for local stdio** (Phase 1
-  transport). Framing only: split and coalesced chunks reassemble with multi-byte UTF-8
-  surviving a mid-codepoint cut (`StringDecoder`, not `String(chunk)`), a garbage line
-  answers `-32700` instead of killing the stream, any line past `maxLineBytes` (default
-  8 MiB, measured in **bytes**) is refused whether or not it ever ends, a result the
-  kernel accepted but JSON cannot carry (BigInt, cycles) answers `-32603` on the wire,
-  and every protocol judgment defers to the kernel. No `bin/` entry point yet — exposing
+  transport). Framing only, and framing happens in **bytes**: lines are split on the
+  wire and each complete line is decoded on its own, so a multi-byte character cut across
+  chunks survives intact and invalid UTF-8 is a named `-32700` rather than silent
+  replacement-character rewriting (a legitimate U+FFFD still round-trips). A garbage line
+  answers `-32700` instead of killing the stream; any line past `maxLineBytes` (default
+  8 MiB) is refused whether or not it ever ends, with a trailing `\r` counted as framing
+  rather than content; the refused line's allocation is released rather than retained by
+  the tail that follows it (`retainedBytes()` exposes what is actually held); and a
+  result the kernel accepted but JSON cannot carry answers `-32603` on the wire. Every
+  protocol judgment defers to the kernel. No `bin/` entry point yet — exposing
   `ratchet-mcp` is a public-surface decision parked for Danny (open loop).
-- **`test/mcp-rpc.test.js` — 49-case contract suite**, wired into `npm test` (the
-  plugin-shape unwired-suite guard was verified red against it first). Two independent
-  Codex review rounds, every accepted finding reproduced red before its fix. Round 1
-  (15 findings, verdict "one era does NOT hold"): 12 fixed, one ruled design (the
-  discover exemption above), one an unfalsifiable test (strengthened), one — remedies on
-  standard JSON-RPC refusals — applied where a remedy exists (`reconnect`) and declined
-  for wire-level errors whose reason is the remedy. Round 2 (2 high / 7 medium / 5 low):
-  an initialize wearing the modern `_meta` marker proves both eras and now refuses
-  unpinned; an incomplete legacy handshake (missing `capabilities`/`clientInfo`) pins
-  nothing; a result smuggling `toJSON` is `-32603` (it would rewrite the wire shape
-  after decoration); decoration spreads instead of `Object.assign` so an own `__proto__`
-  key neither pollutes nor suppresses `resultType`; `clientCapabilities` must be a map,
-  not an array; no refusal path echoes an unusable id (objects, non-finite numbers →
-  `id: null`); dropped notifications are countable (`dropped()`) so tests can tell
-  acceptance from silent rejection; the unpinned era refusal says "no era yet", not
-  "the null era"; and stdio splits lines as bytes — invalid UTF-8 is a named `-32700`
-  (a legitimate U+FFFD still round-trips), a split-CRLF exact-cap line survives, and no
-  decoder state escapes the cap.
+- **`test/mcp-rpc.test.js` — 54-case contract suite**, wired into `npm test` (the
+  plugin-shape unwired-suite guard was verified red against it first). Three independent
+  Codex review rounds drove the kernel from "one era does NOT hold" to **"one connection,
+  one era: YES"**; every accepted finding was reproduced red before its fix, and the
+  defect trajectory was 15 → 13 → 6.
+  - Round 1 (15 findings, verdict NO): 12 fixed, one ruled design (the discover
+    exemption above), one an unfalsifiable test, one — remedies on standard JSON-RPC
+    refusals — applied where a remedy exists (`reconnect`) and declined for wire-level
+    errors whose reason is the remedy.
+  - Round 2 (verdict still NO on one pin break): an `initialize` wearing the modern
+    `_meta` marker proves both eras and now refuses unpinned; incomplete handshakes pin
+    nothing; own `__proto__` keys in a result neither pollute nor suppress `resultType`;
+    `clientCapabilities` must be a map, not an array; no refusal echoes an unusable id;
+    dropped notifications became countable (`dropped()`) so a test can tell acceptance
+    from silent rejection; the unpinned refusal says "no era yet", not "the null era".
+  - Round 3 (verdict YES, patch-then-ship): results are **normalized to inert data
+    before decoration** — inspecting a result for a `toJSON` loses to a getter that
+    answers differently on the second read or a `toJSON` one level down in `_meta`, and
+    either way `JSON.stringify` would run it after the kernel decorated, erasing
+    `resultType` and `serverInfo` on the wire; `clientInfo` must carry `name` and
+    `version`; ids are read **once** and must round-trip unchanged (an unsafe integer
+    echoes as a different number, so it is refused); and a refused oversized line no
+    longer keeps its allocation alive through the tail that follows it. Two of the
+    round-3 falsifiers were green against the unpatched kernel on first write — they
+    asserted the kernel's return value where the defect lives in serialization — and
+    were rewritten to assert the wire bytes before the fix went in.
 
 ## [0.9.0] - 2026-07-29 — Concurrency Gate
 
