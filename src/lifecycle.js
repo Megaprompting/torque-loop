@@ -104,7 +104,11 @@ function fingerprint(cwd, artifact) {
   if (!fs.statSync(real).isFile()) {
     throw new Error(`cannot bind artifact "${a.id || ''}": path "${raw}" is not a regular file — binding refused`);
   }
-  return { rev, hash: sha256(fs.readFileSync(real, 'utf8')), hashScope: 'file', downgradeReason: '' };
+  // Hash the raw BYTES, not a decoded string: reading as utf8 maps every invalid
+  // byte to U+FFFD, so two different binaries hash identically and a KEEP bound
+  // to one authorizes closing the other. Valid UTF-8 hashes the same either way,
+  // so no existing text binding moves.
+  return { rev, hash: sha256(fs.readFileSync(real)), hashScope: 'file', downgradeReason: '' };
 }
 
 // The one KEEP that authorizes closing THIS revision of THIS artifact.
@@ -118,6 +122,11 @@ function bindingEvent(artifact, events, fp) {
     const e = events[i];
     if (!e || !e.artifactId || e.artifactId !== artifact.id) continue;
     if (e.artifactRev !== fp.rev || e.artifactHash !== fp.hash) continue;
+    // Scope is part of the identity, not decoration. Record scope hashes
+    // `record:<kind>\n<title>\n<holes>`, so a FILE containing exactly those bytes
+    // collides — and without this check an old record/manual KEEP would close a
+    // new code file, skipping both the seam gate and the record-owner gate.
+    if (String(e.hashScope || '') !== fp.hashScope) continue;
     return e.verdict === 'KEEP' ? e : null;
   }
   return null;

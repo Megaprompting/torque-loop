@@ -1735,7 +1735,7 @@ ok('fingerprint refuses to bind outside the project, or to a directory', () => {
 ok('a REVERT on the same binding revokes an older KEEP', () => {
   const artifact = { id: 'art-1', title: 't', kind: 'spec', holes: [], rev: 1 };
   const fp = lifecycle.fingerprint(tmp, artifact);
-  const bind = { artifactId: 'art-1', artifactRev: fp.rev, artifactHash: fp.hash };
+  const bind = { artifactId: 'art-1', artifactRev: fp.rev, artifactHash: fp.hash, hashScope: fp.hashScope };
   assert.ok(lifecycle.bindingEvent(artifact, [{ ...bind, verdict: 'KEEP' }], fp), 'a KEEP on the binding authorizes');
   assert.strictEqual(
     lifecycle.bindingEvent(artifact, [{ ...bind, verdict: 'KEEP' }, { ...bind, verdict: 'REVERT' }], fp),
@@ -1750,6 +1750,68 @@ ok('a REVERT on the same binding revokes an older KEEP', () => {
   // a stale hash (the artifact was revised after the proof) does not authorize
   assert.strictEqual(
     lifecycle.bindingEvent(artifact, [{ ...bind, artifactHash: 'stale', verdict: 'KEEP' }], fp), null
+  );
+  // a proof gathered at a DIFFERENT scope does not authorize this one, even on an
+  // identical hash — record-scope evidence is a claim about a record.
+  assert.strictEqual(
+    lifecycle.bindingEvent(artifact, [{ ...bind, hashScope: 'file', verdict: 'KEEP' }], fp), null,
+    'the scope the proof was gathered at is part of the binding'
+  );
+});
+
+ok('a file whose bytes equal the record preimage cannot inherit the record proof', () => {
+  // The collision: record scope hashes `record:<kind>\n<title>\n<holes>`. A file
+  // containing exactly those bytes hashes identically — so without a scope check
+  // an old docs/manual KEEP would close a new .js file, skipping both the code
+  // seam gate and the record-scope owner gate. rev never moves, because the path
+  // resolving from "not a file" to "a file" is not a revision.
+  const proj = path.join(tmp, 'scope-collision');
+  fs.rmSync(proj, { recursive: true, force: true });
+  fs.mkdirSync(proj, { recursive: true });
+  const artifact = { id: 'art-collide', kind: 'docs', title: 'T', holes: [], rev: 1, path: 'anchor.md#frag' };
+
+  const asRecord = lifecycle.fingerprint(proj, artifact);
+  assert.strictEqual(asRecord.hashScope, 'record');
+  const proof = [{ artifactId: 'art-collide', artifactRev: 1, artifactHash: asRecord.hash, hashScope: 'record', verdict: 'KEEP' }];
+  assert.ok(lifecycle.bindingEvent(artifact, proof, asRecord), 'the record proof authorizes the record');
+
+  // now the path becomes a real file whose bytes ARE the record preimage
+  fs.writeFileSync(path.join(proj, 'anchor.md#frag'), 'record:docs\nT\n[]', 'utf8');
+  const asFile = lifecycle.fingerprint(proj, artifact);
+  assert.strictEqual(asFile.hashScope, 'file', 'the path now resolves to a file');
+  assert.strictEqual(asFile.hash, asRecord.hash, 'the hashes collide — this is the whole point');
+  assert.strictEqual(asFile.rev, asRecord.rev, 'and the revision never moved');
+  assert.strictEqual(
+    lifecycle.bindingEvent(artifact, proof, asFile), null,
+    'record-scope proof must not authorize a file-scope identity on a colliding hash'
+  );
+});
+
+ok('the fingerprint hashes bytes, not a lossy text decode', () => {
+  const proj = path.join(tmp, 'fp-bytes');
+  fs.rmSync(proj, { recursive: true, force: true });
+  fs.mkdirSync(proj, { recursive: true });
+  // Two files differing only in invalid-UTF8 bytes. Decoding to a string maps
+  // both to U+FFFD, so a text hash calls two different files identical — and a
+  // KEEP bound to one authorizes closing the other.
+  fs.writeFileSync(path.join(proj, 'a.bin'), Buffer.from([0x80]));
+  fs.writeFileSync(path.join(proj, 'b.bin'), Buffer.from([0x81]));
+  const a = lifecycle.fingerprint(proj, { id: 'x', path: 'a.bin' });
+  const b = lifecycle.fingerprint(proj, { id: 'x', path: 'b.bin' });
+  assert.notStrictEqual(a.hash, b.hash, 'different bytes are a different identity');
+
+  // and CRLF is byte-preserved and stable across reads, as it was before
+  fs.writeFileSync(path.join(proj, 'crlf.txt'), Buffer.from('one\r\ntwo\r\n', 'utf8'));
+  const c1 = lifecycle.fingerprint(proj, { id: 'x', path: 'crlf.txt' });
+  const c2 = lifecycle.fingerprint(proj, { id: 'x', path: 'crlf.txt' });
+  assert.strictEqual(c1.hash, c2.hash, 'a CRLF file hashes stably');
+  // an ASCII file hashes the same under bytes as it did under utf8 — no existing
+  // text binding is invalidated by the switch
+  fs.writeFileSync(path.join(proj, 'ascii.txt'), 'plain\n', 'utf8');
+  const ascii = lifecycle.fingerprint(proj, { id: 'x', path: 'ascii.txt' });
+  assert.strictEqual(
+    ascii.hash, require('crypto').createHash('sha256').update('plain\n').digest('hex'),
+    'valid UTF-8 hashes identically either way'
   );
 });
 
@@ -1770,12 +1832,12 @@ ok('closureBlockers lists everything in one fixed order', () => {
   // clean + bound + no defects + no holes → closable
   const clean = { id: 'art-c', kind: 'spec', title: 't', holes: [], rev: 1 };
   const fp = lifecycle.fingerprint(tmp, clean);
-  const bound = [{ artifactId: 'art-c', artifactRev: fp.rev, artifactHash: fp.hash, verdict: 'KEEP' }];
+  const bound = [{ artifactId: 'art-c', artifactRev: fp.rev, artifactHash: fp.hash, hashScope: fp.hashScope, verdict: 'KEEP' }];
   assert.deepStrictEqual(lifecycle.closureBlockers({ artifacts: [clean], defects: [] }, bound, clean, tmp), []);
   // holes alone block, and the waiver in the request clears exactly that one
   const holey = { ...clean, holes: ['TODO'] };
   const fpH = lifecycle.fingerprint(tmp, holey);
-  const boundH = [{ artifactId: 'art-c', artifactRev: fpH.rev, artifactHash: fpH.hash, verdict: 'KEEP' }];
+  const boundH = [{ artifactId: 'art-c', artifactRev: fpH.rev, artifactHash: fpH.hash, hashScope: fpH.hashScope, verdict: 'KEEP' }];
   assert.deepStrictEqual(
     lifecycle.closureBlockers({ artifacts: [holey], defects: [] }, boundH, holey, tmp).map((b) => b.code), ['holes']
   );
@@ -1789,7 +1851,7 @@ ok('workflowClosed refuses to call it closed while an orphan defect is open', ()
   const clean = { id: 'art-w', kind: 'spec', title: 't', holes: [], rev: 1, status: 'v1' };
   const fp = lifecycle.fingerprint(tmp, clean);
   const closed = { ...clean, status: 'closed', closedBy: 'evo_x', closedRev: fp.rev, closedHash: fp.hash };
-  const events = [{ artifactId: 'art-w', artifactRev: fp.rev, artifactHash: fp.hash, verdict: 'KEEP' }];
+  const events = [{ artifactId: 'art-w', artifactRev: fp.rev, artifactHash: fp.hash, hashScope: fp.hashScope, verdict: 'KEEP' }];
   assert.strictEqual(lifecycle.workflowClosed({ artifacts: [closed], defects: [] }, events, tmp).closed, true);
   const withOrphan = lifecycle.workflowClosed(
     { artifacts: [closed], defects: [{ id: 'd-orphan', artifact: '', severity: 'low', status: 'open' }] }, events, tmp
@@ -1817,7 +1879,7 @@ ok('nextTransition derives one move, in precedence order, with a fixed shape', (
   assert.ok(/ratchet-evolve verify/.test(unproven.command), 'no bound proof → bind proof');
   // 4. a closable artifact names close
   const fp = lifecycle.fingerprint(tmp, art);
-  const bound = [{ artifactId: 'art-n', artifactRev: fp.rev, artifactHash: fp.hash, verdict: 'KEEP' }];
+  const bound = [{ artifactId: 'art-n', artifactRev: fp.rev, artifactHash: fp.hash, hashScope: fp.hashScope, verdict: 'KEEP' }];
   assert.strictEqual(
     shape(lifecycle.nextTransition({ objective: 'o', artifacts: [art] }, bound, tmp)).command,
     'ratchet artifact close art-n'
