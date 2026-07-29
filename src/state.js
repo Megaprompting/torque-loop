@@ -35,21 +35,46 @@ function slugFor(root, lowercase) {
   return `${name}-${hash}`;
 }
 
+function normalizedSlugFor(cwd) {
+  return slugFor(cwd || process.cwd(), process.platform === 'win32');
+}
+
+function legacySlugFor(cwd) {
+  return slugFor(cwd || process.cwd(), false);
+}
+
 // Windows paths are case-insensitive, so `D:\Repo` and `d:\repo` are one
 // project — but hashing the raw casing gave them two separate stores, and a
 // session that spelled the cwd differently silently resumed from an empty one.
-// Normalize by lowercasing before the hash, and keep reading a store that was
-// created under the old casing so no existing record is stranded.
+// Normalize by lowercasing before the hash.
+//
+// A store created under the old casing is MIGRATED, once, by moving it to the
+// normalized slug. Merely reading it in place would require this discovery to
+// succeed on every future call, and it does not: spell the cwd in its already-
+// lowercase form and `normalized === legacy`, the discovery never runs, and the
+// old store is stranded while a fresh empty one opens beside it.
 function projectSlug(cwd) {
   const root = cwd || process.cwd();
   if (process.platform !== 'win32') return slugFor(root, false);
   const normalized = slugFor(root, true);
   const legacy = slugFor(root, false);
   if (normalized === legacy) return normalized;
+
   const projects = path.join(baseDir(), 'projects');
-  if (!fs.existsSync(path.join(projects, normalized)) && fs.existsSync(path.join(projects, legacy))) {
-    return legacy;
+  const legacyDir = path.join(projects, legacy);
+  const normalizedDir = path.join(projects, normalized);
+  if (!fs.existsSync(legacyDir)) return normalized;
+
+  // Both exist: two records for one project. Merging is not ours to invent and
+  // picking one silently loses the other, so name both and stop.
+  if (fs.existsSync(normalizedDir)) {
+    throw new Error(
+      `ratchet store conflict — both of these exist for one project:\n  ${legacyDir} (legacy casing)\n  ${normalizedDir} (normalized)\n` +
+        'Merge or delete one by hand — refusing to guess which record is the real one.'
+    );
   }
+  fs.renameSync(legacyDir, normalizedDir);
+  process.stderr.write(`[ratchet] migrated store ${legacy} → ${normalized} (Windows path casing normalized).\n`);
   return normalized;
 }
 
@@ -111,8 +136,16 @@ function readJsonResilient(file) {
   let raw;
   try {
     raw = fs.readFileSync(file, 'utf8');
-  } catch (_e) {
-    return null; // missing / unreadable → caller creates fresh
+  } catch (e) {
+    // ENOENT is the only error that means "there is no record yet". Anything
+    // else — an ACL that denies read but permits write, a lock, EIO — means the
+    // record EXISTS and cannot be seen, and returning null tells the caller to
+    // reinitialize straight over it.
+    if (e && e.code === 'ENOENT') return null;
+    throw new Error(
+      `${path.basename(file)} exists but could not be read (${e && e.code ? e.code : 'unknown error'}) — ` +
+        'refusing to reinitialize over a record that is present but unreadable. Fix access, then re-run.'
+    );
   }
   if (!raw.trim()) return null; // empty file → fresh, no noisy backup
   try {
@@ -208,6 +241,8 @@ function makeId(prefix) {
 module.exports = {
   baseDir,
   projectSlug,
+  normalizedSlugFor,
+  legacySlugFor,
   projectDir,
   statePath,
   ledgerPath,

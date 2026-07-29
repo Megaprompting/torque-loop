@@ -380,6 +380,37 @@ ok('the corrupt-backup filename is sanitized, not taken from the clock verbatim'
   }
 });
 
+ok('an unreadable state file is never mistaken for a missing one', () => {
+  // ENOENT means "no state yet" and a fresh one is right. Any OTHER read error —
+  // an ACL that denies read but permits write, a locked file, EIO — means the
+  // record EXISTS and we cannot see it, and reinitializing over it is a silent
+  // wipe of the one thing this tool promises to keep.
+  const proj = path.join(tmp, 'unreadable');
+  state.initProject(proj, { force: true });
+  const sp = state.statePath(proj);
+  const marker = JSON.stringify({ version: 1, objective: 'still here' });
+  fs.writeFileSync(sp, marker, 'utf8');
+
+  const origRead = fs.readFileSync;
+  fs.readFileSync = (file, ...rest) => {
+    if (String(file) === sp) {
+      const e = new Error('permission denied');
+      e.code = 'EACCES';
+      throw e;
+    }
+    return origRead(file, ...rest);
+  };
+  try {
+    assert.throws(() => state.loadState(proj), /EACCES|could not be read|refusing/i);
+  } finally {
+    fs.readFileSync = origRead;
+  }
+  assert.strictEqual(fs.readFileSync(sp, 'utf8'), marker, 'the record survived the failed read');
+  // ENOENT still means a clean start
+  fs.rmSync(sp, { force: true });
+  assert.ok(state.loadState(proj).version, 'a missing file still auto-initializes');
+});
+
 ok('two casings of one Windows path resolve to a single store', () => {
   // Windows paths are case-insensitive; a slug that hashes the raw casing splits
   // one project into two stores depending on how the shell spelled the cwd.
@@ -390,6 +421,55 @@ ok('two casings of one Windows path resolve to a single store', () => {
   } else {
     assert.notStrictEqual(state.projectSlug(upper), state.projectSlug(lower), 'case-sensitive platforms keep both');
   }
+});
+
+ok('a legacy-cased store is MIGRATED once, not merely borrowed', () => {
+  if (process.platform !== 'win32') return; // the fallback only exists on win32
+  // The stranding: returning the legacy dir per-invocation without moving it
+  // means the discovery has to succeed on EVERY call forever. It does not — the
+  // early return when normalized === legacy skips discovery entirely, so a
+  // differently-cased cwd silently opens a fresh, empty store beside the real one.
+  const proj = path.join(tmp, 'SlugMigrate', 'Repo');
+  const projects = path.join(state.baseDir(), 'projects');
+  const legacySlug = state.legacySlugFor(proj);
+  const normalizedSlug = state.normalizedSlugFor(proj);
+  assert.notStrictEqual(legacySlug, normalizedSlug, 'the fixture path must actually differ in casing');
+
+  fs.rmSync(path.join(projects, legacySlug), { recursive: true, force: true });
+  fs.rmSync(path.join(projects, normalizedSlug), { recursive: true, force: true });
+  fs.mkdirSync(path.join(projects, legacySlug), { recursive: true });
+  fs.writeFileSync(
+    path.join(projects, legacySlug, 'state.json'),
+    JSON.stringify({ version: 1, objective: 'written under the old casing', artifacts: [], defects: [], history: [] }),
+    'utf8'
+  );
+
+  // one call is enough: the store MOVES to the normalized slug
+  assert.strictEqual(state.projectSlug(proj), normalizedSlug, 'the slug is the normalized one after migration');
+  assert.ok(!fs.existsSync(path.join(projects, legacySlug)), 'the legacy dir is gone, not left as a decoy');
+  assert.strictEqual(
+    state.loadState(proj).objective, 'written under the old casing', 'and the record came with it'
+  );
+  // the lower-cased spelling of the same path now finds the same record
+  assert.strictEqual(state.loadState(proj.toLowerCase()).objective, 'written under the old casing');
+});
+
+ok('two stores for one path is a conflict to name, never a guess to make', () => {
+  if (process.platform !== 'win32') return;
+  const proj = path.join(tmp, 'SlugConflict', 'Repo');
+  const projects = path.join(state.baseDir(), 'projects');
+  const legacySlug = state.legacySlugFor(proj);
+  const normalizedSlug = state.normalizedSlugFor(proj);
+  for (const slug of [legacySlug, normalizedSlug]) {
+    fs.mkdirSync(path.join(projects, slug), { recursive: true });
+    fs.writeFileSync(path.join(projects, slug, 'state.json'), JSON.stringify({ version: 1, objective: slug }), 'utf8');
+  }
+  // Merging is not ours to invent and picking one silently loses the other.
+  assert.throws(() => state.projectSlug(proj), /both|conflict/i);
+  const e = (() => { try { state.projectSlug(proj); } catch (err) { return err; } })();
+  assert.ok(e.message.includes(legacySlug) && e.message.includes(normalizedSlug), 'the refusal names both paths');
+  fs.rmSync(path.join(projects, legacySlug), { recursive: true, force: true });
+  fs.rmSync(path.join(projects, normalizedSlug), { recursive: true, force: true });
 });
 
 ok('corrupt ledger.json is backed up, not silently lost', () => {
