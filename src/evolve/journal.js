@@ -39,11 +39,20 @@ function dateStamp(iso) {
   return String(iso).slice(0, 10).replace(/-/g, '_');
 }
 
+// Identity is the highest sequence ALREADY on the log plus one — not the count
+// of today's events. A count re-derives the same number for every process that
+// reads before any of them writes, and it also re-uses an id the moment one is
+// missing. Called under the append lock (appendEvent), so "highest" cannot move
+// underneath the caller.
 function nextId(cwd, iso) {
   const day = dateStamp(iso);
-  const sameDay = readEvents(cwd).filter((e) => String(e.id).includes(`evo_${day}_`));
-  const seq = String(sameDay.length + 1).padStart(3, '0');
-  return `evo_${day}_${seq}`;
+  const seqOf = new RegExp(`^evo_${day}_(\\d+)$`);
+  let max = 0;
+  for (const e of readEvents(cwd)) {
+    const m = seqOf.exec(String(e && e.id));
+    if (m) max = Math.max(max, Number(m[1]));
+  }
+  return `evo_${day}_${String(max + 1).padStart(3, '0')}`;
 }
 
 // Artifacts that never point at a file still have a mode: derive it from what
@@ -163,10 +172,18 @@ function appendEvent(cwd, fields, opts = {}) {
   // Proof gate: refuse to persist a KEEP without verification evidence. Throws
   // before any write, so the log never contains an unproven kept mutation.
   validateKeepGate(event);
-  if (!event.id) event.id = nextId(cwd, event.timestamp);
   const file = logPath(cwd);
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.appendFileSync(file, JSON.stringify(event) + '\n', 'utf8');
+  // Naming the event and appending it are ONE step. Split, two processes read
+  // the same log, mint the same id, and the second append is a duplicate
+  // identity on a record whose whole job is to be the trail. The lock lives
+  // beside the log, not in the workspace store: the log's path is
+  // caller-selectable (RATCHET_EVOLVE_LOG), so the workspace lock would be the
+  // wrong scope in both directions.
+  require('../state').withFileLock(file, 'evolve append', () => {
+    if (!event.id) event.id = nextId(cwd, event.timestamp);
+    fs.appendFileSync(file, JSON.stringify(event) + '\n', 'utf8');
+  });
   return event;
 }
 
