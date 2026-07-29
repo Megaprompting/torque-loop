@@ -300,6 +300,80 @@ ok('corrupt state.json is backed up, not silently lost', () => {
   assert.ok(raw.includes('this is not valid json'), 'backup preserves the original bad bytes');
 });
 
+// --- store integrity (0.8 Closure Gate) -------------------------------------
+
+ok('state carries a monotonic rev that increments on every write and survives load', () => {
+  // Dormant in 0.8: nothing reads it. It exists so a later version can detect a
+  // lost update without a migration — which is only possible if it starts now.
+  state.initProject(cwd, { force: true });
+  const fresh = state.loadState(cwd);
+  assert.strictEqual(fresh.rev, 0, 'a fresh state opens at rev 0');
+  state.saveState(cwd, fresh);
+  assert.strictEqual(state.loadState(cwd).rev, 1, 'the first write is rev 1');
+  const second = state.loadState(cwd);
+  state.saveState(cwd, second);
+  assert.strictEqual(state.loadState(cwd).rev, 2, 'rev increments across writes and survives a reload');
+  // a legacy (pre-0.8) state file has no rev — it is read as 0, lazily, never migrated
+  const legacy = state.loadState(cwd);
+  delete legacy.rev;
+  state.writeJson(state.statePath(cwd), legacy);
+  assert.strictEqual(state.loadState(cwd).rev, undefined, 'load does not rewrite a legacy file');
+  state.saveState(cwd, state.loadState(cwd));
+  assert.strictEqual(state.loadState(cwd).rev, 1, 'a missing rev counts as 0, so the next write is 1');
+});
+
+ok('a corrupt state file is never clobbered when its backup fails', () => {
+  // The only copy of the record is the corrupt one. If we cannot preserve it,
+  // reinitializing destroys it — so refuse instead.
+  const proj = path.join(tmp, 'corrupt-unbackupable');
+  state.initProject(proj, { force: true });
+  const sp = state.statePath(proj);
+  fs.writeFileSync(sp, '{ broken', 'utf8');
+  const origWrite = fs.writeFileSync;
+  fs.writeFileSync = (file, ...rest) => {
+    if (String(file).includes('.corrupt.')) throw new Error('disk full');
+    return origWrite(file, ...rest);
+  };
+  try {
+    assert.throws(() => state.loadState(proj), /could not be backed up|refusing/i);
+  } finally {
+    fs.writeFileSync = origWrite;
+  }
+  assert.strictEqual(fs.readFileSync(sp, 'utf8'), '{ broken', 'the only copy is still on disk, untouched');
+});
+
+ok('the corrupt-backup filename is sanitized, not taken from the clock verbatim', () => {
+  const proj = path.join(tmp, 'corrupt-stamp');
+  state.initProject(proj, { force: true });
+  fs.writeFileSync(state.statePath(proj), 'nope{', 'utf8');
+  const prevNow = process.env.RATCHET_NOW;
+  process.env.RATCHET_NOW = '../../escape/2026-07-29T00:00:00.000Z';
+  try {
+    state.loadState(proj);
+  } finally {
+    if (prevNow == null) delete process.env.RATCHET_NOW;
+    else process.env.RATCHET_NOW = prevNow;
+  }
+  const backups = fs.readdirSync(path.dirname(state.statePath(proj))).filter((f) => f.includes('.corrupt.'));
+  assert.ok(backups.length >= 1, 'the backup landed');
+  for (const b of backups) {
+    assert.ok(!/[\\/]/.test(b), `backup name has no path separators: ${b}`);
+    assert.ok(/^state\.json\.corrupt\.[0-9A-Za-z-]+\.json$/.test(b), `backup name is allowlisted: ${b}`);
+  }
+});
+
+ok('two casings of one Windows path resolve to a single store', () => {
+  // Windows paths are case-insensitive; a slug that hashes the raw casing splits
+  // one project into two stores depending on how the shell spelled the cwd.
+  const upper = path.join(tmp, 'CaseFixture', 'Repo');
+  const lower = path.join(tmp, 'casefixture', 'repo');
+  if (process.platform === 'win32') {
+    assert.strictEqual(state.projectSlug(upper), state.projectSlug(lower), 'one path, one slug');
+  } else {
+    assert.notStrictEqual(state.projectSlug(upper), state.projectSlug(lower), 'case-sensitive platforms keep both');
+  }
+});
+
 ok('corrupt ledger.json is backed up, not silently lost', () => {
   const lp = state.ledgerPath(cwd);
   fs.writeFileSync(lp, 'garbage{', 'utf8');

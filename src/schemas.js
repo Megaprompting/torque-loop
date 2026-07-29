@@ -17,6 +17,11 @@ function newState(clock) {
   const t = nowIso(clock);
   return {
     version: STATE_VERSION,
+    // Monotonic write counter, incremented by saveState. Dormant in 0.8 —
+    // nothing reads it. It ships now because a lost-update check added later
+    // can only work if the counter already exists in the wild; a state file
+    // written before it started counting can never be retro-numbered.
+    rev: 0,
     createdAt: t,
     updatedAt: t,
     title: '',

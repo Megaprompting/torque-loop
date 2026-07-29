@@ -20,15 +20,37 @@ function baseDir() {
   return path.join(home, '.ratchet');
 }
 
-function projectSlug(cwd) {
-  const root = cwd || process.cwd();
+function slugFor(root, lowercase) {
   const name = path
     .basename(root)
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '') || 'project';
-  const hash = crypto.createHash('sha1').update(path.resolve(root)).digest('hex').slice(0, 8);
+  const resolved = path.resolve(root);
+  const hash = crypto
+    .createHash('sha1')
+    .update(lowercase ? resolved.toLowerCase() : resolved)
+    .digest('hex')
+    .slice(0, 8);
   return `${name}-${hash}`;
+}
+
+// Windows paths are case-insensitive, so `D:\Repo` and `d:\repo` are one
+// project — but hashing the raw casing gave them two separate stores, and a
+// session that spelled the cwd differently silently resumed from an empty one.
+// Normalize by lowercasing before the hash, and keep reading a store that was
+// created under the old casing so no existing record is stranded.
+function projectSlug(cwd) {
+  const root = cwd || process.cwd();
+  if (process.platform !== 'win32') return slugFor(root, false);
+  const normalized = slugFor(root, true);
+  const legacy = slugFor(root, false);
+  if (normalized === legacy) return normalized;
+  const projects = path.join(baseDir(), 'projects');
+  if (!fs.existsSync(path.join(projects, normalized)) && fs.existsSync(path.join(projects, legacy))) {
+    return legacy;
+  }
+  return normalized;
 }
 
 function projectDir(cwd) {
@@ -70,7 +92,10 @@ function writeJson(file, obj) {
 // <file>.corrupt.<timestamp>.json, warn, then let the caller reinitialize.
 function backupCorrupt(file, raw) {
   try {
-    const stamp = schemas.nowIso().replace(/[:.]/g, '-');
+    // The stamp comes from nowIso, which reads RATCHET_NOW — caller-controlled
+    // text landing in a filename. Allowlist it to [0-9A-Za-z-] so no separator,
+    // drive letter, or traversal can steer where the backup is written.
+    const stamp = String(schemas.nowIso()).replace(/[^0-9A-Za-z]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'unstamped';
     const dest = `${file}.corrupt.${stamp}.json`;
     fs.writeFileSync(dest, raw, 'utf8');
     process.stderr.write(
@@ -78,7 +103,7 @@ function backupCorrupt(file, raw) {
     );
     return dest;
   } catch (_e) {
-    return null; // best effort; never block the session over a backup
+    return null; // the caller decides; a failed backup must not become a delete
   }
 }
 
@@ -93,7 +118,16 @@ function readJsonResilient(file) {
   try {
     return JSON.parse(raw);
   } catch (_e) {
-    backupCorrupt(file, raw);
+    // Returning null tells the caller to reinitialize, which overwrites this
+    // file. Only say that once the bad bytes are safely copied: if the backup
+    // failed, the corrupt file is the ONLY copy of the record and clobbering it
+    // is a silent data loss the tool's whole promise forbids.
+    if (!backupCorrupt(file, raw)) {
+      throw new Error(
+        `${path.basename(file)} is malformed and could not be backed up — refusing to reinitialize over the only copy. ` +
+          'Move or repair the file by hand, then re-run.'
+      );
+    }
     return null;
   }
 }
@@ -129,6 +163,9 @@ function loadState(cwd) {
 
 function saveState(cwd, state) {
   state.updatedAt = schemas.nowIso();
+  // Lazy migration: a pre-0.8 file has no rev, so it counts as 0 and starts
+  // counting on its next write. Nothing rewrites it just to add the field.
+  state.rev = (Number.isInteger(state.rev) ? state.rev : 0) + 1;
   writeJson(statePath(cwd), state);
   return state;
 }
