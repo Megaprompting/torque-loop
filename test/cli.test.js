@@ -25,6 +25,7 @@ const gitRefs = require('../src/gitRefs');
 const coldStart = require('../src/coldStart');
 const receipt = require('../src/receipt');
 const journal = require('../src/evolve/journal');
+const lifecycle = require('../src/lifecycle');
 const cli = require('../src/cli');
 
 let passed = 0;
@@ -1118,6 +1119,51 @@ ok('re-adding the same id revises in place; an identical retry is a true no-op',
   assert.ok(s.history.some((h) => h.event === 'artifact.revised'));
 });
 
+ok('a legacy or falsey-shaped retry is still a no-op', () => {
+  // Birth coerced with falsey defaults (`item.title || 'untitled'`) while the
+  // revision path coerced with String(), so the two disagreed about what the
+  // "same" payload means — and a legacy record with no holes array normalized on
+  // first touch, bumping rev and silently invalidating any proof bound to it.
+  state.initProject(cwd, { force: true });
+  const s = state.loadState(cwd);
+  s.artifacts = [{ id: 'art-legacy', at: '2026-07-01T00:00:00.000Z', kind: 'docs', title: 'old', status: 'v1' }];
+  state.saveState(cwd, s);
+
+  const before = fs.readFileSync(state.statePath(cwd), 'utf8');
+  const same = artifacts.addArtifact(cwd, { id: 'art-legacy', kind: 'docs', title: 'old', status: 'v1' });
+  assert.strictEqual(fs.readFileSync(state.statePath(cwd), 'utf8'), before, 'normalizing a missing legacy holes array writes nothing');
+  assert.strictEqual(same.rev, undefined, 'the legacy record is left exactly as it was');
+  assert.strictEqual(lifecycle.fingerprint(cwd, same).rev, 1, 'and a missing rev still reads as 1, so proof stays bound');
+
+  // falsey-shaped payloads round-trip identically through both paths
+  state.initProject(cwd, { force: true });
+  const born = artifacts.addArtifact(cwd, { id: 'art-falsey', kind: 'spec', title: '', path: '', holes: [] });
+  const mid = fs.readFileSync(state.statePath(cwd), 'utf8');
+  const retried = artifacts.addArtifact(cwd, { id: 'art-falsey', kind: 'spec', title: '', path: '', holes: [] });
+  assert.strictEqual(retried.rev, born.rev, 'an identical falsey-shaped retry does not bump rev');
+  assert.strictEqual(fs.readFileSync(state.statePath(cwd), 'utf8'), mid, 'byte-identical state');
+});
+
+ok('a defect whose artifact cannot be fingerprinted is recorded, never half-attached', () => {
+  // The stamp used to fail silently, leaving the defect attached with
+  // artifactRev:null and artifactHash:'' — an attachment that blocks the
+  // artifact's closure while carrying no evidence of which revision it attacks.
+  const proj = path.join(tmp, 'defect-stamp-fail');
+  fs.rmSync(proj, { recursive: true, force: true });
+  fs.mkdirSync(proj, { recursive: true });
+  state.initProject(proj, { force: true });
+  const s = state.loadState(proj);
+  // a path that refuses to bind at all (escapes the project)
+  s.artifacts = [{ id: 'art-escape', at: '2026-07-01T00:00:00.000Z', kind: 'code', title: 'escapes', status: 'v0', path: '../outside.js', holes: [], rev: 1 }];
+  state.saveState(proj, s);
+
+  const { state: d } = artifacts.addDefect(proj, { severity: 'high', summary: 'found it anyway' }, { alsoLedger: false });
+  assert.strictEqual(d.artifact, '', 'no half-stamped attachment');
+  assert.strictEqual(d.attachedBy, 'error', 'the failure is named, not swallowed');
+  assert.ok(/outside the project/.test(d.attachError), `the reason travels: ${d.attachError}`);
+  assert.strictEqual(state.loadState(proj).defects.length, 1, 'the finding is still recorded — that matters more');
+});
+
 ok('kind is immutable on an update in place', () => {
   state.initProject(cwd, { force: true });
   artifacts.addArtifact(cwd, { id: 'art-probe', kind: 'probe', title: 'probe: x' });
@@ -1335,7 +1381,7 @@ ok('the ledger defect mirror is written by transitions, not by hand', () => {
 
 // --- proof binding (0.8 Closure Gate) ---------------------------------------
 
-const lifecycle = require('../src/lifecycle');
+
 const evolveVerify = require('../src/evolve/verify');
 
 // A project with a real file on disk, an artifact pointing at it, and a helper

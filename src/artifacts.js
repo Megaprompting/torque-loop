@@ -25,6 +25,35 @@ function withProbeHole(kind, holes) {
   return holes.concat('disposal: pending');
 }
 
+function next_kind(existing) {
+  return String((existing && existing.kind) || 'artifact');
+}
+
+// ONE canonical shape for the mutable fields, used by birth AND revision. When
+// the two paths normalized differently (falsey defaults on one side, String()
+// coercion on the other) the same payload meant different things depending on
+// which door it came through — so an identical retry could count as a change and
+// bump rev, silently invalidating the proof bound to the previous revision.
+// `fallback` supplies what a partial update leaves alone; at birth it is absent.
+function canonicalFields(kind, item, fallback) {
+  const base = fallback || {};
+  const pick = (key, dflt) => {
+    if (item[key] != null) return String(item[key]);
+    if (base[key] != null) return String(base[key]);
+    return dflt;
+  };
+  const holesSource = item.holes !== undefined ? item.holes : base.holes;
+  const out = {
+    title: pick('title', 'untitled') || 'untitled',
+    path: pick('path', ''),
+    status: pick('status', 'v0') || 'v0',
+    holes: withProbeHole(kind, normalizeHoles(holesSource)),
+  };
+  const revises = item.revises != null ? String(item.revises) : base.revises != null ? String(base.revises) : '';
+  if (revises) out.revises = revises;
+  return out;
+}
+
 function assertArtifactInput(item) {
   const status = item.status == null ? '' : String(item.status).toLowerCase();
   if (status && schemas.ARTIFACT_TERMINAL_STATUSES.includes(status)) {
@@ -86,18 +115,15 @@ function reviseArtifact(cwd, s, existing, item, now) {
     );
   }
 
-  const next = { ...existing };
-  if (item.title != null) next.title = String(item.title);
-  if (item.path != null) next.path = String(item.path);
-  if (item.status != null) next.status = String(item.status);
-  if (item.holes !== undefined) next.holes = normalizeHoles(item.holes);
-  if (item.revises != null) next.revises = String(item.revises);
-  next.holes = withProbeHole(next.kind, normalizeHoles(next.holes));
+  const next = { ...existing, ...canonicalFields(next_kind(existing), item, existing) };
 
   // An identical retry is not a revision. Bumping rev would invalidate the proof
   // bound to the current one, so re-running the same command must cost nothing:
-  // no rev, no timestamp churn, no history line, no write at all.
-  const changed = ARTIFACT_MUTABLE.some((k) => JSON.stringify(next[k]) !== JSON.stringify(existing[k]));
+  // no rev, no timestamp churn, no history line, no write at all. The comparison
+  // runs against the EXISTING record put through the same normalization, so a
+  // legacy record acquiring its missing `holes: []` is not read as a change.
+  const canonicalExisting = canonicalFields(next_kind(existing), existing, existing);
+  const changed = ARTIFACT_MUTABLE.some((k) => JSON.stringify(next[k]) !== JSON.stringify(canonicalExisting[k]));
   if (!changed) return existing;
 
   next.rev = (Number.isInteger(existing.rev) ? existing.rev : 1) + 1;
@@ -120,19 +146,10 @@ function addArtifact(cwd, item) {
     if (existing) return reviseArtifact(cwd, s, existing, item, now);
   }
   const kind = item.kind ? String(item.kind) : 'artifact';
-  const record = {
-    id: id || state.makeId('art'),
-    at: now,
-    rev: 1,
-    kind,
-    title: item.title || 'untitled',
-    path: item.path || '',
-    status: item.status || 'v0',
-    holes: withProbeHole(kind, normalizeHoles(item.holes)),
-  };
-  // Provenance only: naming what this supersedes does not retire it. A lineage
-  // claim is not a lifecycle event — only `retract` and `close` are.
-  if (item.revises != null) record.revises = String(item.revises);
+  // Same normalization as a revision — `revises` included, which is provenance
+  // only: naming what this supersedes does not retire it. A lineage claim is not
+  // a lifecycle event; only `retract` and `close` are.
+  const record = { id: id || state.makeId('art'), at: now, rev: 1, kind, ...canonicalFields(kind, item, null) };
   s.artifacts.push(record);
   s.dirty = true;
   s.history.push({ id: state.makeId('hist'), at: record.at, event: 'artifact.add', note: record.title });
@@ -222,9 +239,15 @@ function addDefect(cwd, item, { alsoLedger = true } = {}) {
       const fp = lifecycle.fingerprint(cwd, (s.artifacts || []).find((a) => a.id === artifact));
       record.artifactRev = fp.rev;
       record.artifactHash = fp.hash;
-    } catch (_e) {
-      // An artifact whose path cannot be bound is still an artifact a defect can
-      // attack — refusing the defect would lose the finding.
+    } catch (e) {
+      // The stamp is what makes an attachment mean something. Without it the
+      // defect would sit attached with no evidence of WHICH revision it attacks,
+      // blocking that artifact's closure on an association nobody can check.
+      // Recording the finding still matters more than the stamp, so keep the
+      // defect and detach it loudly rather than half-attaching it in silence.
+      record.artifact = '';
+      record.attachedBy = 'error';
+      record.attachError = e && e.message ? e.message : String(e);
     }
   }
   s.defects.push(record);
