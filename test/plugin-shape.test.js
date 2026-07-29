@@ -80,6 +80,30 @@ ok('hooks/hooks.json exists and parses', () => {
   assert.ok(hooks.hooks, 'hooks.json has a hooks map');
 });
 
+ok('every hooks.json command resolves to a real CLI hook subcommand', () => {
+  // cmdHook's default: returns silently (hooks must never break a session), so a
+  // renamed or misspelled subcommand in hooks.json would no-op forever in every
+  // installed copy. This is the only tripwire for that drift.
+  const hooks = readJson('hooks/hooks.json');
+  const wired = [];
+  for (const entries of Object.values(hooks.hooks)) {
+    for (const entry of entries) {
+      for (const h of entry.hooks || []) {
+        const m = /bin\/ratchet"?\s+hook\s+([a-z][a-z-]*)/.exec(h.command || '');
+        assert.ok(m, `hook command is a ratchet hook invocation: ${h.command}`);
+        wired.push(m[1]);
+      }
+    }
+  }
+  assert.ok(wired.length >= 3, 'hooks.json wires at least session-start, post-edit, stop-check');
+  const body = /function cmdHook[\s\S]*?\r?\n\}/.exec(read('src/cli.js'));
+  assert.ok(body, 'src/cli.js defines cmdHook');
+  const handled = new Set(Array.from(body[0].matchAll(/case '([^']+)':/g), (m) => m[1]));
+  for (const sub of wired) {
+    assert.ok(handled.has(sub), `hooks.json wires "hook ${sub}" but cmdHook does not handle it (silent no-op)`);
+  }
+});
+
 ok('every bin target from package.json exists', () => {
   for (const [name, rel] of Object.entries(pkg.bin || {})) {
     assert.ok(exists(rel), `bin ${name} -> ${rel} exists`);
