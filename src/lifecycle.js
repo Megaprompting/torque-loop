@@ -213,7 +213,13 @@ const WORKFLOW_SCOPE =
 function workflowClosed(state, events, cwd) {
   const s = state || {};
   const blockers = [];
-  const artifact = activeArtifact(s);
+  // Any artifact still in play decides the answer — NOT simply the most recent
+  // record. Closing B and then building A used to leave `activeArtifact` on B,
+  // so the workflow read CLOSED while nextTransition demanded A's verification.
+  // Between an optimistic reading and a pessimistic one, closure takes the
+  // pessimistic one.
+  const live = liveArtifacts(s);
+  const artifact = live[live.length - 1] || activeArtifact(s);
 
   if (!artifact) {
     blockers.push({ code: 'no-artifact', message: 'no live artifact recorded — nothing has been built to close' });
@@ -225,6 +231,20 @@ function workflowClosed(state, events, cwd) {
         code: 'not-closed',
         message: `artifact "${artifact.id}" is closable but not closed: ratchet artifact close ${artifact.id}`,
       });
+  } else {
+    // Nothing live remains, so the certified artifact IS the workflow. Its
+    // closure certificate covers the revision it was granted against; it does
+    // not cover work raised against it afterwards.
+    const attached = (s.defects || []).filter((d) => d && d.artifact === artifact.id && scoring.isDefectOpen(d));
+    if (attached.length) {
+      blockers.push({
+        code: 'open-defects',
+        message:
+          `${attached.length} open defect(s) attached to closed artifact "${artifact.id}" ` +
+          `(${attached.map((d) => d.id).join(', ')}) — a closure certificate covers the revision it was granted ` +
+          'against, not work raised against it since. Clear them, or record the fix as a new artifact.',
+      });
+    }
   }
 
   const orphans = (s.defects || []).filter((d) => d && scoring.isDefectOpen(d) && !String(d.artifact || '').trim());

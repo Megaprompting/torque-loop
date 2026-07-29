@@ -1882,6 +1882,52 @@ ok('closureBlockers lists everything in one fixed order', () => {
   );
 });
 
+ok('workflowClosed will not close a workflow that still has live work', () => {
+  // The false positive: close B, then build A. `activeArtifact` picked the most
+  // recent record — which was still B — so the workflow read CLOSED while
+  // nextTransition was simultaneously demanding A's verification. The two
+  // surfaces contradicted each other, and the optimistic one is the dangerous one.
+  const closedFp = lifecycle.fingerprint(tmp, { id: 'art-B', kind: 'spec', title: 'B', holes: [], rev: 1 });
+  const B = {
+    id: 'art-B', kind: 'spec', title: 'B', holes: [], rev: 1,
+    status: 'closed', closedBy: 'evo_b', closedRev: closedFp.rev, closedHash: closedFp.hash,
+  };
+  const A = { id: 'art-A', kind: 'spec', title: 'A', holes: [], rev: 1, status: 'v0' };
+  const events = [{ artifactId: 'art-B', artifactRev: closedFp.rev, artifactHash: closedFp.hash, hashScope: closedFp.hashScope, verdict: 'KEEP' }];
+
+  // B closed first, A built after it — and also the reverse order, since "most
+  // recent record" must not be what decides.
+  for (const artifactsList of [[B, A], [A, B]]) {
+    const r = lifecycle.workflowClosed({ artifacts: artifactsList, defects: [] }, events, tmp);
+    assert.strictEqual(r.closed, false, `live work remains (order ${artifactsList.map((x) => x.id).join(',')})`);
+    assert.strictEqual(r.artifact.id, 'art-A', 'the closure read names the artifact that is still live');
+    assert.ok(r.blockers.some((b) => b.code === 'no-bound-proof'));
+  }
+
+  // and it agrees with nextTransition rather than contradicting it
+  const t = lifecycle.nextTransition({ objective: 'o', artifacts: [B, A] }, events, tmp);
+  assert.ok(/--artifact art-A/.test(t.command), `both surfaces name art-A, got: ${t.command}`);
+});
+
+ok('a defect attached to the certified artifact still blocks closure', () => {
+  // Once nothing live remains, the certified artifact is the workflow — and an
+  // open defect explicitly attached to it was being ignored, because the
+  // certified branch stopped looking at defects entirely.
+  const fp = lifecycle.fingerprint(tmp, { id: 'art-C', kind: 'spec', title: 'C', holes: [], rev: 1 });
+  const C = {
+    id: 'art-C', kind: 'spec', title: 'C', holes: [], rev: 1,
+    status: 'closed', closedBy: 'evo_c', closedRev: fp.rev, closedHash: fp.hash,
+  };
+  const events = [{ artifactId: 'art-C', artifactRev: fp.rev, artifactHash: fp.hash, hashScope: fp.hashScope, verdict: 'KEEP' }];
+  assert.strictEqual(lifecycle.workflowClosed({ artifacts: [C], defects: [] }, events, tmp).closed, true);
+
+  const withDefect = lifecycle.workflowClosed(
+    { artifacts: [C], defects: [{ id: 'd-on-closed', artifact: 'art-C', severity: 'high', status: 'open' }] }, events, tmp
+  );
+  assert.strictEqual(withDefect.closed, false, 'an open defect on the closed artifact is still open work');
+  assert.ok(withDefect.blockers.some((b) => b.code === 'open-defects'), withDefect.blockers.map((b) => b.code).join(','));
+});
+
 ok('workflowClosed refuses to call it closed while an orphan defect is open', () => {
   const clean = { id: 'art-w', kind: 'spec', title: 't', holes: [], rev: 1, status: 'v1' };
   const fp = lifecycle.fingerprint(tmp, clean);
