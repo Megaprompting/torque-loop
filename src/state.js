@@ -136,13 +136,25 @@ function readJsonResilient(file) {
 // State lifecycle.
 // ---------------------------------------------------------------------------
 
-function initProject(cwd, { force = false } = {}) {
+function initProject(cwd, { force = false, resetBy = '', resetReason = '' } = {}) {
   ensureDir(projectDir(cwd));
   const sPath = statePath(cwd);
   const lPath = ledgerPath(cwd);
   let created = false;
   if (force || !fs.existsSync(sPath)) {
-    writeJson(sPath, schemas.newState());
+    const fresh = schemas.newState();
+    // A wipe destroys the only record of why the wipe happened. The tombstone is
+    // the one line that survives it, so the next cold session reads "danny reset
+    // this on 2026-07-29 to start a new run" instead of an unexplained blank.
+    if (resetBy || resetReason) {
+      fresh.history.push({
+        id: makeId('hist'),
+        at: fresh.createdAt,
+        event: 'state.reset',
+        note: `state wiped by ${resetBy || 'unnamed'} — ${resetReason || 'no reason recorded'}`,
+      });
+    }
+    writeJson(sPath, fresh);
     created = true;
   }
   if (force || !fs.existsSync(lPath)) {

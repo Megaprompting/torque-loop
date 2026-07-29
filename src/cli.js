@@ -10,6 +10,7 @@ const artifacts = require('./artifacts');
 const repo = require('./repoSnapshot');
 const gitRefs = require('./gitRefs');
 const coldStart = require('./coldStart');
+const lifecycle = require('./lifecycle');
 const md = require('./markdown');
 const receipt = require('./receipt');
 const journal = require('./evolve/journal');
@@ -161,7 +162,9 @@ function run(argv) {
     }
 
     case 'state':
-      return cmdState(cwd, sub, rest, asJson, flags);
+      // The raw argv travels too: the top-level split drops `--key value` pairs,
+      // and the closure verbs carry real values (--evidence, --owner, --reason).
+      return cmdState(cwd, sub, rest, asJson, flags, args);
 
     case 'receipt': {
       const r = receipt.assemble(cwd);
@@ -182,10 +185,11 @@ function run(argv) {
       return cmdLedger(cwd, sub, rest, asJson);
 
     case 'artifact': {
-      if (sub !== 'add') throw new Error('usage: ratchet artifact add <json>');
+      if (sub === 'close') return cmdArtifactClose(cwd, args);
+      if (sub !== 'add') throw new Error('usage: ratchet artifact add <json> | ratchet artifact close <id>');
       assertMayWrite('artifact add');
       const rec = artifacts.addArtifact(cwd, readPayload(rest[0]));
-      return out(`artifact ${rec.id} added: ${rec.title} (${rec.status})`);
+      return out(`artifact ${rec.id} ${rec.rev > 1 ? `revised → rev ${rec.rev}` : 'added'}: ${rec.title} (${rec.status})`);
     }
 
     case 'defect':
@@ -250,7 +254,7 @@ function run(argv) {
   }
 }
 
-function cmdState(cwd, sub, rest, asJson, flags = new Set()) {
+function cmdState(cwd, sub, rest, asJson, flags = new Set(), argv = []) {
   switch (sub) {
     case undefined:
     case 'get': {
@@ -283,32 +287,215 @@ function cmdState(cwd, sub, rest, asJson, flags = new Set()) {
       if (!schemas.STATE_COLLECTIONS[collection]) {
         throw new Error(`unknown collection "${collection}". valid: ${Object.keys(schemas.STATE_COLLECTIONS).join(', ')}`);
       }
+      // Artifacts and defects have gated constructors (identity, attachment,
+      // reserved fields, dedup). A raw append walks straight past all of them,
+      // which is how a "closed" artifact or a "resolved" defect gets minted with
+      // no transition behind it.
+      if (collection === 'artifacts' || collection === 'defects') {
+        throw new Error(
+          `${collection} are not appendable: use ${collection === 'artifacts' ? 'ratchet artifact add' : 'ratchet defect add'} ` +
+            '<json>, which enforces the identity, attachment, and status gates a raw append bypasses.'
+        );
+      }
       const item = readPayload(payloadArg);
       const s = state.loadState(cwd);
+      // Birth status is forced, not accepted: an assumption born "tested" and a
+      // loop born "closed" are exactly the two lies that make the drain lie.
+      const BIRTH_STATUS = { assumptions: 'untested', openLoops: 'open' };
+      const birth = BIRTH_STATUS[collection];
+      if (birth) {
+        const claimed = item.status == null ? '' : String(item.status);
+        if (claimed && claimed !== birth) {
+          throw new Error(
+            `${collection} are born "${birth}", never "${claimed}" — reaching any other status is a transition ` +
+              `(ratchet state close ${collection} <id> …), not a birth field`
+          );
+        }
+        item.status = birth;
+        const key = String(item.text || '').trim().toLowerCase();
+        const dup = key && (s[collection] || []).find((x) => String((x && x.text) || '').trim().toLowerCase() === key);
+        if (dup) return out(`already recorded in ${collection}: ${dup.id}`);
+      }
       const record = { id: item.id || state.makeId(schemas.STATE_COLLECTIONS[collection]), at: schemas.nowIso(), ...item };
       s[collection].push(record);
       s.dirty = true;
       state.saveState(cwd, s);
       return out(`appended to ${collection}: ${record.id}`);
     }
+    case 'close':
+      return cmdStateClose(cwd, argv);
     case 'reset': {
       assertMayWrite('state reset');
       // Authority gate: wiping session state (objective, defects, artifacts,
       // decisions, history) is irreversible. Like every other irreversible verb
       // in the CLI, it must be explicitly authorized — a bare `state reset` must
-      // not be able to erase the record by accident.
+      // not be able to erase the record by accident. --force says "I mean it";
+      // --owner/--reason say who meant it and why, because the wipe destroys the
+      // only record of that answer.
       if (!flags.has('--force')) {
         throw new Error(
           'ratchet state reset wipes all session state (objective, defects, artifacts, decisions, history) — ' +
             'this is irreversible. Re-run with --force to authorize.'
         );
       }
-      state.initProject(cwd, { force: true });
-      return out('state reset');
+      const { opts } = parseArgv(argv, { booleans: ['force', 'json'] });
+      const owner = strOpt(opts.owner);
+      const reason = strOpt(opts.reason);
+      if (!owner) throw new Error('state reset --force requires --owner "<who authorized the wipe>"');
+      if (!reason) throw new Error('state reset --force requires --reason "<why the record is being destroyed>"');
+      state.initProject(cwd, { force: true, resetBy: owner, resetReason: reason });
+      return out(`state reset (owner: ${owner})`);
     }
     default:
       throw new Error(`unknown state subcommand: ${sub}`);
   }
+}
+
+// Loops and assumptions could be born but never finished — the same hole the
+// defect lifecycle had before 0.2. An open loop that was actually answered kept
+// draining confidence, so the drain stopped tracking reality and the number
+// stopped meaning anything. Parking is a close too: it stops the nagging, but it
+// STILL DRAINS, because a parked question is an unanswered question with an
+// owner, not an answered one.
+function cmdStateClose(cwd, argv) {
+  assertMayWrite('state close');
+  const { positionals, opts } = parseArgv(argv, { booleans: ['park', 'json'] });
+  const collection = positionals[2];
+  const id = positionals[3];
+  const need = (val, msg) => {
+    if (!val) throw new Error(msg);
+    return val;
+  };
+
+  if (collection !== 'openLoops' && collection !== 'assumptions') {
+    throw new Error(
+      `ratchet state close handles openLoops and assumptions${collection ? ` (got "${collection}")` : ''} — ` +
+        'defects transition with ratchet defect resolve|waive|supersede, artifacts with ratchet artifact close.'
+    );
+  }
+  need(id, `usage: ratchet state close ${collection} <id> ...`);
+
+  const s = state.loadState(cwd);
+  const record = (s[collection] || []).find((x) => x && x.id === id);
+  if (!record) throw new Error(`no ${collection} entry with id "${id}"`);
+  const now = schemas.nowIso();
+  const evidence = strOpt(opts.evidence);
+  let to;
+
+  if (collection === 'openLoops') {
+    if (opts.park === true) {
+      const owner = need(strOpt(opts.owner), 'parking a loop requires --owner "<who carries it>"');
+      const trigger = need(
+        strOpt(opts['revisit-trigger']),
+        'parking a loop requires --revisit-trigger "<what brings it back>" — a park with no trigger is a drop'
+      );
+      to = 'parked';
+      record.owner = owner;
+      record.revisitTrigger = trigger;
+    } else {
+      need(evidence, 'closing a loop requires --evidence "<what actually closed it>" — no proof, no close');
+      to = 'closed';
+      record.evidence = evidence;
+    }
+  } else {
+    const outcome = strOpt(opts.outcome);
+    if (outcome !== 'tested' && outcome !== 'killed') {
+      throw new Error('closing an assumption requires --outcome tested|killed — an assumption ends proven or dead');
+    }
+    need(evidence, 'closing an assumption requires --evidence "<the result that settled it>"');
+    to = outcome;
+    record.evidence = evidence;
+  }
+
+  const from = record.status || '';
+  record.status = to;
+  record.closedAt = now;
+  s.dirty = true;
+  s.history.push({
+    id: state.makeId('hist'),
+    at: now,
+    event: `${collection === 'openLoops' ? 'loop' : 'assumption'}.${to}`,
+    note: `${id}: ${from} → ${to}${evidence ? ` — ${evidence}` : ''}`,
+  });
+  state.saveState(cwd, s);
+  return out(`${collection} ${id} → ${to}`);
+}
+
+// The closure gate. `compile done` says the record is current; this says the
+// work is finished — and it will only say so when a KEEP is bound to THIS exact
+// revision. Checkpoint is not closure.
+function cmdArtifactClose(cwd, argv) {
+  assertMayWrite('artifact close');
+  const { positionals, opts } = parseArgv(argv, { booleans: ['waive-holes', 'json'] });
+  const id = positionals[2];
+  if (!id) throw new Error('usage: ratchet artifact close <id> [--waive-holes --owner "<who>" --reason "<why>"]');
+
+  const s = state.loadState(cwd);
+  const matches = (s.artifacts || []).filter((a) => a && a.id === id);
+  if (matches.length > 1) {
+    throw new Error(
+      `${matches.length} artifacts share the id "${id}" — refusing to close an ambiguous record. ` +
+        'Repair the store first: give the duplicates distinct ids in state.json, then re-run.'
+    );
+  }
+  const artifact = matches[0];
+  if (!artifact) throw new Error(`no artifact with id "${id}"`);
+
+  // Idempotent: a second close of an already-certified artifact is a no-op, not
+  // an error. Re-running a serialize block must never be punished.
+  if (lifecycle.isClosed(artifact)) {
+    return out(`artifact ${id} is already closed (rev ${artifact.closedRev}, by ${artifact.closedBy}) — no change`);
+  }
+
+  const owner = strOpt(opts.owner);
+  const reason = strOpt(opts.reason);
+  const waiveHoles = opts['waive-holes'] === true;
+
+  let events = [];
+  try {
+    events = journal.readEvents(cwd);
+  } catch (_e) {
+    events = [];
+  }
+  const blockers = lifecycle.closureBlockers(s, events, artifact, cwd, { waiveHoles, owner, reason });
+  if (blockers.length) {
+    throw new Error(
+      `cannot close artifact "${id}" — ${blockers.length} blocker(s):\n` + blockers.map((b) => `  - [${b.code}] ${b.message}`).join('\n')
+    );
+  }
+
+  const fp = lifecycle.fingerprint(cwd, artifact);
+  // A record-scope close certifies a claim about a RECORD, not about bytes on
+  // disk — a much weaker proof. It is allowed, but only with a named owner who
+  // says so out loud, exactly like a seam waiver.
+  if (fp.hashScope === 'record') {
+    if (!owner || !reason) {
+      throw new Error(
+        `cannot close artifact "${id}": its proof is record-scope, not file-scope` +
+          (fp.downgradeReason ? ` (${fp.downgradeReason})` : ' (the artifact points at no file)') +
+          ' — that certifies a claim about the record, not about shipped bytes. ' +
+          'Authorize it by name: --owner "<who accepts it>" --reason "<why record-scope proof is enough here>".'
+      );
+    }
+  }
+
+  const bound = lifecycle.bindingEvent(artifact, events, fp);
+  const now = schemas.nowIso();
+  artifact.status = 'closed';
+  artifact.closedAt = now;
+  artifact.closedBy = bound.id || '';
+  artifact.closedRev = fp.rev;
+  artifact.closedHash = fp.hash;
+  if (waiveHoles && (artifact.holes || []).length) artifact.holesWaiver = { by: owner, reason };
+  s.dirty = true;
+  s.history.push({
+    id: state.makeId('hist'),
+    at: now,
+    event: 'artifact.closed',
+    note: `${id} closed at rev ${fp.rev} on ${bound.id || 'bound proof'}${owner ? ` (owner: ${owner})` : ''}`,
+  });
+  state.saveState(cwd, s);
+  return out(`artifact ${id} closed — rev ${fp.rev}, ${fp.hashScope} hash ${String(fp.hash).slice(0, 8)}, proof ${bound.id || '—'}`);
 }
 
 function cmdLedger(cwd, sub, rest, asJson) {
@@ -743,12 +930,17 @@ function help() {
       '  ratchet status [--json]            render current state',
       '  ratchet state get [key] [--json]   read state (or one key)',
       '  ratchet state set <key> <value>    set objective|title|bottleneck|phase|nextAction|nextCommand|...',
-      '  ratchet state append <coll> <json> append to decisions|artifacts|defects|assumptions|openLoops|history',
-      '  ratchet compile done               mark session compiled: clear dirty + stamp lastCompileAt',
-      '  ratchet state reset --force        wipe session state (irreversible — --force required)',
+      '  ratchet state append <coll> <json> append to decisions|assumptions|openLoops|touchedFiles|history',
+      '  ratchet state close openLoops <id> --evidence "<what closed it>"',
+      '                                     or --park --owner "<n>" --revisit-trigger "<t>" (parked still drains)',
+      '  ratchet state close assumptions <id> --outcome tested|killed --evidence "<result>"',
+      '  ratchet compile done               CHECKPOINT the session (clear dirty, stamp lastCompileAt) — not closure',
+      '  ratchet state reset --force --owner "<n>" --reason "<r>"   wipe session state (irreversible)',
       '',
       'ARTIFACTS & DEFECTS',
-      '  ratchet artifact add <json>        record an artifact ({title,kind,status,path,holes})',
+      '  ratchet artifact add <json>        record an artifact ({title,kind,status,path,holes}); an existing id revises it',
+      '  ratchet artifact close <id> [--waive-holes --owner "<n>" --reason "<r>"]',
+      '                                     CLOSE it — needs a KEEP bound to this exact revision (no proof → no close)',
       '  ratchet defect add <json>          record a defect ({severity,summary,feature}) — also hits ledger',
       '  ratchet defect list [--json]       list defects (○ draining / ● terminal)',
       '  ratchet defect get <id> [--json]   show one defect + its lifecycle log',

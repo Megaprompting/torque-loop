@@ -234,7 +234,8 @@ function assemble(cwd = process.cwd()) {
       retractedArtifacts,
       seamWaivers,
       enforced: [
-        'state reset — requires --force',
+        'state reset — requires --force + --owner + --reason',
+        'artifact close — requires a KEEP bound to this exact revision',
         'defect resolve — requires --evidence',
         'defect waive — requires --owner + --reason',
         'artifact retract — requires --reason',

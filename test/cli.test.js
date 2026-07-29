@@ -488,8 +488,9 @@ ok('state reset requires explicit authority (--force)', () => {
   state.saveState(cwd, s);
   assert.throws(() => cli.run(['node', 'ratchet', 'state', 'reset']), /irreversible|--force/);
   assert.strictEqual(state.loadState(cwd).objective, 'do not lose me', 'a bare reset must not wipe state');
-  cli.run(['node', 'ratchet', 'state', 'reset', '--force']);
-  assert.strictEqual(state.loadState(cwd).objective, '', 'reset --force wipes state');
+  // 0.8: --force says "I mean it"; --owner/--reason say who meant it and why.
+  cli.run(['node', 'ratchet', 'state', 'reset', '--force', '--owner', 'danny', '--reason', 'fixture reset']);
+  assert.strictEqual(state.loadState(cwd).objective, '', 'an authorized reset --force wipes state');
 });
 
 // --- the receipt: one stable shape, every section always present ------------
@@ -1118,6 +1119,87 @@ ok('the defect transition engine enforces its own proof, not just the CLI', () =
   assert.strictEqual(state.loadState(cwd).defects.find((x) => x.id === d.id).status, 'open', 'nothing leaked through');
 });
 
+// --- write-boundary gates (0.8 Closure Gate) --------------------------------
+
+ok('the checkpoint scalars cannot be set by hand — compile done is the only transition', () => {
+  state.initProject(cwd, { force: true });
+  assert.throws(() => cli.run(['node', 'ratchet', 'state', 'set', 'dirty', 'false']), /not a settable scalar/);
+  assert.throws(() => cli.run(['node', 'ratchet', 'state', 'set', 'lastCompileAt', '2026-01-01']), /not a settable scalar/);
+  cli.run(['node', 'ratchet', 'touch', 'README.md']);
+  assert.strictEqual(state.loadState(cwd).dirty, true, 'a bypass would have cleared this silently');
+});
+
+ok('state reset --force names who reset and why, and leaves a tombstone', () => {
+  state.initProject(cwd, { force: true });
+  const s = state.loadState(cwd);
+  s.objective = 'do not lose me quietly';
+  state.saveState(cwd, s);
+  assert.throws(() => cli.run(['node', 'ratchet', 'state', 'reset', '--force']), /owner/);
+  assert.throws(() => cli.run(['node', 'ratchet', 'state', 'reset', '--force', '--owner', 'danny']), /reason/);
+  assert.strictEqual(state.loadState(cwd).objective, 'do not lose me quietly', 'an unauthorized reset changes nothing');
+
+  cli.run(['node', 'ratchet', 'state', 'reset', '--force', '--owner', 'danny', '--reason', 'starting a new run']);
+  const after = state.loadState(cwd);
+  assert.strictEqual(after.objective, '', 'the authorized reset wiped state');
+  const tomb = (after.history || []).find((h) => h.event === 'state.reset');
+  assert.ok(tomb, 'the fresh state opens with a tombstone, not a blank slate');
+  assert.ok(/danny/.test(tomb.note) && /new run/.test(tomb.note), 'the tombstone names who and why');
+});
+
+ok('state append forces birth status and dedups on text', () => {
+  state.initProject(cwd, { force: true });
+  cli.run(['node', 'ratchet', 'state', 'append', 'assumptions', '{"text":"the seam is stable"}']);
+  assert.strictEqual(state.loadState(cwd).assumptions[0].status, 'untested');
+  // an assumption born "tested" is an untested assumption wearing a badge
+  assert.throws(
+    () => cli.run(['node', 'ratchet', 'state', 'append', 'assumptions', '{"text":"x","status":"tested"}']),
+    /born/
+  );
+  // dedup on trimmed text
+  cli.run(['node', 'ratchet', 'state', 'append', 'assumptions', '{"text":"  the seam is stable  "}']);
+  assert.strictEqual(state.loadState(cwd).assumptions.length, 1, 'the same assumption is one drain, not two');
+
+  cli.run(['node', 'ratchet', 'state', 'append', 'openLoops', '{"text":"decide the store shape"}']);
+  assert.strictEqual(state.loadState(cwd).openLoops[0].status, 'open');
+  assert.throws(
+    () => cli.run(['node', 'ratchet', 'state', 'append', 'openLoops', '{"text":"y","status":"closed"}']),
+    /born/
+  );
+  cli.run(['node', 'ratchet', 'state', 'append', 'openLoops', '{"text":"decide the store shape"}']);
+  assert.strictEqual(state.loadState(cwd).openLoops.length, 1);
+});
+
+ok('state append cannot mint artifacts or defects behind their gates', () => {
+  state.initProject(cwd, { force: true });
+  assert.throws(
+    () => cli.run(['node', 'ratchet', 'state', 'append', 'artifacts', '{"title":"forged","status":"closed"}']),
+    /ratchet artifact add/
+  );
+  assert.throws(
+    () => cli.run(['node', 'ratchet', 'state', 'append', 'defects', '{"summary":"forged","status":"resolved"}']),
+    /ratchet defect add/
+  );
+  const s = state.loadState(cwd);
+  assert.strictEqual(s.artifacts.length, 0);
+  assert.strictEqual(s.defects.length, 0);
+});
+
+ok('the ledger defect mirror is written by transitions, not by hand', () => {
+  state.initProject(cwd, { force: true });
+  artifacts.addArtifact(cwd, { title: 'only', kind: 'spec' });
+  const { state: d } = artifacts.addDefect(cwd, { severity: 'high', summary: 'mirror gate' });
+  assert.throws(
+    () => cli.run(['node', 'ratchet', 'ledger', 'update', 'defects', `{"id":"${d.ledgerId}","status":"resolved"}`]),
+    /status/
+  );
+  assert.strictEqual(state.loadLedger(cwd).defects.find((x) => x.id === d.ledgerId).status, 'open', 'the mirror held');
+  // the internal transition sync path still works
+  cli.run(['node', 'ratchet', 'defect', 'resolve', d.id, '--evidence', 'fixed and re-run']);
+  assert.strictEqual(state.loadLedger(cwd).defects.find((x) => x.id === d.ledgerId).status, 'resolved');
+  // non-status ledger writes are untouched
+  assert.doesNotThrow(() => cli.run(['node', 'ratchet', 'ledger', 'update', 'features', '{"name":"router"}']));
+});
+
 // --- proof binding (0.8 Closure Gate) ---------------------------------------
 
 const lifecycle = require('../src/lifecycle');
@@ -1239,6 +1321,196 @@ ok('an unbound verify still returns the fixed shape, with the binding stated emp
   assert.strictEqual(v.verifiedHash, '');
   assert.strictEqual(v.verifiedRev, null);
   assert.strictEqual(v.hashScope, '');
+});
+
+// --- artifact close + loop/assumption transitions (0.8 Closure Gate) --------
+
+// Run a body with the process rooted in `proj` and the evolve journal scoped to
+// it, so `cli.run` (which always reads process.cwd()) works on the fixture.
+function inProject(proj, body) {
+  const prevCwd = process.cwd();
+  const prevLog = process.env.RATCHET_EVOLVE_LOG;
+  process.env.RATCHET_EVOLVE_LOG = path.join(proj, 'evolve-log.jsonl');
+  process.chdir(proj);
+  try {
+    return body();
+  } finally {
+    process.chdir(prevCwd);
+    process.env.RATCHET_EVOLVE_LOG = prevLog;
+  }
+}
+
+function say(fn) {
+  const chunks = [];
+  const orig = process.stdout.write;
+  process.stdout.write = (str) => { chunks.push(String(str)); return true; };
+  try {
+    fn();
+  } finally {
+    process.stdout.write = orig;
+  }
+  return chunks.join('');
+}
+
+ok('artifact close refuses every blocker at once, in one fixed order', () => {
+  const { proj, art } = boundFixture('close-blockers', { kind: 'probe', file: 'src/p.js' });
+  inProject(proj, () => {
+    artifacts.addArtifact(proj, { id: art.id, holes: ['unanswered: does it double-fire?'] });
+    artifacts.addDefect(proj, { severity: 'high', summary: 'still red', artifact: art.id });
+    try {
+      cli.run(['node', 'ratchet', 'artifact', 'close', art.id]);
+      assert.fail('a probe with defects, holes and no proof must not close');
+    } catch (e) {
+      const codes = (e.message.match(/\[([a-z-]+)\]/g) || []).map((m) => m.slice(1, -1));
+      assert.deepStrictEqual(codes, ['probe', 'no-bound-proof', 'open-defects', 'holes'], e.message);
+      assert.ok(/a probe never closes/.test(e.message), 'the probe refusal keeps its house voice');
+      assert.ok(/Checkpoint is not closure/.test(e.message), 'the no-proof refusal names the slogan');
+    }
+  });
+});
+
+ok('artifact close is earned by bound proof, then idempotent', () => {
+  const { proj, art } = boundFixture('close-happy', { kind: 'code', file: 'src/thing.js' });
+  inProject(proj, () => {
+    // no proof yet
+    assert.throws(() => cli.run(['node', 'ratchet', 'artifact', 'close', art.id]), /no KEEP proof bound/);
+    const v = evolveVerify.verify({ target: 'src/thing.js', testCommand: 'node -e 0', mode: 'code', cwd: proj, artifact: art });
+    journal.appendEvent(proj, keepFields(art), { verifiedHash: v.verifiedHash });
+
+    const first = say(() => cli.run(['node', 'ratchet', 'artifact', 'close', art.id]));
+    assert.ok(/closed — rev 1/.test(first), first);
+    const closed = state.loadState(proj).artifacts.find((a) => a.id === art.id);
+    assert.strictEqual(closed.status, 'closed');
+    assert.strictEqual(closed.closedRev, v.verifiedRev);
+    assert.strictEqual(closed.closedHash, v.verifiedHash);
+    assert.ok(closed.closedBy, 'the certificate names the proof that authorized it');
+    assert.ok(closed.closedAt);
+    assert.strictEqual(state.loadState(proj).dirty, true);
+    assert.ok(state.loadState(proj).history.some((h) => h.event === 'artifact.closed'));
+
+    // a second close is a no-op, not an error — re-running a serialize block is free
+    const again = say(() => cli.run(['node', 'ratchet', 'artifact', 'close', art.id]));
+    assert.ok(/already closed/.test(again), again);
+    // and the closed record cannot be edited away
+    assert.throws(() => artifacts.addArtifact(proj, { id: art.id, title: 'rewrite history' }), /historical fact/);
+  });
+});
+
+ok('revising an artifact invalidates the proof bound to its old revision', () => {
+  const { proj, art } = boundFixture('close-revised', { kind: 'code', file: 'src/thing.js' });
+  inProject(proj, () => {
+    const v = evolveVerify.verify({ target: 'src/thing.js', testCommand: 'node -e 0', mode: 'code', cwd: proj, artifact: art });
+    journal.appendEvent(proj, keepFields(art), { verifiedHash: v.verifiedHash });
+    // rev 1 is closable...
+    assert.deepStrictEqual(
+      lifecycle.closureBlockers(state.loadState(proj), journal.readEvents(proj),
+        state.loadState(proj).artifacts.find((a) => a.id === art.id), proj), []
+    );
+    // ...and revising it is not
+    artifacts.addArtifact(proj, { id: art.id, title: 'thing, revised' });
+    assert.throws(() => cli.run(['node', 'ratchet', 'artifact', 'close', art.id]), /rev 2/);
+  });
+});
+
+ok('a record-scope close must be authorized by name', () => {
+  const proj = path.join(tmp, 'close-record');
+  fs.rmSync(proj, { recursive: true, force: true });
+  fs.mkdirSync(proj, { recursive: true });
+  state.initProject(proj, { force: true });
+  // the real dogfood shape: a path that is not a file
+  const art = artifacts.addArtifact(proj, { title: 'release note', kind: 'docs', path: 'CHANGELOG.md#unreleased' });
+  inProject(proj, () => {
+    const fp = lifecycle.fingerprint(proj, art);
+    assert.strictEqual(fp.hashScope, 'record');
+    journal.appendEvent(proj, {
+      target: 'CHANGELOG.md', artifactId: art.id, verdict: 'KEEP',
+      verification: { manualChecks: ['read end to end against the diff'], result: 'manual' },
+    }, { verifiedHash: fp.hash });
+    assert.throws(() => cli.run(['node', 'ratchet', 'artifact', 'close', art.id]), /record-scope/);
+    cli.run(['node', 'ratchet', 'artifact', 'close', art.id, '--owner', 'danny', '--reason', 'no file ships; the record is the artifact']);
+    assert.strictEqual(state.loadState(proj).artifacts.find((a) => a.id === art.id).status, 'closed');
+  });
+});
+
+ok('holes block a close until they are filled or waived by a named owner', () => {
+  const { proj, art } = boundFixture('close-holes', { kind: 'code', file: 'src/thing.js' });
+  inProject(proj, () => {
+    artifacts.addArtifact(proj, { id: art.id, holes: ['no rollback path'] });
+    const live = state.loadState(proj).artifacts.find((a) => a.id === art.id);
+    const v = evolveVerify.verify({ target: 'src/thing.js', testCommand: 'node -e 0', mode: 'code', cwd: proj, artifact: live });
+    journal.appendEvent(proj, keepFields(live), { verifiedHash: v.verifiedHash });
+    assert.throws(() => cli.run(['node', 'ratchet', 'artifact', 'close', art.id]), /open hole/);
+    assert.throws(() => cli.run(['node', 'ratchet', 'artifact', 'close', art.id, '--waive-holes']), /open hole/);
+    cli.run(['node', 'ratchet', 'artifact', 'close', art.id, '--waive-holes', '--owner', 'danny', '--reason', 'rollback lands next release']);
+    const closed = state.loadState(proj).artifacts.find((a) => a.id === art.id);
+    assert.strictEqual(closed.status, 'closed');
+    assert.deepStrictEqual(closed.holesWaiver, { by: 'danny', reason: 'rollback lands next release' });
+  });
+});
+
+ok('loops close with evidence; parking stops the nagging but keeps the drain', () => {
+  state.initProject(cwd, { force: true });
+  cli.run(['node', 'ratchet', 'state', 'append', 'openLoops', '{"text":"pick the store shape"}']);
+  const loopId = state.loadState(cwd).openLoops[0].id;
+  assert.throws(() => cli.run(['node', 'ratchet', 'state', 'close', 'openLoops', loopId]), /evidence/);
+  const drained = scoring.scoreConfidence(state.loadState(cwd)).penalties.some((p) => /open loop/.test(p.reason));
+  assert.ok(drained, 'an open loop drains');
+
+  // park: named owner + a trigger that brings it back, and it STILL drains
+  cli.run(['node', 'ratchet', 'state', 'append', 'openLoops', '{"text":"decide the v0.9 rot check"}']);
+  const parkId = state.loadState(cwd).openLoops[1].id;
+  assert.throws(() => cli.run(['node', 'ratchet', 'state', 'close', 'openLoops', parkId, '--park']), /owner/);
+  assert.throws(
+    () => cli.run(['node', 'ratchet', 'state', 'close', 'openLoops', parkId, '--park', '--owner', 'danny']),
+    /revisit-trigger/
+  );
+  cli.run(['node', 'ratchet', 'state', 'close', 'openLoops', parkId, '--park', '--owner', 'danny', '--revisit-trigger', 'first rot report']);
+  const parked = state.loadState(cwd).openLoops.find((l) => l.id === parkId);
+  assert.strictEqual(parked.status, 'parked');
+  assert.strictEqual(parked.owner, 'danny');
+  assert.strictEqual(parked.revisitTrigger, 'first rot report');
+  assert.ok(
+    scoring.scoreConfidence(state.loadState(cwd)).penalties.some((p) => /2 open loop/.test(p.reason)),
+    'a parked question is an unanswered question with an owner — it still drains'
+  );
+
+  cli.run(['node', 'ratchet', 'state', 'close', 'openLoops', loopId, '--evidence', 'chose one store; decision recorded']);
+  const closedLoop = state.loadState(cwd).openLoops.find((l) => l.id === loopId);
+  assert.strictEqual(closedLoop.status, 'closed');
+  assert.ok(/chose one store/.test(closedLoop.evidence));
+  assert.ok(
+    scoring.scoreConfidence(state.loadState(cwd)).penalties.some((p) => /1 open loop/.test(p.reason)),
+    'a closed loop stops draining'
+  );
+});
+
+ok('assumptions end proven or dead, never just "done"', () => {
+  state.initProject(cwd, { force: true });
+  cli.run(['node', 'ratchet', 'state', 'append', 'assumptions', '{"text":"the seam is stable","killTest":"call it 100x"}']);
+  const id = state.loadState(cwd).assumptions[0].id;
+  assert.throws(() => cli.run(['node', 'ratchet', 'state', 'close', 'assumptions', id]), /tested\|killed/);
+  assert.throws(
+    () => cli.run(['node', 'ratchet', 'state', 'close', 'assumptions', id, '--outcome', 'tested']),
+    /evidence/
+  );
+  cli.run(['node', 'ratchet', 'state', 'close', 'assumptions', id, '--outcome', 'killed', '--evidence', 'failed on call 12']);
+  assert.strictEqual(state.loadState(cwd).assumptions[0].status, 'killed');
+  // other collections are refused, and pointed at their own verb
+  assert.throws(() => cli.run(['node', 'ratchet', 'state', 'close', 'defects', 'x', '--evidence', 'y']), /ratchet defect resolve/);
+  assert.throws(() => cli.run(['node', 'ratchet', 'state', 'close', 'artifacts', 'x', '--evidence', 'y']), /ratchet artifact close/);
+});
+
+ok('the fog auto-close names its authority and its evidence', () => {
+  state.initProject(cwd, { force: true });
+  cli.run(['node', 'ratchet', 'score', 'aperture', '{"ambiguity":2,"terrain":2,"taste":2,"blastRadius":1,"reversibility":1}']);
+  const map = artifacts.addArtifact(cwd, { kind: 'unknown-map', title: 'unknowns map: closure', holes: ['Q1 OPEN'] });
+  const fog = state.loadState(cwd).openLoops.filter((l) => /^fog:/.test(l.text));
+  assert.ok(fog.length >= 1);
+  for (const l of fog) {
+    assert.strictEqual(l.status, 'closed');
+    assert.strictEqual(l.closedBy, map.id, 'the close names which map answered it');
+    assert.ok(/unknown-map/.test(l.evidence), 'and states the evidence, not just the flag flip');
+  }
 });
 
 // --- closure derivation (0.8 Closure Gate) ----------------------------------

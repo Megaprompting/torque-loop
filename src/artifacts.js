@@ -241,7 +241,7 @@ function addDefect(cwd, item, { alsoLedger = true } = {}) {
       summary: record.summary,
       status: record.status,
       foundAt: now,
-    }).item;
+    }, { via: 'transition' }).item;
     // Link the state defect to its ledger mirror so lifecycle transitions can
     // keep both surfaces honest instead of letting the ledger silently drift.
     record.ledgerId = ledgerRecord.id;
@@ -310,7 +310,7 @@ function transitionDefect(cwd, id, toStatus, meta = {}) {
   // state transition that already succeeded.
   if (d.ledgerId) {
     try {
-      require('./ledger').upsert(cwd, 'defects', { id: d.ledgerId, status: toStatus });
+      require('./ledger').upsert(cwd, 'defects', { id: d.ledgerId, status: toStatus }, { via: 'transition' });
     } catch (_e) {
       /* ledger sync is best-effort */
     }

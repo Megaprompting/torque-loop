@@ -67,7 +67,10 @@ const STATE_COLLECTIONS = {
   history: 'hist',
 };
 
-// Top-level scalar fields that `state set` accepts.
+// Top-level scalar fields that `state set` accepts. `dirty` and `lastCompileAt`
+// are deliberately absent: they are the checkpoint, and a checkpoint you can
+// assert by hand is not a record of anything. `ratchet compile done` is the only
+// transition that moves them.
 const STATE_SCALARS = new Set([
   'title',
   'objective',
@@ -76,8 +79,6 @@ const STATE_SCALARS = new Set([
   'nextAction',
   'nextCommand',
   'confidence',
-  'dirty',
-  'lastCompileAt',
 ]);
 
 const LEDGER_COLLECTIONS = {
