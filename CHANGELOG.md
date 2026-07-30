@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **README restructured so value precedes setup, and the MCP server is no longer invisible.**
+  The front door described `/ratchet:evolve` — one of twenty-one commands — while install had
+  grown to 43% of the document and pushed the Commands section past the halfway mark. The
+  headline now states the whole engine and the three things it bundles; the MCP server is a
+  top-level section rather than install sub-section "F"; install collapses from six lettered
+  paths (A–F) to the four real choices; and a table of contents is added.
+  - The Development section was **wrong**, not merely thin: it called `npm test` a
+    "zero-dependency smoke test over the state engine" when it is eleven suites, and it never
+    mentioned `npm run preflight` at all. It now names every suite and what it guards, both
+    gates, how to run one suite, and the two rules a contributor is held to.
+  - Restored during review, after diffing the rewrite against the original: the MCP surface
+    says out loud that it is **one tool and three read-only resources today** (the rewrite had
+    thinned that into "the only call that accepts a pathname", which reads as though there are
+    others), and Codex's lack of a documented per-session workspace substitution is back as
+    the reason a bundled config has nothing correct to put in it.
+  - Prose claims verified against the code rather than trusted: the evolve log path, the
+    `receipt --save` targets, `doctor cold-start`, zero runtime *and* dev dependencies, the
+    eleven-suite count, and every relative link.
+
 ### Added
 
 - **`--project-root`: a host may NAME the workspace, which is not the same as this server
