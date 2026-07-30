@@ -7,18 +7,20 @@
   "type": "commonjs",
   "bin": {
     "ratchet": "bin/ratchet",
-    "ratchet-evolve": "bin/ratchet-evolve"
+    "ratchet-evolve": "bin/ratchet-evolve",
+    "ratchet-mcp": "bin/ratchet-mcp"
   },
   "main": "src/cli.js",
   "engines": {
     "node": ">=18"
   },
   "scripts": {
-    "test": "node test/cli.test.js && node test/evolve.test.js && node test/plugin-shape.test.js && node test/concurrency.test.js && node test/mcp-rpc.test.js && node test/mcp-workspace.test.js && node test/mcp-handles.test.js && node test/mcp-repository.test.js && node test/mcp-server.test.js && node test/mcp-toctou.test.js",
+    "test": "node test/cli.test.js && node test/evolve.test.js && node test/plugin-shape.test.js && node test/concurrency.test.js && node test/mcp-rpc.test.js && node test/mcp-workspace.test.js && node test/mcp-handles.test.js && node test/mcp-repository.test.js && node test/mcp-server.test.js && node test/mcp-toctou.test.js && node test/mcp-entry.test.js",
     "test:concurrency": "node test/concurrency.test.js",
     "preflight": "node scripts/preflight.js",
     "ratchet": "node bin/ratchet",
-    "ratchet-evolve": "node bin/ratchet-evolve"
+    "ratchet-evolve": "node bin/ratchet-evolve",
+    "ratchet-mcp": "node bin/ratchet-mcp"
   },
   "files": [
     "bin",
