@@ -141,7 +141,7 @@ function payload(response) {
   return fromText;
 }
 
-ok('S1 both protocol eras advertise the fixed tools and resources capabilities', () => {
+ok('S1 both protocol eras advertise the fixed tools, resources, and prompts capabilities', () => {
   const root = fixture('s1-root');
   const server = service([root]);
 
@@ -149,11 +149,11 @@ ok('S1 both protocol eras advertise the fixed tools and resources capabilities',
   const discover = modernConn.handleMessage({
     jsonrpc: '2.0', id: ++requestId, method: 'server/discover',
   });
-  assert.deepStrictEqual(discover.result.capabilities, { tools: {}, resources: {} });
+  assert.deepStrictEqual(discover.result.capabilities, { tools: {}, resources: {}, prompts: {} });
 
   const legacyConn = server.createConnection();
   const init = initialize(legacyConn);
-  assert.deepStrictEqual(init.result.capabilities, { tools: {}, resources: {} });
+  assert.deepStrictEqual(init.result.capabilities, { tools: {}, resources: {}, prompts: {} });
 });
 
 ok('S2 tools/list exposes only workspace.open with a closed path schema', () => {

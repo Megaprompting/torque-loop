@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **The 16 canonical ratchet prompts are now an MCP prompt surface.** `prompts/list`
+  advertises each prompt and its body-derived required arguments; `prompts/get` substitutes
+  those arguments into a fresh copy of the canonical body for both supported protocol eras.
+  The registry is generated from `reference/PROMPTS.md` at build time and byte-matched in
+  `plugin-shape`, so a stale committed artifact fails CI instead of drifting at runtime.
+  Unknown prompts and missing or non-string required arguments are **MCP-boundary enforced**;
+  the instructions inside each returned prompt remain **prompt-level guidance**, not CLI
+  enforcement.
+
+<!-- Traced by: openai-codex-gpt-5 -->
+
 ## [1.0.0] - 2026-07-30 — Boundary Gate
 
 0.2 gated proof; 0.3 the seam; 0.6 the fog; 0.7 the probe; 0.8 closure; 0.9 the write.
