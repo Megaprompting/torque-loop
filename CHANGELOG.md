@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`src/mcp/repository.js` — Git-root discovery and local repository identity**
+  (Torque MCP build-order step 2.3). Discovery begins only after the step 2.1 root
+  authority accepts the client-supplied directory, resolves the innermost Git
+  top-level, and then sends that top-level back through the same authority. An
+  allowlisted subdirectory therefore cannot smuggle in a repository root outside
+  the configured boundary.
+  - Repository identity is the SHA-256 digest of the canonical Git common directory;
+    worktree identity separately digests the canonical Git top-level. Linked worktrees
+    consequently share one opaque `repo_…` identity while retaining distinct opaque
+    `worktree_…` identities. Branch, commit, and remote changes do not redefine either.
+  - Git is invoked without a shell and with ambient `GIT_*` variables removed, so
+    inherited `GIT_DIR`, `GIT_WORK_TREE`, or config overrides cannot redirect
+    discovery away from the directory that passed containment.
+  - Non-Git directories, files, inaccessible metadata, sibling repositories, and
+    nested repositories have explicit, tested behavior. The canonical common Git
+    directory may live outside the workspace allowlist for a linked worktree; it is
+    used only as hashed identity material and is not granted as workspace authority.
+  - **Boundary named, not closed:** discovery still observes mutable pathnames and Git
+    metadata over time. Step 2.5 owns the adversarial TOCTOU pass; step 2.4 owns the
+    public `workspace.open` and `torque://` surface that consumes this internal record.
+- **`test/mcp-repository.test.js` — 12-case Git discovery suite**, written red first
+  and wired into `npm test`. It covers subdirectories, spaces, non-repositories,
+  files, both allowlist checks, internal links, nested and sibling repositories,
+  linked worktrees, ambient Git overrides, and identity stability across branch and
+  HEAD changes.
+  - Traced by: `openai-codex-gpt-5`
 - **`src/mcp/handles.js` — opaque, connection-scoped workspace handles** (Torque MCP
   build-order step 2.2). A handle is a **capability, not a shorter spelling of a
   pathname**. It is minted only by the server, only from a path step 2.1 already judged
