@@ -9,6 +9,125 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`src/mcp/handles.js` — opaque, connection-scoped workspace handles** (Torque MCP
+  build-order step 2.2). A handle is a **capability, not a shorter spelling of a
+  pathname**. It is minted only by the server, only from a path step 2.1 already judged
+  contained, and the registry entry keeps the facts established at that moment rather
+  than a string to re-interpret later: the connection it was issued to, the workspace
+  root it belongs to, its canonical name within that workspace, its kind, the exact
+  operations granted, and an issuance nonce distinguishing it from any other grant over
+  the same target.
+  - 256 CSPRNG bits per handle. The client cannot choose one (a supplied `handle`/`id`
+    is ignored, not honored), cannot predict one, and cannot derive one — two grants of
+    the same file are two different capabilities.
+  - Scoped to exactly one live connection: useless on another connection *even from the
+    same client*, dead the instant its connection closes, and never minted by a closed
+    one. Retired values are remembered for the registry's lifetime, not just by the
+    issuing connection, so an RNG collision cannot make a dead capability become someone
+    else's live one.
+  - **The registry is not an existence oracle.** Unknown, malformed, wrong-typed,
+    revoked, closed, and belonging-to-another-connection all raise one identical
+    refusal. Presenting a handle you *do* hold and asking for an operation it lacks is a
+    different, specific refusal — naming the missing authority reveals nothing you had
+    not already proven.
+  - Kinds are `file`, `directory`, `create-file`, `create-directory`, checked against
+    what is actually there at issue time; `file` means a regular file, not a socket, pipe,
+    or device. This is also where the trailing-separator limitation from step 2.1 is
+    answered: a nonexistent name ending in a separator may mint `create-directory`, but
+    is refused as `create-file`, so the directory assertion is not silently discarded.
+    Unknown kinds and unknown or empty operation sets are refused at grant.
+  - Requested operations are snapshotted once before validation, and connection metadata
+    is copied both when the connection opens and when a grant is returned, so getters or
+    caller mutation cannot edit a stored record into more authority.
+  - When configured roots are nested, a target binds to the most-specific containing
+    root, so workspace identity does not depend on allowlist order.
+  - Filesystem examination errors distinguish absence from an object that could not be
+    examined. Both fail closed, but the refusal no longer sends the reader to the wrong
+    cause.
+  - **Boundaries named, not closed:** a handle does not eliminate the race between
+    validation and use — the filesystem underneath can still change; what it removes is
+    client-controlled path substitution and repeated authority interpretation at the
+    protocol boundary. Lookup is a `Map` get and therefore not constant-time, which is
+    not claimed as a timing-attack defence. And "handles are the *only* accepted
+    workspace authority" is enforced by the tool surface that does not exist yet
+    (step 2.4); what this step proves is that a raw path is not accepted *as a handle*.
+- **`test/mcp-handles.test.js` — 25-case capability suite**, with the initial 16 written
+  red against an absent module, eight combined-boundary review falsifiers written red
+  against the interrupted `196c9e3` draft, and an explicit containment/handle seam case
+  covering both internal and escaping symlinks. Wired into `npm test`.
+- **`src/mcp/workspace.js` — the root allowlist and canonical path containment**
+  (Torque MCP build-order step 2.1). The invariant, **with its boundary named**: no
+  client-controlled path is accepted unless the components this module observed, as it
+  observed them, placed it inside a configured root — directly or indirectly. A string
+  check cannot establish that, because the filesystem decides what a path means — so
+  containment is judged on a canonical path, every component resolved through the
+  filesystem in order, never on the text the client sent.
+  - **Not provided: safety across time** — not after the call, and *not even at the
+    instant it returns*. Each component is observed at its own moment and the filesystem
+    can be rearranged between any two of them, so the result describes what was true
+    during the walk and may already be stale on the way back. A pathname API cannot do
+    better: Node exposes no `openat`-style primitive to bind a resolution to an opened
+    directory without a dependency. Closing that window means never handing back a name
+    at all — operating through a bound handle instead — which is the next sub-step's
+    job. Named here rather than implied away.
+  - Resolution walks component by component rather than calling `realpath` once: a
+    single call fails with `ENOENT` on a path that does not exist yet, and says nothing
+    about a link already traversed. `..` is applied to where the path has *actually*
+    arrived, after any link — `path.resolve` would collapse it lexically first, turning
+    `<root>/link-to-elsewhere/..` into `<root>`, a different directory than the client
+    named. Climbing past a component that does not exist is refused outright, since the
+    filesystem would give that no answer either.
+  - Refused directly: relative and drive-relative paths (Node calls Windows `\work`
+    absolute, but it means a different place depending on the process's current drive —
+    and `\\name\` is the same trap in UNC costume, since a real UNC path needs a server
+    *and* a share), `..` escapes, unrelated absolute paths, and a sibling that merely
+    shares a root's name prefix (`/srv/work` does not contain `/srv/work-evil`).
+  - **A backslash is a separator only where the platform says so.** On POSIX it is an
+    ordinary character in a filename, so splitting on it would turn `/srv/work\evil` — a
+    *sibling* of the root — into a path inside it. Extended UNC (`\\?\UNC\...`) is
+    refused rather than half-handled, because its root is not what `path.parse` reports.
+  - Refused indirectly: a symlink leaving the root, a symlinked directory partway along,
+    a **dangling** link whose destination nothing can confirm, a component that is a file
+    rather than a directory (including a *link to* a file, and a trailing separator on
+    one — a file has no contents to descend into, and `..` may not climb out of it as if
+    it had), and any component that could not be examined at all — unreadable is not
+    absent, so `EACCES` fails closed rather than being treated as a path that does not
+    exist yet.
+  - Name comparison is **exact, never case-folded**: both sides come from
+    `realpath.native`, which answers with the name the filesystem actually stores, so
+    equivalent spellings have already converged. Lowercasing would be worse than useless
+    — JavaScript's case mapping is not the filesystem's, and `"İ".toLowerCase()` is two
+    code points, so distinct directories could be judged the same one.
+  - **Known limitation, named not fixed:** a trailing separator on a target that does
+    not exist yet (`<root>/new-dir/`) asserts "this is a directory", and the returned
+    name does not carry that assertion — a caller could create a file there instead.
+    Refusing it outright would break the legitimate case of naming a directory you are
+    about to create, and carrying it would change the return contract, so the fix belongs
+    with the typed handles in the next sub-step rather than here. Containment is not
+    affected. (Open loop, owner Danny.)
+  - Zero roots is a **closed** allowlist: every path is refused. Roots must be fully
+    qualified, existing directories, and are canonicalized at construction. Links that
+    stay *inside* a root are followed normally — containment is not achieved by refusing
+    the feature. Refusals name the boundary without echoing the resolved target, which
+    would answer the question the traversal was asking.
+- **`test/mcp-workspace.test.js` — 28-case containment suite**, written red against an
+  absent module and wired into `npm test` (the plugin-shape unwired-suite guard was
+  verified red against it first). Three independent Codex review rounds — "do not ship",
+  "do not ship", then **containment holds** — with every accepted finding reproduced
+  before its fix.
+  **Ten of the twenty-five findings were defects in the tests themselves**, which is the
+  point of running the review at all: falsifiers whose escape landed outside the root, so
+  they passed against a broken implementation for a reason unrelated to the rule under
+  test; cases that built their `..` paths with `path.join`, which
+  normalizes the dot segments away before the module ever sees them; a case-comparison
+  test the reviewer defeated by loading the *old* implementation and watching it pass; an
+  assertion that could not fail; a UNC fixture that refused because the path did not
+  exist rather than because it was malformed; and a rationale comment that was wrong
+  about how Node handles a NUL. Every falsifier is now verified red against the
+  implementation it targets, checked out from git rather than assumed. The suite keeps
+  the positive controls that stop it passing for the wrong reason: an implementation that
+  refused every symlink, or every `..`, would block all the escapes and still be broken.
+
 - **`src/mcp/rpc.js` — the Torque MCP RPC kernel with era pinning** (CLI-enforced at the
   kernel boundary; Torque MCP 1.0 build-order step 1 of the ratified spec). A connection
   speaks exactly one protocol era: `server/discover` pins **modern** (MCP `2026-07-28` —
