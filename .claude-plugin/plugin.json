@@ -1,7 +1,7 @@
 {
   "name": "ratchet",
   "displayName": "Torque Loop",
-  "version": "0.9.0",
+  "version": "1.0.0",
   "description": "Torque Loop turns ambiguous work into shipped artifacts through target locking, adversarial validation, patching, and state serialization — plus a bounded /ratchet:evolve loop. A stateful advancement engine, not a prompt library. Not affiliated with Anthropic.",
   "author": {
     "name": "Danny Gillespie"
