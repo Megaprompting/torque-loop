@@ -376,5 +376,22 @@ ok('I7 --help through the real binary exits 0 with a clean stdout', () => {
   assert.match(proc.stderr, /Usage: ratchet-mcp/);
 });
 
+ok('I8 the real binary negotiates the legacy revision proposed by Codex 0.142.5', () => {
+  const repo = initRepo('i8-repo');
+  const c = converse(['--root', repo], [{
+    jsonrpc: '2.0', id: 1, method: 'initialize',
+    params: {
+      protocolVersion: '2025-06-18',
+      capabilities: {},
+      clientInfo: { name: 'codex-mcp-client', version: '0.142.5' },
+    },
+  }]);
+  assert.strictEqual(c.status, 0, `clean exit expected, stderr: ${c.stderr}`);
+  assert.strictEqual(c.replies.length, 1, 'one initialize request, one reply');
+  assert.strictEqual(c.replies[0].error, undefined, c.replies[0].error && c.replies[0].error.message);
+  assert.strictEqual(c.replies[0].result.protocolVersion, '2025-06-18',
+    'the supported client proposal must survive the real binary transport');
+});
+
 process.stdout.write(`\n${passed} passed, ${failures.length} failed\n`);
 if (failures.length) process.exit(1);

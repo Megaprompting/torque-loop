@@ -208,10 +208,25 @@ handle is a capability bound to one connection and one filesystem object, and it
 either changes.
 
 Registering with a non-Claude client uses that client's own MCP configuration. For Codex,
-add a stdio server to `~/.codex/config.toml` pointing at `node bin/ratchet-mcp` with a
-`--root`; the `.codex-plugin/` manifest deliberately does **not** declare an MCP server yet,
-because that key is unverified for this manifest format and a wrong one breaks installs
-silently rather than loudly.
+register the server with the exact checkout containing `bin/ratchet-mcp` and the exact
+workspace roots it may open:
+
+```bash
+codex mcp add torque -- node /absolute/path/to/torque-loop/bin/ratchet-mcp \
+  --root /absolute/path/to/allowed/repo
+
+codex mcp get torque --json
+```
+
+Repeat `--root` in the first command to authorize more than one workspace. Codex stores this
+configuration in `~/.codex/config.toml`; its app, CLI, and IDE surfaces share it.
+
+The `.codex-plugin/` manifest deliberately does **not** auto-declare this server. Codex does
+support bundled MCP servers through a root-level `.mcp.json`, but resolves their working
+directory inside the installed plugin. It does not provide a documented per-session workspace
+substitution for the server's arguments. Passing `--root .` there would authorize the plugin
+cache instead of the project; omitting `--root` fails closed. Explicit registration preserves
+the same root boundary as a manual launch.
 
 ### State location
 
