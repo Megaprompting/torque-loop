@@ -118,10 +118,15 @@ function projectSlug(cwd) {
   // Both exist: two records for one project. Merging is not ours to invent and
   // picking one silently loses the other, so name both and stop.
   if (fs.existsSync(normalizedDir)) {
-    throw new Error(
+    const e = new Error(
       `ratchet store conflict — both of these exist for one project:\n  ${legacyDir} (legacy casing)\n  ${normalizedDir} (normalized)\n` +
         'Merge or delete one by hand — refusing to guess which record is the real one.'
     );
+    // Coded, because a caller that must not echo server paths (the MCP boundary)
+    // cannot pass this message through and has nothing else to tell a conflict
+    // apart from "the store would not open" — which sends the operator hunting.
+    e.code = 'ERATCHETSTORECONFLICT';
+    throw e;
   }
   fs.renameSync(legacyDir, normalizedDir);
   process.stderr.write(`[ratchet] migrated store ${legacy} → ${normalized} (Windows path casing normalized).\n`);

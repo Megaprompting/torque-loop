@@ -104,13 +104,42 @@ function globFiles(cwd, glob) {
   return out;
 }
 
+// Containment, not merely resolution. `path.resolve` follows an absolute or `..`
+// surface path straight OUT of the workspace, and the checks below quote matching
+// lines from whatever they open — so a checked-in config could make the scan read
+// a file the caller never had authority over and hand its content back in a check
+// detail. An escaping surface is never opened; the refusal is a named check.
+//
+// A lexically contained NAME can still be a symlink pointing outside, and the read
+// would follow it, so the real target is judged too where the filesystem can
+// answer. What this does not do is survive a swap between the judgment and the
+// read — a pathname API cannot, and the MCP boundary names that same limit.
+function outside(root, target) {
+  const rel = path.relative(path.resolve(root), path.resolve(target));
+  return rel.startsWith('..') || path.isAbsolute(rel);
+}
+
+function escapesRoot(cwd, file) {
+  if (outside(cwd, file)) return true;
+  try {
+    return outside(fs.realpathSync(cwd), fs.realpathSync(file));
+  } catch (_e) {
+    return false; // it is not there to read; the "no matching file" check says so
+  }
+}
+
+// { files, escaped } rather than a bare list: "nothing matched" and "it matched
+// something we refuse to open" are different facts, and the scan states both.
 function resolveSurface(cwd, surface) {
   if (surface.path) {
     const p = path.resolve(cwd, surface.path);
-    return fs.existsSync(p) && fs.statSync(p).isFile() ? [p] : [];
+    if (escapesRoot(cwd, p)) return { files: [], escaped: true };
+    return { files: fs.existsSync(p) && fs.statSync(p).isFile() ? [p] : [], escaped: false };
   }
-  if (surface.glob) return globFiles(cwd, surface.glob);
-  return [];
+  // A glob is walked with readdir from the root and a Dirent reports the link
+  // itself, so neither `..` nor a symlinked directory can carry the walk out.
+  if (surface.glob) return { files: globFiles(cwd, surface.glob), escaped: false };
+  return { files: [], escaped: false };
 }
 
 function runSurfaceChecks(cwd, file, surface, retracted, add) {
@@ -247,12 +276,19 @@ function scan(cwd = process.cwd()) {
   const config = loadConfig(cwd);
   if (config && Array.isArray(config.surfaces)) {
     for (const surface of config.surfaces) {
-      const files = resolveSurface(cwd, surface);
-      if (!files.length) {
-        add(`surface ${surface.path || surface.glob}`, 'warn', 'configured but no matching file found');
+      const label = surface.path || surface.glob;
+      const resolved = resolveSurface(cwd, surface);
+      // Warn, not fail: nothing outside was read, so no stale steering reached
+      // this session. The config is wrong, the record is not.
+      if (resolved.escaped) {
+        add(`surface ${label}`, 'warn', 'surface escapes workspace root — not read');
         continue;
       }
-      for (const file of files) runSurfaceChecks(cwd, file, surface, retracted, add);
+      if (!resolved.files.length) {
+        add(`surface ${label}`, 'warn', 'configured but no matching file found');
+        continue;
+      }
+      for (const file of resolved.files) runSurfaceChecks(cwd, file, surface, retracted, add);
     }
   }
 

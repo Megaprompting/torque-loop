@@ -156,23 +156,69 @@ ok('S1 both protocol eras advertise the fixed tools, resources, and prompts capa
   assert.deepStrictEqual(init.result.capabilities, { tools: {}, resources: {}, prompts: {} });
 });
 
-ok('S2 tools/list exposes only workspace.open with a closed path schema', () => {
+// S2 pinned "only workspace.open" until step 3b, which advertises the three
+// derived read tools. The assertion was not weakened — it was replaced by a
+// stricter one: the exact list, in order, with every descriptor's shape,
+// schemas and hints pinned, so an added, renamed or silently widened tool
+// fails here rather than shipping.
+ok('S2 tools/list advertises exactly four tools, in order, with closed schemas', () => {
   const conn = service([fixture('s2-root')]).createConnection();
   const listed = modern(conn, 'tools/list');
   assert.strictEqual(listed.error, undefined);
-  assert.strictEqual(listed.result.tools.length, 1);
-  const tool = listed.result.tools[0];
-  assert.strictEqual(tool.name, 'workspace.open');
-  assert.deepStrictEqual(tool.inputSchema.required, ['path']);
-  assert.strictEqual(tool.inputSchema.properties.path.type, 'string');
-  assert.strictEqual(tool.inputSchema.additionalProperties, false);
-  assert.strictEqual(tool.annotations.destructiveHint, false);
-  assert.strictEqual(tool.annotations.idempotentHint, true);
-  assert.strictEqual(tool.annotations.openWorldHint, false);
-  assert.strictEqual(tool.annotations.readOnlyHint, false,
+  assert.deepStrictEqual(
+    listed.result.tools.map((tool) => tool.name),
+    ['workspace.open', 'workspace.scan', 'score.confidence', 'score.friction']
+  );
+  for (const tool of listed.result.tools) {
+    assert.deepStrictEqual(
+      Object.keys(tool),
+      ['name', 'title', 'description', 'inputSchema', 'outputSchema', 'annotations'],
+      `${tool.name} carries the whole descriptor shape and nothing else`
+    );
+    assert.strictEqual(tool.inputSchema.additionalProperties, false,
+      `${tool.name} rejects additional input properties`);
+    assert.strictEqual(tool.outputSchema.additionalProperties, false,
+      `${tool.name} pins its public top-level output shape`);
+    assert.strictEqual(tool.annotations.destructiveHint, false);
+    assert.strictEqual(tool.annotations.idempotentHint, true);
+    assert.strictEqual(tool.annotations.openWorldHint, false);
+  }
+
+  const [open, scan, confidence, friction] = listed.result.tools;
+  assert.deepStrictEqual(open.inputSchema.required, ['path']);
+  assert.strictEqual(open.inputSchema.properties.path.type, 'string');
+  assert.strictEqual(open.annotations.readOnlyHint, false,
     'opening may initialize the external Torque state store');
+  for (const derived of [scan, confidence, friction]) {
+    assert.strictEqual(derived.annotations.readOnlyHint, true,
+      `${derived.name} moves nothing, and says so`);
+  }
+  assert.deepStrictEqual(scan.inputSchema, confidence.inputSchema,
+    'both workspace-bound tools take one handle and nothing else');
+  assert.deepStrictEqual(scan.inputSchema.required, ['workspaceHandle']);
+  assert.deepStrictEqual(scan.outputSchema.required, ['ok', 'configured', 'checks']);
+  assert.deepStrictEqual(confidence.outputSchema.required,
+    ['artifact', 'session', 'ledger', 'closure', 'stateRev', 'journal']);
+  assert.deepStrictEqual(friction.inputSchema.required, ['obstacles']);
+  assert.strictEqual(friction.inputSchema.properties.obstacles.items.additionalProperties, false,
+    'an obstacle carries only the fields the domain function reads');
+  assert.strictEqual(
+    Object.prototype.hasOwnProperty.call(friction.inputSchema.properties, 'workspaceHandle'),
+    false, 'the payload-only tool takes no workspace authority');
   assert.strictEqual(listed.result.ttlMs, 300000);
   assert.strictEqual(listed.result.cacheScope, 'public');
+
+  // The whole-object pin. The assertions above give a named reason when one
+  // guarantee breaks; this one catches everything they do not enumerate —
+  // description text, a nested schema type, a new hint — because the fixture
+  // is checked-in bytes, not a reference to the objects the server serves.
+  // Changing a descriptor is allowed; doing it without touching the fixture
+  // is drift, and drift fails here.
+  assert.deepStrictEqual(
+    listed.result.tools,
+    JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures', 'mcp-tools-list.json'), 'utf8')),
+    'tools/list deep-equals the pinned descriptor fixture'
+  );
 });
 
 ok('S3 workspace.open returns an opaque handle, stable identities, stateRev, and resource links', () => {
@@ -435,6 +481,443 @@ ok('S15 workspace.open and resource read survive the newline-delimited stdio wir
   assert.strictEqual(read.result.contents[0].uri, uri);
   assert.strictEqual(JSON.parse(read.result.contents[0].text).rev, 0);
   attached.connection.close();
+});
+
+// ---------------------------------------------------------------------------
+// Step 3b: the derived read tools. Traced by: claude-opus-5
+//
+// Everything below holds one line: a read moves nothing. workspace.open is the
+// one boundary allowed to write, and it initializes BOTH canonical records
+// there — so the byte proof covers every resource and every tool, not just the
+// ones that happened to find their file already on disk.
+// ---------------------------------------------------------------------------
+
+const crypto = require('crypto');
+const RATCHET_BIN = path.join(__dirname, '..', 'bin', 'ratchet');
+
+function fileDigest(file) {
+  try {
+    return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+  } catch (_e) {
+    return 'absent';
+  }
+}
+
+function treeDigest(dir) {
+  const out = [];
+  const walk = (rel) => {
+    let entries;
+    try {
+      entries = fs.readdirSync(path.join(dir, rel), { withFileTypes: true });
+    } catch (_e) {
+      return;
+    }
+    for (const entry of entries.slice().sort((a, b) => (a.name < b.name ? -1 : 1))) {
+      const child = rel ? `${rel}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) {
+        out.push(`d ${child}`);
+        walk(child);
+      } else {
+        out.push(`f ${child} ${fileDigest(path.join(dir, child))}`);
+      }
+    }
+  };
+  walk('');
+  return out.join('\n');
+}
+
+// Scope, named out loud: the canonical store (state + ledger + any residue),
+// the workspace .ratchet directory, the evolution log, and whatever extra file
+// a case names. NOT .git — a read that shells out to git can refresh git's own
+// index stat cache, which is git's bookkeeping and not Torque state.
+function worldSnapshot(repo, extras) {
+  return JSON.stringify({
+    store: treeDigest(state.projectDir(repo)),
+    workspace: treeDigest(path.join(repo, '.ratchet')),
+    log: fileDigest(process.env.RATCHET_EVOLVE_LOG),
+    extras: (extras || []).map(fileDigest),
+  });
+}
+
+// The same domain read the tools perform, reached the way a user reaches it.
+// Equivalence has to be measured against the CLI actually running, not against
+// a second call to the same function the server just called.
+function ratchet(repo, args, env) {
+  const proc = childProcess.spawnSync(process.execPath, [RATCHET_BIN, ...args], {
+    cwd: repo,
+    encoding: 'utf8',
+    env: Object.assign(cleanGitEnv(), env || {}),
+    timeout: 60000,
+    windowsHide: true,
+  });
+  if (proc.error) throw proc.error;
+  return proc;
+}
+
+function callTool(conn, name, args, era) {
+  const call = era === 'legacy' ? legacy : modern;
+  return call(conn, 'tools/call', { name, arguments: args });
+}
+
+const FRICTION_PAYLOAD = [
+  { name: 'lock contention', leverage: 9, certainty: 8, speed: 4, risk: 9, note: 'blocks writes' },
+  { obstacle: 'stale docs', leverage: 3, certainty: 9, timeToUnblock: 9, riskOfIgnoring: 2 },
+];
+
+ok('S16 workspace.open initializes BOTH canonical records before it issues a handle', () => {
+  const repo = initRepo('s16-repo');
+  const store = state.projectDir(repo);
+  assert.strictEqual(fs.existsSync(path.join(store, 'state.json')), false, 'fresh fixture, no state yet');
+  assert.strictEqual(fs.existsSync(path.join(store, 'ledger.json')), false, 'fresh fixture, no ledger yet');
+
+  const conn = service([repo]).createConnection();
+  const opened = payload(openWorkspace(conn, repo));
+  assert.match(opened.workspaceHandle, /^[A-Za-z0-9_-]{43}$/);
+  assert.ok(fs.existsSync(path.join(store, 'state.json')), 'open initializes the state record');
+  assert.ok(fs.existsSync(path.join(store, 'ledger.json')),
+    'open initializes the ledger record too — otherwise the FIRST ledger resource read writes it, ' +
+    'and no read path is pure');
+});
+
+ok('S17 first read of every resource and every derived tool moves zero bytes and zero revisions', () => {
+  const repo = initRepo('s17-repo');
+  // A configured surface joins the snapshot scope: the scan OPENS this file,
+  // and a read that opens a file is exactly the read that could touch it.
+  const surface = path.join(repo, 'NOTES.md');
+  fs.writeFileSync(surface, 'plain surface content\n');
+  fs.mkdirSync(path.join(repo, '.ratchet'), { recursive: true });
+  fs.writeFileSync(path.join(repo, '.ratchet', 'cold-start.json'),
+    JSON.stringify({ surfaces: [{ path: 'NOTES.md' }] }));
+  const conn = service([repo]).createConnection();
+  const opened = payload(openWorkspace(conn, repo));
+  const before = worldSnapshot(repo, [surface]);
+
+  for (const name of ['state', 'ledger', 'receipt']) {
+    const read = modern(conn, 'resources/read', { uri: opened.resources[name] });
+    assert.strictEqual(read.error, undefined, `${name} must read: ${JSON.stringify(read.error)}`);
+    assert.strictEqual(worldSnapshot(repo, [surface]), before, `reading the ${name} resource moved bytes`);
+  }
+
+  const calls = [
+    ['workspace.scan', { workspaceHandle: opened.workspaceHandle }],
+    ['score.confidence', { workspaceHandle: opened.workspaceHandle }],
+    ['score.friction', { obstacles: FRICTION_PAYLOAD }],
+  ];
+  for (const [name, args] of calls) {
+    const result = callTool(conn, name, args);
+    assert.strictEqual(result.error, undefined, `${name} must answer: ${JSON.stringify(result.error)}`);
+    assert.strictEqual(result.result.isError, undefined, `${name}: ${JSON.stringify(result.result)}`);
+    assert.strictEqual(worldSnapshot(repo, [surface]), before, `${name} moved bytes`);
+  }
+
+  const reopened = payload(openWorkspace(conn, repo));
+  assert.strictEqual(reopened.stateRev, opened.stateRev, 'no revision moved either');
+  assert.strictEqual(worldSnapshot(repo, [surface]), before, 're-opening an open workspace moved bytes');
+});
+
+ok('S18 workspace.scan deep-equals ratchet doctor cold-start --json for the same workspace', () => {
+  const repo = initRepo('s18-repo');
+  const conn = service([repo]).createConnection();
+  const opened = payload(openWorkspace(conn, repo));
+  const wire = payload(callTool(conn, 'workspace.scan', { workspaceHandle: opened.workspaceHandle }));
+  const cli = JSON.parse(ratchet(repo, ['doctor', 'cold-start', '--json']).stdout);
+  assert.deepStrictEqual(wire, cli, 'one domain answer, two surfaces');
+  assert.strictEqual(wire.configured, false, 'this fixture declares no project surfaces');
+  assert.ok(wire.checks.length > 0 && wire.checks.every((c) => typeof c.detail === 'string'),
+    'emptiness is rendered, never omitted');
+});
+
+ok('S19 score.confidence deep-equals ratchet score confidence --json once its MCP-only fields are set aside', () => {
+  const repo = initRepo('s19-repo');
+  const conn = service([repo]).createConnection();
+  payload(openWorkspace(conn, repo));
+
+  const snapshot = state.loadState(repo);
+  snapshot.objective = 'prove the layers agree across surfaces';
+  snapshot.nextAction = 'compare the wire to the CLI';
+  snapshot.artifacts = [{ id: 'art-1', title: 'spec', kind: 'spec', status: 'v1', holes: ['one hole'] }];
+  snapshot.defects = [{ id: 'def-1', artifact: 'art-1', severity: 'high', status: 'open', title: 'unproven' }];
+  state.saveState(repo, snapshot);
+  const ledger = state.loadLedger(repo);
+  ledger.features = [{ id: 'feat-1', name: 'derived reads', evidence: 'src/mcp/server.js' }];
+  state.saveLedger(repo, ledger);
+
+  const opened = payload(openWorkspace(conn, repo));
+  const wire = payload(callTool(conn, 'score.confidence', { workspaceHandle: opened.workspaceHandle }));
+  const cli = JSON.parse(ratchet(repo, ['score', 'confidence', '--json']).stdout);
+
+  const domain = { ...wire };
+  delete domain.stateRev;
+  delete domain.journal;
+  assert.deepStrictEqual(domain, cli, 'the derived layers and closure are the CLI answer');
+  assert.strictEqual(wire.stateRev, state.loadState(repo).rev, 'stateRev names the record it scored');
+  assert.strictEqual(wire.stateRev, opened.stateRev, 'and agrees with the handle that was just issued');
+  assert.deepStrictEqual(Object.keys(wire),
+    ['artifact', 'session', 'ledger', 'closure', 'stateRev', 'journal'],
+    'fixed-shape output, same keys every run');
+});
+
+ok('S20 score.confidence loads state exactly once — stateRev comes from the scored snapshot', () => {
+  // A second load for the revision alone would let a write that landed in
+  // between make stateRev describe a record the layers never saw.
+  const repo = initRepo('s20-repo');
+  const conn = service([repo]).createConnection();
+  const opened = payload(openWorkspace(conn, repo));
+  const realLoad = state.loadState;
+  let loads = 0;
+  try {
+    state.loadState = function counted(cwd) {
+      loads++;
+      return realLoad.call(state, cwd);
+    };
+    payload(callTool(conn, 'score.confidence', { workspaceHandle: opened.workspaceHandle }));
+  } finally {
+    state.loadState = realLoad;
+  }
+  assert.strictEqual(loads, 1, `score.confidence read state ${loads} times; the contract is one snapshot`);
+});
+
+ok('S21 journal damage is on the wire, not on stderr where no client reads', () => {
+  const repo = initRepo('s21-repo');
+  const conn = service([repo]).createConnection();
+  const opened = payload(openWorkspace(conn, repo));
+  const realLog = process.env.RATCHET_EVOLVE_LOG;
+  const damaged = path.join(tmp, 's21-damaged.jsonl');
+  const good = (id) => JSON.stringify({ id, target: 'x', verdict: 'ASK', timestamp: '2026-07-30T00:00:00.000Z' });
+  fs.writeFileSync(damaged, [good('evo_1'), '{not json', good('evo_2'), 'truncated {"a":'].join('\n') + '\n');
+  try {
+    process.env.RATCHET_EVOLVE_LOG = damaged;
+    const wire = payload(callTool(conn, 'score.confidence', { workspaceHandle: opened.workspaceHandle }));
+    assert.deepStrictEqual(wire.journal, { counted: 2, malformed: 2 },
+      'two events scored, two unreadable lines excluded — and the caller is told');
+
+    process.env.RATCHET_EVOLVE_LOG = path.join(tmp, 's21-absent.jsonl');
+    const empty = payload(callTool(conn, 'score.confidence', { workspaceHandle: opened.workspaceHandle }));
+    assert.deepStrictEqual(empty.journal, { counted: 0, malformed: 0 },
+      'an absent log is stated as zero, never omitted');
+  } finally {
+    process.env.RATCHET_EVOLVE_LOG = realLog;
+  }
+});
+
+ok('S22 an escaping cold-start surface is refused by name and never opened', () => {
+  const repo = initRepo('s22-repo');
+  const outsideDir = fixture('s22-outside');
+  const absolute = path.join(outsideDir, 'absolute.md');
+  fs.writeFileSync(absolute, 'OUTSIDEPOISON 43 ahead\n');
+  fs.writeFileSync(path.join(path.dirname(repo), 's22-sibling.md'), 'OUTSIDEPOISON 43 ahead\n');
+  fs.mkdirSync(path.join(repo, '.ratchet'), { recursive: true });
+  fs.writeFileSync(path.join(repo, 'inside.md'), 'INSIDEPOISON 43 ahead\n');
+  fs.writeFileSync(path.join(repo, '.ratchet', 'cold-start.json'), JSON.stringify({
+    surfaces: [
+      { path: absolute, checks: ['base-qualified-git'] },
+      { path: '../s22-sibling.md', checks: ['base-qualified-git'] },
+      { path: 'inside.md', checks: ['base-qualified-git'] },
+    ],
+  }));
+
+  const conn = service([repo]).createConnection();
+  const opened = payload(openWorkspace(conn, repo));
+  const seen = [];
+  const realRead = fs.readFileSync;
+  let wire;
+  try {
+    fs.readFileSync = function spy(file, ...rest) {
+      seen.push(String(file));
+      return realRead.call(fs, file, ...rest);
+    };
+    wire = payload(callTool(conn, 'workspace.scan', { workspaceHandle: opened.workspaceHandle }));
+  } finally {
+    fs.readFileSync = realRead;
+  }
+
+  const escaped = wire.checks.filter((c) => c.detail === 'surface escapes workspace root — not read');
+  assert.strictEqual(escaped.length, 2, `both escaping surfaces are named: ${JSON.stringify(wire.checks)}`);
+  assert.ok(!JSON.stringify(wire).includes('OUTSIDEPOISON'),
+    'a file outside the handle\'s root cannot reach the wire through a check detail');
+  assert.ok(!seen.includes(absolute) && !seen.includes(path.join(path.dirname(repo), 's22-sibling.md')),
+    `an escaping surface is never opened: ${seen.join(', ')}`);
+  const inside = wire.checks.find((c) => c.name.includes('inside.md'));
+  assert.strictEqual(inside.level, 'fail', 'a contained surface is still scanned');
+  assert.match(inside.detail, /INSIDEPOISON/, 'so the refusal is containment, not blindness');
+  assert.strictEqual(wire.configured, true);
+});
+
+ok('S23 every handle refusal is one answer, for resources and tools alike', () => {
+  const repo = initRepo('s23-repo');
+  const server = service([repo]);
+  const owner = server.createConnection();
+  const stranger = server.createConnection();
+  const opened = payload(openWorkspace(owner, repo));
+  const foreign = payload(openWorkspace(stranger, repo)).workspaceHandle;
+  const doomed = server.createConnection();
+  const closedHandle = payload(openWorkspace(doomed, repo)).workspaceHandle;
+  doomed.close();
+
+  const refused = [
+    ['missing', {}],
+    ['non-string', { workspaceHandle: 7 }],
+    ['malformed', { workspaceHandle: 'not-a-handle' }],
+    ['fabricated', { workspaceHandle: 'A'.repeat(43) }],
+    ['foreign connection', { workspaceHandle: foreign }],
+    ['closed connection', { workspaceHandle: closedHandle }],
+    ['extra argument', { workspaceHandle: opened.workspaceHandle, path: repo }],
+    ['no arguments at all', undefined],
+  ];
+  for (const [label, args] of refused) {
+    for (const tool of ['workspace.scan', 'score.confidence']) {
+      const response = callTool(owner, tool, args);
+      assert.ok(response.error, `${tool} must refuse a ${label} handle, got ${JSON.stringify(response.result)}`);
+      assert.strictEqual(response.error.code, -32602, `${tool} · ${label}`);
+      assert.strictEqual(response.error.message, 'resource is not available on this connection',
+        `${tool} · ${label} must not be distinguishable from any other refusal`);
+    }
+  }
+  // The same handles through the resource door give the identical answer, which
+  // is the point of one shared resolveHandle.
+  for (const handle of [foreign, closedHandle, 'A'.repeat(43)]) {
+    const read = modern(owner, 'resources/read', { uri: `torque://workspace/${handle}/state` });
+    assert.strictEqual(read.error.code, -32602);
+    assert.strictEqual(read.error.message, 'resource is not available on this connection');
+  }
+  // And the owner's own handle still works, so the refusals above are the check
+  // doing its job rather than the tools being broken.
+  assert.ok(payload(callTool(owner, 'workspace.scan', { workspaceHandle: opened.workspaceHandle })).checks.length);
+});
+
+ok('S24 score.friction ranks its payload, deep-equals the CLI, and touches no workspace', () => {
+  const repo = initRepo('s24-repo');
+  const conn = service([repo]).createConnection();
+  const before = worldSnapshot(repo);
+  const wire = payload(callTool(conn, 'score.friction', { obstacles: FRICTION_PAYLOAD }));
+  const cli = JSON.parse(ratchet(repo, ['score', 'friction', JSON.stringify(FRICTION_PAYLOAD), '--json']).stdout);
+  assert.deepStrictEqual(wire, cli, 'one ranking, two surfaces');
+  assert.strictEqual(wire.winner.name, 'lock contention');
+  assert.strictEqual(wire.obstacles[1].name, 'stale docs', 'the obstacle alias still resolves');
+  assert.strictEqual(wire.obstacles[1].speed, 9, 'timeToUnblock still resolves');
+  assert.strictEqual(wire.obstacles[1].risk, 2, 'riskOfIgnoring still resolves');
+  assert.ok(wire.scope.includes('unlisted'), 'the ranking names what it cannot see');
+  assert.strictEqual(worldSnapshot(repo), before,
+    'a payload-only tool never opened a workspace, so nothing moved');
+  // No handle was ever minted on this connection, and none is needed.
+  assert.strictEqual(worldSnapshot(repo).includes('state.json'), false, 'no store was created either');
+});
+
+ok('S24b decimal factors flow through to a fractional margin, and the schema says number', () => {
+  // Factors are clamped, never rounded, so this valid input MUST produce a
+  // non-integer margin — which is why the advertised schema says number, not
+  // integer. Written red against a descriptor that claimed integer|null.
+  const conn = service([fixture('s24b-root')]).createConnection();
+  const wire = payload(callTool(conn, 'score.friction', {
+    obstacles: [
+      { name: 'a', leverage: 2.5, certainty: 2, speed: 2, risk: 2 },
+      { name: 'b', leverage: 2, certainty: 2, speed: 2, risk: 2 },
+    ],
+  }));
+  assert.strictEqual(wire.winner.name, 'a');
+  assert.strictEqual(wire.margin, 4, '2.5·2·2·2 − 2·2·2·2 = 20 − 16');
+  const half = payload(callTool(conn, 'score.friction', {
+    obstacles: [
+      { name: 'a', leverage: 2.2, certainty: 2, speed: 2, risk: 2 },
+      { name: 'b', leverage: 2, certainty: 2, speed: 2, risk: 2 },
+    ],
+  }));
+  assert.ok(!Number.isInteger(half.margin) && half.margin > 0,
+    `a fractional margin is a valid result (got ${half.margin})`);
+  const listed = modern(conn, 'tools/list');
+  const friction = listed.result.tools.find((tool) => tool.name === 'score.friction');
+  assert.deepStrictEqual(friction.outputSchema.properties.margin.type, ['number', 'null'],
+    'the advertised type admits the results the domain actually returns');
+});
+
+ok('S25 malformed score.friction arguments are refused at the boundary, not normalized', () => {
+  const conn = service([fixture('s25-root')]).createConnection();
+  const bad = [
+    undefined,
+    {},
+    { obstacles: 'not an array' },
+    { obstacles: [null] },
+    { obstacles: ['a string'] },
+    { obstacles: [{ name: 'x', leverage: 5, unknownField: 1 }] },
+    { obstacles: [], extra: true },
+  ];
+  for (const args of bad) {
+    const response = callTool(conn, 'score.friction', args);
+    assert.ok(response.error, `refused: ${JSON.stringify(args)}`);
+    assert.strictEqual(response.error.code, -32602);
+    assert.match(response.error.message, /^score\.friction takes one argument/);
+  }
+  // A factor outside 1..10 is domain normalization, not a boundary error.
+  const clamped = payload(callTool(conn, 'score.friction', {
+    obstacles: [{ name: 'x', leverage: 99, certainty: 0, speed: 5, risk: 5 }],
+  }));
+  assert.strictEqual(clamped.obstacles[0].leverage, 10);
+  assert.strictEqual(clamped.obstacles[0].certainty, 1);
+});
+
+ok('S26 every advertised tool is dispatchable, and only advertised tools are', () => {
+  const repo = initRepo('s26-repo');
+  const conn = service([repo]).createConnection();
+  const advertised = modern(conn, 'tools/list').result.tools.map((tool) => tool.name);
+  for (const name of advertised) {
+    const response = callTool(conn, name, {});
+    const message = (response.error && response.error.message) || '';
+    assert.ok(!/^unknown tool/.test(message),
+      `${name} is advertised but has no handler behind it`);
+  }
+  for (const name of ['workspace.delete', 'score.aperture', 'status', 'defect.list', 'workspace.scan ']) {
+    const response = callTool(conn, name, {});
+    assert.strictEqual(response.error.code, -32602, `${name} is not a tool`);
+    assert.match(response.error.message, /^unknown tool: /);
+  }
+});
+
+ok('S27 the legacy era serves the derived tools with legacy wire shape', () => {
+  const repo = initRepo('s27-repo');
+  const conn = service([repo]).createConnection();
+  initialize(conn);
+  const listed = legacy(conn, 'tools/list');
+  assert.deepStrictEqual(
+    listed.result.tools.map((tool) => tool.name),
+    ['workspace.open', 'workspace.scan', 'score.confidence', 'score.friction']
+  );
+  assert.strictEqual(listed.result.ttlMs, undefined, 'legacy carries no modern cache metadata');
+
+  const opened = payload(openWorkspace(conn, repo, 'legacy'));
+  const before = worldSnapshot(repo);
+  const scan = payload(callTool(conn, 'workspace.scan', { workspaceHandle: opened.workspaceHandle }, 'legacy'));
+  const confidence = payload(callTool(conn, 'score.confidence', { workspaceHandle: opened.workspaceHandle }, 'legacy'));
+  const friction = payload(callTool(conn, 'score.friction', { obstacles: FRICTION_PAYLOAD }, 'legacy'));
+  assert.ok(Array.isArray(scan.checks) && scan.checks.length);
+  assert.strictEqual(confidence.stateRev, opened.stateRev);
+  assert.strictEqual(friction.winner.name, 'lock contention');
+  assert.strictEqual(worldSnapshot(repo), before, 'legacy reads move nothing either');
+});
+
+ok('S28 a store conflict is a named, actionable refusal that carries no server path', () => {
+  const message = mcp.safeOpenError(Object.assign(new Error('two records'), { code: 'ERATCHETSTORECONFLICT' }));
+  assert.strictEqual(message,
+    'workspace store has conflicting project records — operator must merge or delete one');
+  assert.notStrictEqual(message, mcp.safeOpenError(new Error('anything else')),
+    'the conflict no longer collapses into the generic open failure');
+  assert.ok(!/[\\/]/.test(message), 'and it names no path');
+
+  if (process.platform !== 'win32') {
+    process.stdout.write('        (skipped the end-to-end collision: slug casing conflicts are win32-only)\n');
+    return;
+  }
+  // The real thing: two store records for one project, reached through the tool.
+  const repo = initRepo('S28-Repo-MixedCase');
+  const projects = path.join(process.env.RATCHET_DATA_DIR, 'projects');
+  for (const slug of [state.legacySlugFor(repo), state.normalizedSlugFor(repo)]) {
+    fs.mkdirSync(path.join(projects, slug), { recursive: true });
+  }
+  const conn = service([repo]).createConnection();
+  const response = openWorkspace(conn, repo);
+  assert.strictEqual(response.result.isError, true, 'a conflicted store issues no handle');
+  assert.strictEqual(response.result.structuredContent, undefined);
+  assert.strictEqual(response.result.content[0].text,
+    'workspace store has conflicting project records — operator must merge or delete one');
 });
 
 fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });

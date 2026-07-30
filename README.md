@@ -283,12 +283,22 @@ TARGET · DELTA · PROOF · VERDICT · RISK · AUTHORITY · STATE · NEXT
 Claude Code plugin registers it automatically; Codex and other clients register it explicitly.
 
 **A read is authority you already hold, never a path you asked for.** The surface is
-deliberately small: today it is **one tool and three read-only resources**. `workspace.open`
-is the only call that accepts a pathname — it takes a path inside a configured root and
-returns an opaque workspace handle, the repository and worktree identities, the current
-`stateRev`, and read-only resource links. Every later read names that handle in a URI
-(`torque://workspace/{handle}/{state|ledger|receipt}`) rather than re-supplying a path, so the
-server never re-interprets client input:
+deliberately small: today it is **four tools and three read-only resources**. `workspace.open`
+is the only call that accepts a pathname — it takes a path inside a configured root,
+initializes both canonical records, and returns an opaque workspace handle, the repository
+and worktree identities, the current `stateRev`, and read-only resource links. Every later
+read names that handle in a URI (`torque://workspace/{handle}/{state|ledger|receipt}`) rather
+than re-supplying a path, so the server never re-interprets client input:
+
+| Tool | What it returns |
+| --- | --- |
+| `workspace.open` | The handle, the identities, `stateRev`, and the three resource links. The only call that takes a path. |
+| `workspace.scan` | The cold-start poison scan for an opened workspace — the same answer as `ratchet doctor cold-start --json`. |
+| `score.confidence` | The three scoped confidence layers plus workflow closure, with the `stateRev` they were computed from and the journal health (`counted` / `malformed`) behind every count. |
+| `score.friction` | A ranking of the obstacles you supply. No handle, no workspace, no ambient read. |
+
+The three derived tools are marked `readOnlyHint` and prove it: after `workspace.open`, no
+read — resource or tool — moves a byte or a revision.
 
 | Guarantee | What it means |
 | --- | --- |

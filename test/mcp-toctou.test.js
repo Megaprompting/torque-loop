@@ -408,5 +408,32 @@ ok('R2 resources/read is refused after the opened root is replaced', () => {
   assert.strictEqual(read.error.code, -32602, 'refused as an invalid resource, revealing nothing further');
 });
 
+ok('R3 the derived read tools refuse stale authority exactly as the resources do', () => {
+  // Step 3b routes tools and resources through ONE resolveHandle, so a handle
+  // whose object was replaced has to die on both doors at once. A tool that
+  // kept its own lookup would happily scan the impostor directory.
+  // Traced by: claude-opus-5
+  const w = repoWorld('r3');
+  const opened = openWorkspace(w.conn, w.root);
+  assert.ok(opened.result && !opened.result.isError, 'open must succeed');
+  const workspaceHandle = opened.result.structuredContent.workspaceHandle;
+  const uri = opened.result.structuredContent.resources.state;
+
+  const before = modern(w.conn, 'tools/call', { name: 'workspace.scan', arguments: { workspaceHandle } });
+  assert.strictEqual(before.error, undefined, 'the tool works while the authority is live');
+
+  swapDirectory(w.root, (replacement) => {
+    git(replacement, ['init', '--quiet']);
+  });
+
+  const read = modern(w.conn, 'resources/read', { uri });
+  for (const name of ['workspace.scan', 'score.confidence']) {
+    const response = modern(w.conn, 'tools/call', { name, arguments: { workspaceHandle } });
+    assert.ok(response.error, `${name} through stale authority must be refused, got ${JSON.stringify(response.result)}`);
+    assert.strictEqual(response.error.code, read.error.code, `${name} refuses with the resource's code`);
+    assert.strictEqual(response.error.message, read.error.message, `${name} refuses with the resource's message`);
+  }
+});
+
 process.stdout.write(`\n${passed} passed, ${failures.length} failed\n`);
 if (failures.length) process.exit(1);

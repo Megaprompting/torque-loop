@@ -1,0 +1,308 @@
+[
+  {
+    "name": "workspace.open",
+    "title": "Open Torque workspace",
+    "description": "Open an allowed Git worktree and return an opaque workspace handle plus read-only Torque resource links.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "Fully qualified path to a directory inside a configured workspace root."
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "additionalProperties": false
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "workspaceHandle": {
+          "type": "string"
+        },
+        "repositoryId": {
+          "type": "string"
+        },
+        "worktreeId": {
+          "type": "string"
+        },
+        "stateRev": {
+          "type": "integer"
+        },
+        "resources": {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string"
+            },
+            "ledger": {
+              "type": "string"
+            },
+            "receipt": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "ledger",
+            "receipt"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "workspaceHandle",
+        "repositoryId",
+        "worktreeId",
+        "stateRev",
+        "resources"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "workspace.scan",
+    "title": "Scan an opened workspace for cold-start poison",
+    "description": "Run the Torque cold-start poison scan over an opened workspace: does the recorded state, or an opt-in project surface, steer the next session into the wrong world?",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workspaceHandle": {
+          "type": "string",
+          "description": "The opaque handle workspace.open minted on this connection."
+        }
+      },
+      "required": [
+        "workspaceHandle"
+      ],
+      "additionalProperties": false
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "configured": {
+          "type": "boolean"
+        },
+        "checks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "level": {
+                "type": "string",
+                "enum": [
+                  "ok",
+                  "warn",
+                  "fail"
+                ]
+              },
+              "detail": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "name",
+              "level",
+              "detail"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": [
+        "ok",
+        "configured",
+        "checks"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "score.confidence",
+    "title": "Score confidence for an opened workspace",
+    "description": "Derive the three independently scoped confidence layers (artifact, session, ledger) and the workflow closure verdict for an opened workspace, with the state revision and journal health they were computed from.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workspaceHandle": {
+          "type": "string",
+          "description": "The opaque handle workspace.open minted on this connection."
+        }
+      },
+      "required": [
+        "workspaceHandle"
+      ],
+      "additionalProperties": false
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "artifact": {
+          "type": "object"
+        },
+        "session": {
+          "type": "object"
+        },
+        "ledger": {
+          "type": "object"
+        },
+        "closure": {
+          "type": "object"
+        },
+        "stateRev": {
+          "type": "integer"
+        },
+        "journal": {
+          "type": "object",
+          "properties": {
+            "counted": {
+              "type": "integer"
+            },
+            "malformed": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "counted",
+            "malformed"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "artifact",
+        "session",
+        "ledger",
+        "closure",
+        "stateRev",
+        "journal"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "score.friction",
+    "title": "Rank obstacles by friction priority",
+    "description": "Rank a supplied set of obstacles by Leverage x Certainty x Speed-to-unblock x Risk-of-ignoring and name the winner. Operates only on its payload: no workspace, no handle, no ambient read.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "obstacles": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "obstacle": {
+                "type": "string",
+                "description": "Alias for name."
+              },
+              "leverage": {
+                "type": "number"
+              },
+              "certainty": {
+                "type": "number"
+              },
+              "speed": {
+                "type": "number"
+              },
+              "timeToUnblock": {
+                "type": "number",
+                "description": "Alias for speed."
+              },
+              "risk": {
+                "type": "number"
+              },
+              "riskOfIgnoring": {
+                "type": "number",
+                "description": "Alias for risk."
+              },
+              "note": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": [
+        "obstacles"
+      ],
+      "additionalProperties": false
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "obstacles": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "winner": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "runnerUp": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "margin": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "scope": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "obstacles",
+        "winner",
+        "runnerUp",
+        "margin",
+        "scope"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  }
+]
