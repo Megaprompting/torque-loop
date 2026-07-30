@@ -175,6 +175,44 @@ ratchet init
 ratchet status
 ```
 
+### F. The MCP server (`ratchet-mcp`)
+
+`bin/ratchet-mcp` serves Torque state to any MCP client over stdio. Installing the Claude
+Code plugin registers it automatically — `.claude-plugin/plugin.json` launches it with the
+project directory as its single workspace root, and its tools appear under `torque`.
+
+To run it by hand, or to register it with another client:
+
+```bash
+# stdin/stdout carry newline-delimited JSON-RPC; diagnostics go to stderr
+node bin/ratchet-mcp --root /absolute/path/to/repo
+
+# repeatable, for more than one allowed workspace
+node bin/ratchet-mcp --root /srv/work/alpha --root /srv/work/beta
+
+# or by environment, used only when no --root is passed
+RATCHET_MCP_ROOTS="/srv/work/alpha:/srv/work/beta" node bin/ratchet-mcp
+```
+
+**Roots are never inferred.** With no `--root` and no `RATCHET_MCP_ROOTS`, the server
+refuses to start rather than falling back to its working directory — which is whatever the
+client happened to spawn it in, and would widen the allowlist by accident on every launch.
+An unknown argument is refused for the same reason: a `--roots` typo must not quietly become
+an empty allowlist.
+
+What it exposes today: one tool, `workspace.open`, which takes a path inside a configured
+root and returns an opaque workspace handle, the repository and worktree identities, the
+current `stateRev`, and read-only resource links. Reads are addressed by handle
+(`torque://workspace/{handle}/{state|ledger|receipt}`), never by re-supplying a path — a
+handle is a capability bound to one connection and one filesystem object, and it dies when
+either changes.
+
+Registering with a non-Claude client uses that client's own MCP configuration. For Codex,
+add a stdio server to `~/.codex/config.toml` pointing at `node bin/ratchet-mcp` with a
+`--root`; the `.codex-plugin/` manifest deliberately does **not** declare an MCP server yet,
+because that key is unverified for this manifest format and a wrong one breaks installs
+silently rather than loudly.
+
 ### State location
 
 State survives plugin updates. It is written to, in order of preference:
@@ -372,6 +410,7 @@ agents/*.md         →  ratchet-builder · ratchet-auditor · ratchet-scribe
 hooks/hooks.json    →  Claude-only session-start init · post-edit tracking · stop reminder
 bin/ratchet         →  the state CLI (PATH in Claude, global or plugin-root path in Codex)
 bin/ratchet-evolve  →  the evolution-loop helper CLI (snapshot · score · verify · log)
+bin/ratchet-mcp     →  the MCP server over stdio (handle-scoped reads for any MCP client)
 src/*.js            →  state, scoring, ledger, artifact indexing, snapshots, rendering
 src/evolve/*.js     →  snapshot · pressure · mutation scoring · verify runner · journal
 templates/*         →  copy-paste shapes for decision / artifact / defect records

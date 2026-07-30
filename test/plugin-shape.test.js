@@ -71,8 +71,39 @@ ok('Codex marketplace installs this repo as a local plugin source', () => {
 ok('CLI VERSION constants match package.json', () => {
   const cli = require('../src/cli');
   const evolve = require('../src/evolve/index');
+  const mcpMain = require('../src/mcp/main');
   assert.strictEqual(cli.VERSION, pkg.version, 'ratchet CLI version matches package.json');
   assert.strictEqual(evolve.VERSION, pkg.version, 'ratchet-evolve CLI version matches package.json');
+  assert.strictEqual(mcpMain.VERSION, pkg.version, 'ratchet-mcp version matches package.json');
+});
+
+ok('the declared MCP server launches a bin that exists, through node', () => {
+  // A plugin manifest is the one surface no test in this repo can observe at
+  // runtime: it is read by the host at INSTALL time, so a renamed binary or a
+  // path that only works on POSIX fails in the user's install and nowhere here.
+  const declared = claudePlugin.mcpServers;
+  assert.ok(declared && typeof declared === 'object', 'plugin.json declares mcpServers');
+  const names = Object.keys(declared);
+  assert.ok(names.length >= 1, 'at least one MCP server is declared');
+  for (const name of names) {
+    const server = declared[name];
+    // `command` must be the interpreter, not the script: bin/ratchet-mcp has no
+    // extension and no exec bit on Windows, so naming it as the command would
+    // install fine and fail to launch on half the platforms.
+    assert.strictEqual(server.command, 'node', `mcp server ${name} launches via node`);
+    const args = server.args || [];
+    const script = args.find((a) => typeof a === 'string' && a.includes('${CLAUDE_PLUGIN_ROOT}'));
+    assert.ok(script, `mcp server ${name} locates its script from \${CLAUDE_PLUGIN_ROOT}`);
+    const rel = script.replace('${CLAUDE_PLUGIN_ROOT}/', '');
+    assert.ok(exists(rel), `mcp server ${name} points at a real file: ${rel}`);
+    assert.ok(
+      Object.values(pkg.bin || {}).includes(rel),
+      `${rel} is a declared bin target, so packaging keeps it`
+    );
+    // Roots are never inferred (see src/mcp/main.js): a manifest that forgot to
+    // pass one would install a server that refuses to start.
+    assert.ok(args.includes('--root'), `mcp server ${name} configures a workspace root`);
+  }
 });
 
 ok('hooks/hooks.json exists and parses', () => {

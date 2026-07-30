@@ -16,5 +16,15 @@
     "state",
     "qa",
     "decision"
-  ]
+  ],
+  "mcpServers": {
+    "torque": {
+      "command": "node",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/bin/ratchet-mcp",
+        "--root",
+        "${CLAUDE_PROJECT_DIR}"
+      ]
+    }
+  }
 }

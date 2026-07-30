@@ -9,6 +9,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`bin/ratchet-mcp` + `src/mcp/main.js` — the MCP server is launchable, and registered
+  with Claude Code** (Torque MCP: the public surface). Everything the protocol needed
+  already existed; what was missing was a way to start it. Two decisions carry the weight,
+  both CLI-enforced with tests proving the refusal path:
+  - **stdout belongs to the protocol.** Usage, version, the startup banner, and every
+    configuration refusal go to stderr. A diagnostic on stdout is not a log line, it is a
+    corrupt frame. Falsifiers assert stdout is empty on every non-serving path and that
+    every stdout line from the spawned binary parses as JSON.
+  - **Roots are never inferred.** With no `--root` and no `RATCHET_MCP_ROOTS`, the server
+    exits 2 instead of falling back to its working directory — which is whatever the client
+    spawned it in, and would widen the 2.1–2.5 allowlist by accident on every launch. An
+    unknown argument is refused for the same reason: a `--roots` typo must not quietly
+    become an empty allowlist. `--root` is repeatable, and a dedicated parser exists
+    because the one in `src/cli.js` stores flags in an object where a second `--root` would
+    silently *narrow* the allowlist. Flags win outright over the environment rather than
+    merging, so an inherited variable cannot add authority to an explicit launch.
+  - Root validation fails at configuration time, not on first call: a missing, relative, or
+    non-directory root is reported with its reason and exits 2.
+- **`.claude-plugin/plugin.json` declares the server**, launched as
+  `node ${CLAUDE_PLUGIN_ROOT}/bin/ratchet-mcp --root ${CLAUDE_PROJECT_DIR}`, so installing
+  the plugin registers it with the opened project as its single root. Tools appear under
+  `torque`, matching the `torque://` resource scheme and the `torque-mcp` server identity.
+  `node` is the command and the script is an argument on purpose — `bin/ratchet-mcp` has no
+  extension and no exec bit on Windows, so naming it as the command would install cleanly
+  and fail to launch on half the platforms.
+- **`test/mcp-entry.test.js` — 19 cases**, wired into `npm test`. Twelve cover the
+  configuration surface in-process; seven **spawn the real binary and talk to it over real
+  OS pipes**, which is the first thing in this repo to exercise node startup, argv, the
+  shebang wrapper, and process exit together. One of those runs a real *client process*
+  driving the real server process, because a handle is connection-scoped and open-then-read
+  cannot be expressed as a fixed input script.
+- **`test/plugin-shape.test.js` — two new drift guards.** `ratchet-mcp`'s version joins the
+  aligned-version assertion, and the declared MCP server is now checked to launch through
+  `node`, locate its script from `${CLAUDE_PLUGIN_ROOT}`, point at a file that exists, be a
+  declared `bin` target so packaging keeps it, and pass a `--root`. A plugin manifest is
+  read by the host at install time, so a renamed binary would otherwise fail in the user's
+  install and nowhere in CI. Verified by breaking the manifest and watching it fail.
+- **Codex MCP registration is documented, not declared.** `.codex-plugin/plugin.json` gets
+  no `mcpServers` key: that key is unverified for this manifest format, and a wrong one
+  breaks installs silently rather than loudly (the precedent is the default-paths breakage).
+  The README documents the `~/.codex/config.toml` route instead. **Open loop, owner Danny:**
+  confirm the Codex plugin-manifest MCP schema, then declare it.
+- **Not yet done, and not claimed:** a real third-party MCP client has still never connected
+  to this server. The interop cases prove the transport, the framing, and the process
+  contract against a client we wrote. **Open loop, owner Danny:** run it against an actual
+  2026-07-28 client.
+
 - **`src/mcp/handles.js` — verify-on-use: a handle names the object it was granted
   over, not whatever later answers to that name** (Torque MCP build-order step 2.5,
   CLI-enforced at the registry boundary). Steps 2.1–2.4 established authority at grant

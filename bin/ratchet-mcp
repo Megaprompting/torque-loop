@@ -1,0 +1,13 @@
+#!/usr/bin/env node
+'use strict';
+
+// Torque MCP server over stdio. Launched by an MCP client, not by a human at a
+// prompt — so the failure report goes to stderr and never to stdout, which
+// carries the protocol. All real logic lives in ../src so it stays testable.
+
+try {
+  require('../src/mcp/main').run(process.argv);
+} catch (e) {
+  process.stderr.write(`ratchet-mcp: ${e && e.message ? e.message : e}\n`);
+  process.exitCode = 1;
+}
