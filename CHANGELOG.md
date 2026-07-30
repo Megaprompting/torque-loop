@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-07-30 — Boundary Gate
+
+0.2 gated proof; 0.3 the seam; 0.6 the fog; 0.7 the probe; 0.8 closure; 0.9 the write.
+Every one of those governed what the loop may *keep* — and every one quietly assumed the
+record was only ever read from inside the process that held it. 1.0 opens the record to
+anything that speaks MCP, and that changes the question from *what may be kept* to *who may
+reach in*. A pathname cannot answer it: the filesystem decides what a path means, a symlink
+re-points a component, `..` means the parent of where you actually arrived, and the object a
+name referred to can be exchanged between the check and the read. So nothing crosses as a
+name. A client names a path exactly once, to `workspace.open`, and gets back a capability
+bound to one connection and one filesystem object — re-verified on every use, refused the
+moment something else answers to that name. 1.0 gates the boundary:
+**no handle → no read.**
+
+The surface it opens is deliberately narrow: one tool, three read-only resources, and two
+real clients proven against it — Codex 0.142.5 on legacy `2025-06-18`, Claude Code on modern
+`2026-07-28`. What it does not yet do is write. Four limits are named rather than implied:
+verify-on-use narrows the validation-to-read race but does not close it (Node exposes no
+`openat`, and inode reuse can alias a deleted object); Torque state is keyed by a slug of the
+canonical root pathname, so two repositories occupying one path over time share one record;
+Codex registration stays explicit because a bundled config has nothing correct to put in it;
+and `Connected` proves a handshake, not which era a given client negotiated.
+
 ### Changed
 
 - **README restructured so value precedes setup, and the MCP server is no longer invisible.**
@@ -1297,7 +1320,8 @@ Initial public release.
 - Single-plugin marketplace manifest so the repo installs directly as a Claude Code plugin.
 - Zero-dependency smoke test suites for the state engine and the evolution helpers.
 
-[Unreleased]: https://github.com/Megaprompting/torque-loop/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/Megaprompting/torque-loop/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/Megaprompting/torque-loop/compare/v0.9.0...v1.0.0
 [0.9.0]: https://github.com/Megaprompting/torque-loop/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/Megaprompting/torque-loop/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/Megaprompting/torque-loop/compare/v0.6.0...v0.7.0
