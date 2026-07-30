@@ -73,14 +73,37 @@ function refuses(fn, code, why) {
   return err;
 }
 
-// Replace a directory with a different directory carrying the same name. Not a
-// symlink: this is the plain rename swap, which needs no special privilege and
-// therefore works identically on Windows CI.
+function objectKey(target) {
+  const stat = fs.statSync(target, { bigint: true });
+  return `${stat.dev}:${stat.ino}`;
+}
+
+function proveDistinctObjects(original, replacement) {
+  assert.notStrictEqual(
+    objectKey(original),
+    objectKey(replacement),
+    'the adversarial fixture must substitute a distinct live object, not rely on inode reuse'
+  );
+}
+
+// Build the substitute while the original is still live, prove that the two
+// objects have different identities, then exchange their names. Building after
+// deletion lets Linux immediately recycle the freed inode and accidentally
+// exercises the explicitly parked inode-reuse limit instead of replacement.
 function swapDirectory(target, build) {
   const replacement = target + '.replacement';
   fs.mkdirSync(replacement, { recursive: true });
   if (build) build(replacement);
+  proveDistinctObjects(target, replacement);
   fs.rmSync(target, { recursive: true, force: true });
+  fs.renameSync(replacement, target);
+}
+
+function swapFile(target, contents) {
+  const replacement = target + '.replacement';
+  fs.writeFileSync(replacement, contents, 'utf8');
+  proveDistinctObjects(target, replacement);
+  fs.rmSync(target);
   fs.renameSync(replacement, target);
 }
 
@@ -98,14 +121,13 @@ ok('T1 a directory handle whose directory is replaced at the same path is refuse
     'a different directory now answers to the granted name');
 });
 
-ok('T2 a file handle whose file is deleted and recreated is refused on use', () => {
+ok('T2 a file handle whose file is replaced at the same path is refused on use', () => {
   const w = world('t2');
   const target = path.join(w.root, 'file.txt');
   const token = w.session.grant({ path: target, kind: 'file', operations: ['read'] });
   assert.ok(w.session.use(token, 'read'));
 
-  fs.rmSync(target);
-  fs.writeFileSync(target, 'attacker', 'utf8');
+  swapFile(target, 'attacker');
 
   refuses(() => w.session.use(token, 'read'), 'ERATCHETHANDLESTALE',
     'the name survived but the object behind it did not');
@@ -169,8 +191,7 @@ ok('T7 a file replaced by a directory at the same name is refused', () => {
   const target = path.join(w.root, 'file.txt');
   const token = w.session.grant({ path: target, kind: 'file', operations: ['read'] });
 
-  fs.rmSync(target);
-  fs.mkdirSync(target);
+  swapDirectory(target);
 
   refuses(() => w.session.use(token, 'read'), 'ERATCHETHANDLESTALE',
     'the kind established at grant time no longer describes what is there');
@@ -361,9 +382,9 @@ ok('R1 a root replaced by a different repository does not keep handing back the 
   // A different repository takes over the same pathname. The cached record is
   // keyed by that pathname, so without a freshness check the server hands back
   // the handle it minted over the directory that is no longer there.
-  fs.rmSync(w.root, { recursive: true, force: true });
-  fs.mkdirSync(w.root, { recursive: true });
-  git(w.root, ['init', '--quiet']);
+  swapDirectory(w.root, (replacement) => {
+    git(replacement, ['init', '--quiet']);
+  });
 
   const second = openWorkspace(w.conn, w.root);
   assert.ok(second.result && !second.result.isError,
@@ -378,9 +399,9 @@ ok('R2 resources/read is refused after the opened root is replaced', () => {
   assert.ok(opened.result && !opened.result.isError, 'open must succeed');
   const uri = opened.result.structuredContent.resources.state;
 
-  fs.rmSync(w.root, { recursive: true, force: true });
-  fs.mkdirSync(w.root, { recursive: true });
-  git(w.root, ['init', '--quiet']);
+  swapDirectory(w.root, (replacement) => {
+    git(replacement, ['init', '--quiet']);
+  });
 
   const read = modern(w.conn, 'resources/read', { uri });
   assert.ok(read.error, `a read through stale authority must be refused, got ${JSON.stringify(read.result)}`);
