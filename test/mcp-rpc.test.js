@@ -38,6 +38,7 @@ function ok(name, fn) {
 const META = 'io.modelcontextprotocol/';
 const MODERN = '2026-07-28';
 const LEGACY = '2025-11-25';
+const CODEX_LEGACY = '2025-06-18';
 
 function kernel(extraMethods) {
   return rpc.createKernel({
@@ -89,7 +90,7 @@ ok('server/discover advertises versions, capabilities, identity — and pins mod
   const conn = kernel().createConnection();
   const res = conn.handleMessage({ jsonrpc: '2.0', id: 1, method: 'server/discover' });
   assert.strictEqual(res.error, undefined, res.error && res.error.message);
-  assert.deepStrictEqual(res.result.protocolVersions, [MODERN, LEGACY]);
+  assert.deepStrictEqual(res.result.protocolVersions, [MODERN, LEGACY, CODEX_LEGACY]);
   assert.deepStrictEqual(res.result.serverInfo, { name: 'torque-mcp-test', version: '0.0.0' });
   assert.ok(res.result.capabilities, 'capabilities must be advertised');
   assert.strictEqual(res.result.resultType, 'complete');
@@ -155,6 +156,12 @@ ok('modern is stateless: EVERY request re-proves its version, not just the first
 
 // --- legacy era: initialize -------------------------------------------------
 
+ok('the legacy compatibility set is exact, ordered newest-first, and immutable', () => {
+  assert.strictEqual(rpc.LEGACY_CODEX_VERSION, CODEX_LEGACY);
+  assert.deepStrictEqual(rpc.LEGACY_VERSIONS, [LEGACY, CODEX_LEGACY]);
+  assert.ok(Object.isFrozen(rpc.LEGACY_VERSIONS), 'callers cannot widen compatibility at runtime');
+});
+
 ok('initialize answers the legacy handshake shape and pins legacy', () => {
   const conn = kernel().createConnection();
   const res = conn.handleMessage({
@@ -165,6 +172,22 @@ ok('initialize answers the legacy handshake shape and pins legacy', () => {
   assert.deepStrictEqual(res.result.serverInfo, { name: 'torque-mcp-test', version: '0.0.0' });
   assert.ok(res.result.capabilities);
   assert.strictEqual(res.result.resultType, undefined, 'legacy results predate resultType — the kernel must not leak modern fields');
+  assert.strictEqual(conn.era(), 'legacy');
+});
+
+ok('initialize negotiates the legacy revision proposed by Codex 0.142.5', () => {
+  const conn = kernel().createConnection();
+  const res = conn.handleMessage({
+    jsonrpc: '2.0', id: 1, method: 'initialize',
+    params: {
+      protocolVersion: CODEX_LEGACY,
+      capabilities: {},
+      clientInfo: { name: 'codex-mcp-client', version: '0.142.5' },
+    },
+  });
+  assert.strictEqual(res.error, undefined, res.error && res.error.message);
+  assert.strictEqual(res.result.protocolVersion, CODEX_LEGACY,
+    'a supported client proposal must be echoed instead of forcing a newer revision');
   assert.strictEqual(conn.era(), 'legacy');
 });
 

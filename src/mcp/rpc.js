@@ -5,18 +5,23 @@
 //
 // Era pinning is the one invariant this module exists to enforce: a connection
 // speaks exactly one protocol era. `server/discover` (protocol 2026-07-28,
-// stateless, _meta-carried version) pins modern; `initialize` (2025-11-25
-// handshake) pins legacy; after the pin, the other era's surface is a named
-// refusal — never a silent downgrade, never a mixed connection. Mixing is how a
-// stateless request inherits handshake state it never negotiated.
+// stateless, _meta-carried version) pins modern; `initialize` (a named
+// request/response revision) pins legacy; after the pin, the other era's
+// surface is a named refusal — never a silent downgrade, never a mixed
+// connection. Mixing is how a stateless request inherits handshake state it
+// never negotiated.
 
 const JSONRPC = '2.0';
 const META = 'io.modelcontextprotocol/';
 
-// One modern version, one legacy version — the boundary is named, not open-ended.
-// Widening either list is a deliberate compatibility decision, not a default.
+// One modern version and a closed legacy compatibility set — the boundary is
+// named, not open-ended. Widening either list is a deliberate compatibility
+// decision, not a default. 2025-06-18 is the revision proposed by Codex 0.142.5;
+// the wire shapes Torque uses are shared by both named legacy revisions.
 const MODERN_VERSION = '2026-07-28';
 const LEGACY_VERSION = '2025-11-25';
+const LEGACY_CODEX_VERSION = '2025-06-18';
+const LEGACY_VERSIONS = Object.freeze([LEGACY_VERSION, LEGACY_CODEX_VERSION]);
 
 // JSON-RPC standard codes.
 const ERR_PARSE = -32700;
@@ -62,7 +67,8 @@ function createKernel({ serverInfo, capabilities, methods }) {
         throw rpcError(
           ERR_UNSUPPORTED_PROTOCOL_VERSION,
           `request carried ${said}; this server speaks ${MODERN_VERSION} ` +
-            `(_meta ${META}protocolVersion on every request) or the legacy ${LEGACY_VERSION} initialize handshake`
+            `(_meta ${META}protocolVersion on every request) or a legacy initialize handshake ` +
+            `(${LEGACY_VERSIONS.join(', ')})`
         );
       }
       const clientCaps = meta[META + 'clientCapabilities'];
@@ -119,7 +125,9 @@ function createKernel({ serverInfo, capabilities, methods }) {
         }
         era = 'legacy'; // pinned only after the handshake proves its shape
         return {
-          protocolVersion: params.protocolVersion === LEGACY_VERSION ? params.protocolVersion : LEGACY_VERSION,
+          protocolVersion: LEGACY_VERSIONS.includes(params.protocolVersion)
+            ? params.protocolVersion
+            : LEGACY_VERSION,
           capabilities: caps,
           serverInfo: info,
         };
@@ -132,7 +140,7 @@ function createKernel({ serverInfo, capabilities, methods }) {
         if (era === 'legacy') throw eraRefusal(method);
         era = 'modern';
         return {
-          protocolVersions: [MODERN_VERSION, LEGACY_VERSION],
+          protocolVersions: [MODERN_VERSION, ...LEGACY_VERSIONS],
           capabilities: caps,
           serverInfo: info,
         };
@@ -265,6 +273,8 @@ module.exports = {
   rpcError,
   MODERN_VERSION,
   LEGACY_VERSION,
+  LEGACY_CODEX_VERSION,
+  LEGACY_VERSIONS,
   ERR_ERA_PINNED,
   ERR_UNSUPPORTED_PROTOCOL_VERSION,
 };

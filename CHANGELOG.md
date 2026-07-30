@@ -34,27 +34,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `node` is the command and the script is an argument on purpose — `bin/ratchet-mcp` has no
   extension and no exec bit on Windows, so naming it as the command would install cleanly
   and fail to launch on half the platforms.
-- **`test/mcp-entry.test.js` — 19 cases**, wired into `npm test`. Twelve cover the
-  configuration surface in-process; seven **spawn the real binary and talk to it over real
+- **`test/mcp-entry.test.js` — 20 cases**, wired into `npm test`. Twelve cover the
+  configuration surface in-process; eight **spawn the real binary and talk to it over real
   OS pipes**, which is the first thing in this repo to exercise node startup, argv, the
   shebang wrapper, and process exit together. One of those runs a real *client process*
   driving the real server process, because a handle is connection-scoped and open-then-read
-  cannot be expressed as a fixed input script.
+  cannot be expressed as a fixed input script; another locks the legacy revision proposed by
+  Codex 0.142.5 to the real executable boundary.
 - **`test/plugin-shape.test.js` — two new drift guards.** `ratchet-mcp`'s version joins the
   aligned-version assertion, and the declared MCP server is now checked to launch through
   `node`, locate its script from `${CLAUDE_PLUGIN_ROOT}`, point at a file that exists, be a
   declared `bin` target so packaging keeps it, and pass a `--root`. A plugin manifest is
   read by the host at install time, so a renamed binary would otherwise fail in the user's
   install and nowhere in CI. Verified by breaking the manifest and watching it fail.
-- **Codex MCP registration is documented, not declared.** `.codex-plugin/plugin.json` gets
-  no `mcpServers` key: that key is unverified for this manifest format, and a wrong one
-  breaks installs silently rather than loudly (the precedent is the default-paths breakage).
-  The README documents the `~/.codex/config.toml` route instead. **Open loop, owner Danny:**
-  confirm the Codex plugin-manifest MCP schema, then declare it.
-- **Not yet done, and not claimed:** a real third-party MCP client has still never connected
-  to this server. The interop cases prove the transport, the framing, and the process
-  contract against a client we wrote. **Open loop, owner Danny:** run it against an actual
-  2026-07-28 client.
+- **Codex registration is verified and remains explicit by design.** Codex does support
+  plugin-bundled MCP servers through `mcpServers: "./.mcp.json"`, but resolves a bundled
+  server's working directory inside the installed plugin and exposes no documented
+  per-session workspace substitution for its arguments. Declaring
+  `node ./bin/ratchet-mcp --root .` would therefore authorize the plugin cache, not the
+  opened project. The README now gives the exact `codex mcp add` command with absolute
+  launcher and root paths; `.codex-plugin/plugin.json` stays free of a misleading automatic
+  grant.
+- **A real Codex client found and closed the legacy negotiation gap.** Codex 0.142.5
+  proposes MCP `2025-06-18`; Torque previously answered every non-`2025-11-25` initialize
+  with `2025-11-25`, which that client rejected before tool discovery. The legacy
+  compatibility set is now closed over exactly those two named revisions, echoes either
+  supported proposal, and still falls back to the newest legacy revision for an unknown
+  proposal. Era pinning is unchanged: both revisions are one request/response era and can
+  never mix with the stateless `2026-07-28` surface.
 
 - **`src/mcp/handles.js` — verify-on-use: a handle names the object it was granted
   over, not whatever later answers to that name** (Torque MCP build-order step 2.5,
