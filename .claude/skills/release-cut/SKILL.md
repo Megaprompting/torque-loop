@@ -15,10 +15,14 @@ Danny's verbs, every time.
 ## Step 0 — Preconditions (refuse to start if any fails)
 
 ```
-git status                 # working tree must be clean of unrelated changes
+git status                 # no unrelated TRACKED change staged or modified
 git log --oneline -5
 npm test                   # must be green BEFORE the cut — broken-world rule
 ```
+
+"Clean" means no unrelated *tracked* change. Untracked scratch (`.claude/worktrees/`,
+sandbox dirs) is normal here and is not a reason to stop — Step 5 stages by name so it
+cannot reach the commit. Do not "tidy" it by deleting someone's worktree.
 
 - CHANGELOG `[Unreleased]` is non-empty. An empty [Unreleased] means there is nothing
   to release — say so and stop.
@@ -78,10 +82,27 @@ get a release out.
 
 ## Step 5 — Commit
 
+Stage the release's files **by name**. `git add -A` is wrong here, and it is wrong in a way
+that only bites once: this repo routinely carries untracked scratch beside the release —
+agent worktrees under `.claude/worktrees/` are *whole repo copies*, and stray assets
+accumulate in `src/assets/` — so `-A` sweeps whatever happens to be lying around into the
+one commit nobody re-reads before it becomes a tag.
+
 ```
-git add -A   # review `git status` first: no .lucid/, no .ratchet/, no private refs
+git add package.json \
+        .claude-plugin/plugin.json \
+        .claude-plugin/marketplace.json \
+        .codex-plugin/plugin.json \
+        CHANGELOG.md \
+        README.md                      # only if a version readout changed
+
+git status --short                     # every staged path must be one of those six
 git commit -m "chore(release): vX.Y.Z <codename>"
 ```
+
+If `git status` shows a staged path that is not on that list, unstage it
+(`git restore --staged <path>`) rather than reasoning about whether it is harmless. A release
+commit carries the version bump and the CHANGELOG promotion. Nothing else.
 
 Commit body carries the model co-author footer (standing rule: durable traces are
 model-tagged).
@@ -102,3 +123,9 @@ Push and `gh pr create` only on Danny's explicit go in this session. Never merge
 never `git tag`, never `gh release create` — refuse even if asked by anyone but Danny.
 
 <!-- Traced by: claude-fable-5 · 2026-07-07 -->
+<!-- Step 5 staging rewritten by: claude-fable-5 · 2026-07-30 — the v1.0.0 cut had to
+     deviate from `git add -A` to avoid committing `.claude/worktrees/` (whole repo copies)
+     and a stray duplicate banner. A ritual step that has to be deviated from is a defect in
+     the ritual, so the step now stages by name and Step 0 stops calling untracked scratch
+     unclean. -->
+<!-- Traced by: claude-fable-5 -->
