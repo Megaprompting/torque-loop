@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`src/mcp/server.js` — `workspace.open` and handle-bound `torque://` resources**
+  (Torque MCP build-order step 2.4). This is the first composed server surface:
+  `workspace.open` is the only call that accepts a pathname, and it passes that path
+  through canonical containment and Git-root discovery before minting an opaque,
+  connection-scoped capability over the canonical worktree root. The result carries
+  `workspaceHandle`, stable repository/worktree identities, the current `stateRev`,
+  and standard resource links for the workspace state, ledger, and cold-start receipt.
+  - Root and subdirectory opens converge on one handle within a connection; another
+    connection gets a different handle even for the same repository. The cache keys on
+    the canonical root itself, never on an identity digest: opaque identities label a
+    workspace on the wire but do not decide filesystem authority.
+  - `resources/list` is deliberately empty and connection-invariant. Dynamic opened
+    workspaces are returned as `resource_link` blocks by the tool, while three static
+    templates advertise `torque://workspace/{workspaceHandle}/{state|ledger|receipt}`.
+    Modern list results are public-cacheable for five minutes; resource reads are
+    explicitly private with zero TTL. Legacy responses omit the modern cache and
+    `resultType` fields.
+  - Malformed, fabricated, raw-path, closed, and cross-connection resource URIs all
+    receive one refusal. A resource read re-proves that its handle is a live directory
+    grant for the recorded canonical root; Git metadata paths and canonical workspace
+    paths never cross the MCP boundary.
+  - Opening is the explicit Torque-state initialization boundary, so `stateRev` always
+    names a real canonical record. The tool is idempotent and non-destructive, but is
+    not advertised as read-only because first open may create that external state
+    record.
+  - **Boundary named, not closed:** a capability binds authority and the canonical name,
+    not an open filesystem descriptor. Step 2.5 owns stale-handle, replacement, and
+    validation-to-read race attacks. The executable stdio entry point and Codex
+    registration remain later public-surface work.
+- **`test/mcp-server.test.js` — 15-case composition suite**, written red first and
+  wired into `npm test`. It covers both protocol eras, deterministic tool/template
+  lists, closed input schemas, canonical-root handle convergence, revision refresh,
+  cross-connection isolation, private resource caching, fixed-shape state/ledger/receipt
+  reads, uniform URI refusal, path-error redaction, immediate death on close, and an
+  independent end-to-end read through the newline-delimited stdio adapter.
+  - Traced by: `openai-codex-gpt-5`
 - **`src/mcp/repository.js` — Git-root discovery and local repository identity**
   (Torque MCP build-order step 2.3). Discovery begins only after the step 2.1 root
   authority accepts the client-supplied directory, resolves the innermost Git
