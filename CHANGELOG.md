@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`--project-root`: a host may NAME the workspace, which is not the same as this server
+  guessing one** (CLI-enforced, six falsifiers). Claude Code sets `CLAUDE_PROJECT_DIR` in a
+  spawned MCP server's environment to the project it opened. Reading it is not the cwd
+  inference this server refuses — cwd is an accident of how we were spawned, while this is
+  the host stating which workspace it means — but it takes an explicit flag to accept, so
+  the authority stays visible in the config a human reads.
+  - Refuses when the variable is unset, with a diagnostic that blames the host rather than
+    the operator: they *did* configure a root, and a generic "nothing configured" would send
+    them to fix the wrong file.
+  - The named root must still be absolute. In a project `.mcp.json`, `CLAUDE_PROJECT_DIR` is
+    set in the server's environment rather than substituted into `args`, so the documented
+    `${CLAUDE_PROJECT_DIR:-.}` form can expand to `.` — which is rejected rather than
+    resolved against a working directory the host does not document.
+  - It adds to explicit `--root` values rather than replacing them, and a flag-configured
+    launch still ignores `RATCHET_MCP_ROOTS`, which remains the no-flag fallback only.
+- **Claude Code registration is documented, and verified against the real client.**
+  `claude mcp add torque --scope local -- node .../bin/ratchet-mcp --root <repo>` reports
+  `✔ Connected` — the first time a real third-party MCP client has completed a handshake with
+  this server on the modern revision, closing the interop loop left open when the entry point
+  landed. (Codex 0.142.5 closed the legacy half on `2025-06-18`.) The README also documents
+  the portable project-`.mcp.json` shape that `--project-root` exists to serve.
+- **This repo deliberately ships no root `.mcp.json`.** A project `.mcp.json` is the obvious
+  way to wire the server into Claude Code, and it was written and then removed: this repo is
+  itself a plugin, and Codex treats a plugin's root `.mcp.json` as a bundled server config
+  resolved inside the plugin cache. Shipping one for Claude Code would hand Codex installs a
+  server that cannot work, and would silently reverse the decision not to auto-declare a
+  bundled Codex server. Registration stays explicit per host.
 - **`bin/ratchet-mcp` + `src/mcp/main.js` — the MCP server is launchable, and registered
   with Claude Code** (Torque MCP: the public surface). Everything the protocol needed
   already existed; what was missing was a way to start it. Two decisions carry the weight,

@@ -26,19 +26,29 @@ const stdio = require('./stdio');
 const VERSION = pkg.version;
 const ROOTS_ENV = 'RATCHET_MCP_ROOTS';
 
+// Claude Code sets this in a spawned MCP server's environment, naming the
+// project it opened. Reading it is NOT the cwd inference this module refuses:
+// cwd is an accident of how we were spawned, while this is the host stating
+// which workspace it means. It still takes an explicit --project-root to
+// accept, so the authority is visible in the config a human reads.
+const PROJECT_ENV = 'CLAUDE_PROJECT_DIR';
+
 const USAGE = [
   'ratchet-mcp — Torque Loop MCP server (stdio transport)',
   '',
   'Usage: ratchet-mcp --root <dir> [--root <dir> ...]',
   '',
   'Options:',
-  '  --root <dir>   Allow this directory as a workspace root. Repeatable.',
-  '                 Must be an existing, fully qualified directory.',
-  '  --help, -h     Show this message.',
-  '  --version      Print the version.',
+  '  --root <dir>     Allow this directory as a workspace root. Repeatable.',
+  '                   Must be an existing, fully qualified directory.',
+  `  --project-root   Allow the directory named by ${PROJECT_ENV}. For an MCP`,
+  '                   host that states the project it opened; refuses if unset.',
+  '  --help, -h       Show this message.',
+  '  --version        Print the version.',
   '',
   `Environment:`,
-  `  ${ROOTS_ENV}   ${path.delimiter}-separated roots, used only when no --root is given.`,
+  `  ${ROOTS_ENV}     ${path.delimiter}-separated roots, used only when no root flag is given.`,
+  `  ${PROJECT_ENV}   Read only when --project-root is passed.`,
   '',
   'The server speaks newline-delimited JSON-RPC on stdin/stdout. Diagnostics go',
   'to stderr, because stdout carries the protocol.',
@@ -50,7 +60,7 @@ const USAGE = [
 // direction to be wrong in.
 function parseArgs(argv) {
   const roots = [];
-  const flags = { help: false, version: false };
+  const flags = { help: false, version: false, projectRoot: false };
   const errors = [];
 
   for (let i = 0; i < argv.length; i++) {
@@ -61,6 +71,10 @@ function parseArgs(argv) {
     }
     if (arg === '--version') {
       flags.version = true;
+      continue;
+    }
+    if (arg === '--project-root') {
+      flags.projectRoot = true;
       continue;
     }
     let value = null;
@@ -90,11 +104,26 @@ function parseArgs(argv) {
 // mean an inherited variable could quietly add authority to an explicit launch,
 // and the operator reading the command line would not see it.
 function resolveRoots(parsed, env) {
-  if (parsed.roots.length) return { roots: parsed.roots, source: '--root' };
+  const roots = parsed.roots.slice();
+  const sources = roots.length ? ['--root'] : [];
+
+  if (parsed.flags.projectRoot) {
+    const named = env && env[PROJECT_ENV];
+    if (typeof named !== 'string' || !named.length) {
+      // Asked for the host's project and the host did not name one. Falling
+      // back to anything else here would hand back authority nobody granted.
+      return { roots: [], source: 'nothing', missingProjectRoot: true };
+    }
+    roots.push(named);
+    sources.push(PROJECT_ENV);
+  }
+
+  if (roots.length) return { roots, source: sources.join(' + ') };
+
   const raw = env && env[ROOTS_ENV];
   if (typeof raw === 'string' && raw.length) {
-    const roots = raw.split(path.delimiter).filter((entry) => entry.length);
-    if (roots.length) return { roots, source: ROOTS_ENV };
+    const listed = raw.split(path.delimiter).filter((entry) => entry.length);
+    if (listed.length) return { roots: listed, source: ROOTS_ENV };
   }
   return { roots: [], source: 'nothing' };
 }
@@ -121,10 +150,18 @@ function start(argv, io) {
     return { exitCode: 2 };
   }
 
-  const { roots, source } = resolveRoots(parsed, io.env || {});
+  const resolved = resolveRoots(parsed, io.env || {});
+  const { roots, source } = resolved;
+  if (resolved.missingProjectRoot) {
+    // Named separately from "nothing configured": the operator did configure a
+    // root, and the reason it is not there belongs to the host, not to them.
+    err.write(`ratchet-mcp: --project-root was passed but ${PROJECT_ENV} is not set in this environment\n`);
+    err.write('ratchet-mcp: an MCP host sets it for a spawned server; pass --root <dir> instead\n');
+    return { exitCode: 2 };
+  }
   if (!roots.length) {
     err.write('ratchet-mcp: no workspace root configured, so every request would be refused\n');
-    err.write(`ratchet-mcp: pass --root <dir> (repeatable) or set ${ROOTS_ENV}\n`);
+    err.write(`ratchet-mcp: pass --root <dir> (repeatable), --project-root, or set ${ROOTS_ENV}\n`);
     return { exitCode: 2 };
   }
 
@@ -170,4 +207,6 @@ function run(argv, overrides) {
   return started;
 }
 
-module.exports = { run, start, parseArgs, resolveRoots, USAGE, VERSION, ROOTS_ENV };
+module.exports = {
+  run, start, parseArgs, resolveRoots, USAGE, VERSION, ROOTS_ENV, PROJECT_ENV,
+};

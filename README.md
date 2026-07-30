@@ -190,15 +190,25 @@ node bin/ratchet-mcp --root /absolute/path/to/repo
 # repeatable, for more than one allowed workspace
 node bin/ratchet-mcp --root /srv/work/alpha --root /srv/work/beta
 
-# or by environment, used only when no --root is passed
+# or by environment, used only when no root flag is passed
 RATCHET_MCP_ROOTS="/srv/work/alpha:/srv/work/beta" node bin/ratchet-mcp
+
+# or let an MCP host name the project it opened, via CLAUDE_PROJECT_DIR
+node bin/ratchet-mcp --project-root
 ```
 
-**Roots are never inferred.** With no `--root` and no `RATCHET_MCP_ROOTS`, the server
+**Roots are never inferred.** With no root flag and no `RATCHET_MCP_ROOTS`, the server
 refuses to start rather than falling back to its working directory — which is whatever the
 client happened to spawn it in, and would widen the allowlist by accident on every launch.
 An unknown argument is refused for the same reason: a `--roots` typo must not quietly become
 an empty allowlist.
+
+`--project-root` is the one exception, and it is not an exception to the rule: it reads
+`CLAUDE_PROJECT_DIR`, which an MCP host sets in a spawned server's environment to name the
+project it opened. That is the host *stating* a workspace, not this server guessing one from
+how it happened to be spawned. It refuses if the variable is unset, and the root it names
+must still be absolute — the documented `${CLAUDE_PROJECT_DIR:-.}` fallback expanding to `.`
+is rejected rather than resolved against an undocumented working directory.
 
 What it exposes today: one tool, `workspace.open`, which takes a path inside a configured
 root and returns an opaque workspace handle, the repository and worktree identities, the
@@ -206,6 +216,47 @@ current `stateRev`, and read-only resource links. Reads are addressed by handle
 (`torque://workspace/{handle}/{state|ledger|receipt}`), never by re-supplying a path — a
 handle is a capability bound to one connection and one filesystem object, and it dies when
 either changes.
+
+#### Registering with Claude Code without installing the plugin
+
+Installing the plugin is enough — `.claude-plugin/plugin.json` already declares the server.
+To register it directly instead (for a checkout you are developing against, or to scope it to
+one project), use Claude Code's own MCP configuration:
+
+```bash
+claude mcp add torque --scope local -- \
+  node /absolute/path/to/torque-loop/bin/ratchet-mcp \
+  --root /absolute/path/to/allowed/repo
+
+claude mcp get torque      # -> ✔ Connected
+```
+
+Repeat `--root` to authorize more than one workspace. Use `--scope user` for every project,
+`--scope local` for this one only. The server's tools then appear as `mcp__torque__*` after
+Claude Code reconnects.
+
+To wire it into a project you own via a checked-in `.mcp.json`, the portable shape is:
+
+```jsonc
+// <your-project>/.mcp.json
+{
+  "mcpServers": {
+    "torque": {
+      "command": "node",
+      "args": ["/absolute/path/to/torque-loop/bin/ratchet-mcp", "--project-root"]
+    }
+  }
+}
+```
+
+`--project-root` is what makes that portable: in a project `.mcp.json`, `CLAUDE_PROJECT_DIR`
+is set in the spawned server's environment rather than substituted into `args`, so the server
+reads it there instead of trusting an expansion that may not have happened.
+
+**This repo intentionally ships no root `.mcp.json`.** It is itself a plugin, and Codex treats
+a plugin's root `.mcp.json` as a bundled server config resolved inside the plugin cache — so a
+file meant for Claude Code here would be inherited by Codex installs as a server that cannot
+work. Registration stays explicit per host.
 
 Registering with a non-Claude client uses that client's own MCP configuration. For Codex,
 register the server with the exact checkout containing `bin/ratchet-mcp` and the exact
