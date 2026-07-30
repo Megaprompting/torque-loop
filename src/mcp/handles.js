@@ -10,12 +10,20 @@
 // nothing else, so a client never re-supplies a path and the server never
 // re-interprets one.
 //
-// What this does NOT do: close the window between validation and use. The
-// filesystem underneath a handle can still change; what a handle removes is
-// client-controlled path substitution and repeated authority interpretation at
-// the protocol boundary. Naming that is the point — an opaque token that merely
-// maps back to a string would otherwise look like it had solved a race it never
-// touched. (Open loop, owner Danny: verify-on-use against the recorded identity.)
+// Step 2.5 added verify-on-use: a grant records WHICH OBJECT it was issued over
+// (device + inode), and every use re-checks that the recorded pathname still
+// reaches that same object. Replacement is therefore detected and refused
+// instead of inherited — the case where an attacker takes over the name and
+// leaves the substitute in place.
+//
+// What this still does NOT do, stated precisely because the check is easy to
+// over-read: it does not make use atomic. Node exposes no openat, so a gap
+// remains between the identity check and whatever the caller then does with the
+// path, and an attacker who wins that gap on every attempt is not stopped by
+// this. Nor does it survive inode reuse — a filesystem is free to hand a
+// deleted object's id to a new one, and this check would call that a match.
+// What it converts is silent substitution into a named refusal.
+// (Open loop, owner Danny: bind reads to an opened descriptor to close the gap.)
 //
 // One more boundary, named rather than implied: lookup is a Map get, so it is
 // not constant-time. Against a local stdio peer that already holds its own
@@ -48,13 +56,35 @@ function unknownHandle() {
   return refuse('ERATCHETHANDLE', 'no such handle on this connection');
 }
 
+// A different refusal from `unknownHandle` on purpose, and safe to distinguish:
+// the holder has already proven this handle exists by presenting it, so naming
+// staleness reveals nothing the registry did not just confirm — and it sends
+// them somewhere useful instead of implying they hold a forgery. Revocation is
+// still checked FIRST, so a revoked token never earns this reply.
+function stale(why) {
+  return refuse('ERATCHETHANDLESTALE', `this handle no longer names what it was granted over — ${why}`);
+}
+
 function mintToken() {
   return crypto.randomBytes(HANDLE_BYTES).toString('base64url');
 }
 
+// The OS answers "is this the same object?" with the containing device and the
+// inode, so that pair is what a grant records. Read in the WIDE form on
+// purpose: NTFS file ids and large inodes exceed 2^53, where adjacent values
+// collide as JS Numbers (10696049115337591 rounds to ...592), and an identity
+// check that compared those would call two different objects one.
+function objectIdentity(stat) {
+  return { dev: stat.dev, ino: stat.ino };
+}
+
+function sameObject(recorded, current) {
+  return recorded.dev === current.dev && recorded.ino === current.ino;
+}
+
 function statIfPresent(target, label) {
   try {
-    return fs.statSync(target);
+    return fs.statSync(target, { bigint: true });
   } catch (e) {
     if (e && (e.code === 'ENOENT' || e.code === 'ENOTDIR')) return null;
     const code = e && e.code ? e.code : 'unknown error';
@@ -135,6 +165,7 @@ function createRegistry({ roots }) {
       // being lost in a returned pathname.
       const wantsExisting = kind === 'file' || kind === 'directory';
       const stat = statIfPresent(target, 'the handle target');
+      let parentStat = null;
       if (wantsExisting) {
         if (!stat) throw refuse('ERATCHETHANDLEKIND', `nothing is there to grant a ${kind} handle over`);
         const actual = stat.isDirectory() ? 'directory' : stat.isFile() ? 'file' : 'special filesystem object';
@@ -143,8 +174,8 @@ function createRegistry({ roots }) {
         }
       } else {
         if (stat) throw refuse('ERATCHETHANDLEKIND', `something is already there, so it cannot be created`);
-        const parent = statIfPresent(path.dirname(target), 'the parent directory');
-        if (!parent || !parent.isDirectory()) {
+        parentStat = statIfPresent(path.dirname(target), 'the parent directory');
+        if (!parentStat || !parentStat.isDirectory()) {
           throw refuse('ERATCHETHANDLEKIND', 'the parent directory this would be created in does not exist');
         }
       }
@@ -162,6 +193,15 @@ function createRegistry({ roots }) {
         relative: path.relative(root, target),
         kind,
         operations,
+        // Taken from the SAME stat that validated the kind above. A second stat
+        // would record the object as it was a moment later than the one that
+        // passed validation, which is the very substitution being defended
+        // against. A create grant has no object yet, so it records absence.
+        object: stat ? objectIdentity(stat) : null,
+        // For a create grant, absence at the target says nothing about WHERE it
+        // would be created: the name is still free inside a directory that was
+        // swapped underneath it. The parent is the object that grant authorized.
+        parent: parentStat ? objectIdentity(parentStat) : null,
         // Distinguishes this issuance from any other grant over the same path,
         // including a reissue after revocation.
         issued: uniqueToken(issuanceTokens),
@@ -176,8 +216,36 @@ function createRegistry({ roots }) {
       return entry;
     }
 
+    // Nothing here re-interprets a client string: the pathname re-checked is the
+    // canonical one this registry recorded at grant time. The question is
+    // narrower than containment — is the object still the one the grant was
+    // issued over? Containment does not need re-deciding, because the same
+    // object is necessarily in the same place it was judged to be.
+    function stillGranted(entry) {
+      const current = statIfPresent(entry.path, 'the handle target');
+      if (!entry.object) {
+        // A create grant asserted that nothing was there. If something is now,
+        // writing would target an object the client never had authority over.
+        if (current) throw stale('this handle was granted to create something, and something is there now');
+        const parent = statIfPresent(path.dirname(entry.path), 'the parent directory');
+        if (!parent) throw stale('the directory it would be created in is gone');
+        if (!sameObject(entry.parent, objectIdentity(parent))) {
+          throw stale('a different directory now answers to the place it would be created in');
+        }
+        return;
+      }
+      if (!current) throw stale('the object it was granted over is gone');
+      if (!sameObject(entry.object, objectIdentity(current))) {
+        // Type changes come free with this check: an inode cannot change what
+        // kind of object it is, so a file replaced by a directory is a
+        // different object and fails here rather than needing its own rule.
+        throw stale('a different object now answers to that name');
+      }
+    }
+
     function use(token, operation) {
       const entry = lookup(token);
+      stillGranted(entry);
       if (entry.operations.indexOf(operation) === -1) {
         // A different refusal on purpose: the holder has already proven this
         // handle exists, so naming the missing authority reveals nothing new.

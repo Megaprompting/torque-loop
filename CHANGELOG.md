@@ -9,6 +9,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`src/mcp/handles.js` — verify-on-use: a handle names the object it was granted
+  over, not whatever later answers to that name** (Torque MCP build-order step 2.5,
+  CLI-enforced at the registry boundary). Steps 2.1–2.4 established authority at grant
+  time and then handed back a canonical pathname to re-resolve on every use, so anything
+  that took over that name inherited the grant. A grant now records WHICH OBJECT it was
+  issued over — containing device plus inode, taken from the same `stat` that validated
+  the kind, never a second one — and every `use` re-checks that the recorded pathname
+  still reaches that same object. Replacement is refused, not inherited.
+  - Identity is read in the **wide** form (`{ bigint: true }`). NTFS file ids and large
+    inodes exceed 2^53, where adjacent values collide as JS Numbers
+    (`10696049115337591` rounds to `...592`), so a Number-based check would call two
+    different objects one. A falsifier asserts every identity read passes `bigint`.
+  - Object type changes come free: an inode cannot change what kind of object it is, so
+    a file replaced by a directory fails as a different object without its own rule.
+    Content changes are *not* staleness — a rewritten file keeps the same object, and
+    invalidating there would break every capability on every ordinary write.
+  - A create grant records its **parent** directory's identity too. Absence at the
+    target says nothing about *where* the create would land: the name is still free
+    inside a directory that was swapped underneath it.
+  - Staleness answers `ERATCHETHANDLESTALE`, distinct from the uniform
+    `ERATCHETHANDLE` refusal, and safe to distinguish because the holder already proved
+    the handle exists by presenting it. Revocation is checked **first**, so a revoked
+    token never earns the stale reply and stays indistinguishable from one that never
+    existed — the enumeration guarantee is unchanged.
+- **`src/mcp/server.js` — a replaced workspace root no longer reissues dead authority.**
+  The open-workspace cache keys on the canonical pathname, so a directory replaced
+  between two opens would otherwise be served the handle minted over the object that
+  used to be there. The cached grant is now re-proved on every open; a dead one is
+  revoked and reissued, never repaired.
+- **`test/mcp-toctou.test.js` — 17-case replacement suite**, written red first (11 of
+  the first 16 failed against the unpatched tree) and wired into `npm test`. Directory
+  and file replacement, mid-path parent swaps, deletion, file-becomes-directory, create
+  targets that become occupied, create parents that get swapped, hard-linked second
+  names, cross-connection independence, revocation precedence, wide-inode comparison,
+  every granted operation, and two end-to-end server cases driving replacement through
+  `workspace.open` and `resources/read`.
+  - **What this does not claim.** It does not make use atomic: Node exposes no `openat`,
+    so a gap remains between the identity check and whatever the caller then does with
+    the path, and an attacker who wins that gap on every attempt is not stopped by this.
+    Nor does it survive inode reuse — a filesystem may hand a deleted object's id to a
+    new one. What it converts is *silent substitution* into a *named refusal*, which is
+    the class where the attacker wins by leaving the substitute in place. Closing the
+    remaining gap means binding reads to an opened descriptor (open loop, owner Danny).
+  - **Scope of the resource guarantee, stated exactly:** Torque state and ledger do not
+    live in the repository — they resolve under the ratchet base dir keyed by a slug of
+    the canonical root pathname. The refusal after replacement therefore protects
+    *authority freshness*, and for the receipt read also byte provenance; it is not a
+    claim that the state record itself was inode-verified. Two different repositories
+    that occupy one pathname over time still share one Torque state record — a scoped
+    product decision, **parked** rather than silently changed (owner Danny).
 - **`src/mcp/server.js` — `workspace.open` and handle-bound `torque://` resources**
   (Torque MCP build-order step 2.4). This is the first composed server surface:
   `workspace.open` is the only call that accepts a pathname, and it passes that path
