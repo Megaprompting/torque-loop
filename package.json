@@ -15,8 +15,9 @@
     "node": ">=18"
   },
   "scripts": {
-    "test": "node test/cli.test.js && node test/evolve.test.js && node test/plugin-shape.test.js && node test/concurrency.test.js && node test/mcp-rpc.test.js && node test/mcp-workspace.test.js && node test/mcp-handles.test.js && node test/mcp-repository.test.js && node test/mcp-server.test.js && node test/mcp-toctou.test.js && node test/mcp-entry.test.js",
+    "test": "node test/cli.test.js && node test/evolve.test.js && node test/plugin-shape.test.js && node test/concurrency.test.js && node test/mcp-rpc.test.js && node test/mcp-workspace.test.js && node test/mcp-handles.test.js && node test/mcp-repository.test.js && node test/mcp-server.test.js && node test/mcp-prompts.test.js && node test/mcp-toctou.test.js && node test/mcp-entry.test.js",
     "test:concurrency": "node test/concurrency.test.js",
+    "prompts-gen": "node scripts/prompts-gen.js",
     "preflight": "node scripts/preflight.js",
     "ratchet": "node bin/ratchet",
     "ratchet-evolve": "node bin/ratchet-evolve",

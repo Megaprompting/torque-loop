@@ -22,6 +22,7 @@
 // Traced by: openai-codex-gpt-5
 
 const handles = require('./handles');
+const prompts = require('./prompts');
 const repository = require('./repository');
 const rpc = require('./rpc');
 const workspace = require('./workspace');
@@ -156,7 +157,11 @@ function createServer(options) {
     name: (opts.serverInfo && opts.serverInfo.name) || 'torque-mcp',
     version: (opts.serverInfo && opts.serverInfo.version) || pkg.version,
   });
-  const capabilities = Object.freeze({ tools: Object.freeze({}), resources: Object.freeze({}) });
+  const capabilities = Object.freeze({
+    tools: Object.freeze({}),
+    resources: Object.freeze({}),
+    prompts: Object.freeze({}),
+  });
 
   function createConnection(options_) {
     const connectionOptions = options_ || {};
@@ -330,6 +335,17 @@ function createServer(options) {
       'resources/read': {
         eras: ['modern', 'legacy'],
         handler: readResource,
+      },
+      'prompts/list': {
+        eras: ['modern', 'legacy'],
+        handler: (params, context) => {
+          listParams(params, 'prompts/list');
+          return withCache(prompts.list(), context.era, LIST_TTL_MS, 'public');
+        },
+      },
+      'prompts/get': {
+        eras: ['modern', 'legacy'],
+        handler: (params) => prompts.get(params.name, params.arguments),
       },
     };
 

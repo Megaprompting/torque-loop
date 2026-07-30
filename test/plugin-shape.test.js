@@ -406,6 +406,30 @@ ok('the skill graph covers every skill and rebuilds cleanly', () => {
   );
 });
 
+ok('the MCP prompt surface is derived from PROMPTS.md, not remembered (drift guard)', () => {
+  // src/mcp/prompts.generated.json is what the MCP server serves as prompts/list and
+  // prompts/get. Committing it is only safe because it is DERIVED: scripts/prompts-gen.js
+  // reads reference/PROMPTS.md and emits it. Hand-edit the JSON and the wire would teach a
+  // client a prompt the canonical source never said — the exact drift PROMPTS.md exists to
+  // outrank. So byte-match it against a fresh generation, normalizing CRLF only so a clone
+  // whose autocrlf touched the file still checks content (convention 16).
+  const promptsGen = require('../scripts/prompts-gen');
+  assert.ok(exists(promptsGen.OUT_REL), 'src/mcp/prompts.generated.json exists');
+  const committed = read(promptsGen.OUT_REL).replace(/\r\n/g, '\n');
+  assert.strictEqual(
+    committed,
+    promptsGen.buildPrompts(),
+    'src/mcp/prompts.generated.json is stale — run: node scripts/prompts-gen.js'
+  );
+  const generated = JSON.parse(committed);
+  assert.ok(Array.isArray(generated.prompts) && generated.prompts.length,
+    'the generated prompt set is non-empty — an empty surface is drift, not a clean slate');
+  for (const entry of generated.prompts) {
+    assert.ok(entry.name, `a generated prompt has a name: ${JSON.stringify(entry)}`);
+    assert.ok(entry.body && entry.body.trim(), `prompt "${entry.name}" has a body`);
+  }
+});
+
 ok('the graph README parks the aperture cross-links instead of smuggling them in', () => {
   // The honest-scope boundary is load-bearing: the derived graph deliberately omits the
   // aperture cross-links (a separate repo, never adversarially attacked) and documents that

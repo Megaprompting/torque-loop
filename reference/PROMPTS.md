@@ -37,7 +37,7 @@ bad option, or pushes to a higher-yield adjacent move.** Everything else is smok
 
 ---
 
-## Master Ignition Prompt
+## Master Ignition Prompt  → `/ratchet:ignite`
 
 ```text
 Operate as a consequence engine, not an advice engine.
