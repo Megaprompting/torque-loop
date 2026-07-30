@@ -1,6 +1,6 @@
 {
   "name": "@torque-loop/plugin",
-  "version": "0.9.0",
+  "version": "1.0.0",
   "description": "Torque Loop — a Claude Code and Codex plugin that evolves ambiguity into shipped, tested, serialized artifacts through evidence-gated loops.",
   "license": "MIT",
   "author": "Danny Gillespie",

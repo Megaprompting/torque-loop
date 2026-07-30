@@ -5,14 +5,14 @@
   },
   "metadata": {
     "description": "Torque Loop — a single-plugin marketplace.",
-    "version": "0.9.0"
+    "version": "1.0.0"
   },
   "plugins": [
     {
       "name": "ratchet",
       "source": "./",
       "description": "Torque Loop: turns ambiguous work into shipped artifacts through target locking, adversarial validation, patching, and state serialization, plus a bounded /ratchet:evolve loop.",
-      "version": "0.9.0",
+      "version": "1.0.0",
       "author": {
         "name": "Danny Gillespie"
       },
