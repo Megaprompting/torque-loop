@@ -168,6 +168,14 @@ function createServer(options) {
     const byHandle = new Map();
     let closed = false;
 
+    function stillCurrent(record) {
+      try {
+        return authority.use(record.handle, 'read').path === record.root;
+      } catch (_error) {
+        return false;
+      }
+    }
+
     function openWorkspace(arguments_) {
       const args = arguments_;
       const shaped = args && typeof args === 'object' && !Array.isArray(args) &&
@@ -190,6 +198,16 @@ function createServer(options) {
       }
 
       let record = byRoot.get(found.root);
+      // The cache is keyed by pathname, so a directory that was replaced since
+      // the first open would otherwise be served authority minted over the
+      // object that used to be there. Re-proving the grant is what makes the
+      // key honest; a dead one is dropped and reissued, not repaired.
+      if (record && !stillCurrent(record)) {
+        authority.revoke(record.handle);
+        byRoot.delete(found.root);
+        byHandle.delete(record.handle);
+        record = undefined;
+      }
       if (!record) {
         let token;
         try {
