@@ -195,6 +195,59 @@ ok('E12 the startup banner goes to stderr, so stdout opens clean', () => {
     'the first byte a client reads must be protocol');
 });
 
+ok('E13 --project-root takes the root the host named, not the working directory', () => {
+  const dir = fixture('e13');
+  const r = launch(['--project-root'], { [main.PROJECT_ENV]: dir });
+  assert.strictEqual(r.started.exitCode, null, 'a host-named project is a configured root');
+  assert.match(r.stderr.text(), new RegExp(`1 root\\(s\\) from ${main.PROJECT_ENV}`),
+    'the banner names the host as the source, so the authority is visible');
+});
+
+ok('E14 --project-root with nothing named refuses, and blames the right side', () => {
+  const r = launch(['--project-root'], {});
+  assert.strictEqual(r.started.exitCode, 2, 'no named project is not a reason to guess one');
+  assert.match(r.stderr.text(), new RegExp(`${main.PROJECT_ENV} is not set`));
+  // The operator DID configure a root; the reason it is absent belongs to the
+  // host. A generic "nothing configured" would send them to fix the wrong file.
+  assert.doesNotMatch(r.stderr.text(), /no workspace root configured/);
+  assert.strictEqual(r.stdout.text(), '');
+});
+
+ok('E15 --project-root does not silently replace an explicit --root', () => {
+  const flagged = fixture('e15-flag');
+  const project = fixture('e15-project');
+  const r = launch(['--root', flagged, '--project-root'], { [main.PROJECT_ENV]: project });
+  assert.strictEqual(r.started.exitCode, null);
+  const resolved = main.resolveRoots(
+    main.parseArgs(['--root', flagged, '--project-root']),
+    { [main.PROJECT_ENV]: project }
+  );
+  assert.deepStrictEqual(resolved.roots, [flagged, project],
+    'both were asked for explicitly, so both are granted');
+  assert.match(r.stderr.text(), /2 root\(s\)/);
+});
+
+ok('E16 --project-root ignores an unrelated inherited roots list', () => {
+  const project = fixture('e16-project');
+  const inherited = fixture('e16-inherited');
+  const resolved = main.resolveRoots(main.parseArgs(['--project-root']), {
+    [main.PROJECT_ENV]: project,
+    [main.ROOTS_ENV]: inherited,
+  });
+  // The env list is the no-flag fallback only. A flag-configured launch must not
+  // pick up extra authority from a variable the operator never looked at.
+  assert.deepStrictEqual(resolved.roots, [project]);
+});
+
+ok('E17 a relative project root is still refused', () => {
+  // The documented `${CLAUDE_PROJECT_DIR:-.}` fallback in a project .mcp.json
+  // can expand to "." on a host that does not substitute it. That must fail
+  // loudly at configuration rather than resolving against an unspecified cwd.
+  const r = launch(['--project-root'], { [main.PROJECT_ENV]: '.' });
+  assert.strictEqual(r.started.exitCode, 2);
+  assert.match(r.stderr.text(), /fully qualified/);
+});
+
 // ---------------------------------------------------------------------------
 // I: the real binary, spawned, over real pipes.
 // ---------------------------------------------------------------------------
@@ -365,6 +418,53 @@ ok('I6 the real binary refuses to start with no root, and says nothing on stdout
   assert.strictEqual(proc.status, 2, 'a misconfigured launch fails visibly');
   assert.strictEqual(proc.stdout, '', 'and never writes to the protocol channel');
   assert.match(proc.stderr, /no workspace root configured/);
+});
+
+ok('I10 the real binary serves the project the host named, over real pipes', () => {
+  const repo = initRepo('i10-repo');
+  const c = converse(['--project-root'], [{
+    jsonrpc: '2.0', id: 1, method: 'tools/call',
+    params: { name: 'workspace.open', arguments: { path: repo }, _meta: modernMeta() },
+  }], { env: { [main.PROJECT_ENV]: repo } });
+  assert.strictEqual(c.status, 0, `stderr: ${c.stderr}`);
+  assert.ok(c.replies[0].result.structuredContent.workspaceHandle,
+    `the host-named project must be openable: ${c.stdout}`);
+  assert.match(c.stderr, new RegExp(main.PROJECT_ENV), 'the banner names the source');
+});
+
+ok('I11 the documented project .mcp.json shape launches and serves', () => {
+  // This repo ships no root .mcp.json on purpose (Codex would inherit it as a
+  // bundled plugin config), so the config under test is the one the README tells
+  // a USER to put in their own project. Written out, expanded the way Claude Code
+  // documents, and actually run — a shape that names a missing script or an
+  // unsupported flag fails here rather than in someone's editor.
+  const repoRoot = fs.realpathSync.native(path.join(__dirname, '..'));
+  const documented = {
+    mcpServers: {
+      torque: {
+        command: 'node',
+        args: ['${CLAUDE_PROJECT_DIR:-.}/bin/ratchet-mcp', '--project-root'],
+      },
+    },
+  };
+  const server = documented.mcpServers.torque;
+  const args = server.args.map((a) => a.replace('${CLAUDE_PROJECT_DIR:-.}', repoRoot));
+  const proc = childProcess.spawnSync(process.execPath, args, {
+    input: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'server/discover' }) + '\n',
+    encoding: 'utf8',
+    // Claude Code sets this in the spawned server's environment even when the
+    // ${...} form in args falls back — which is exactly why --project-root reads
+    // it from there instead of trusting the expansion.
+    env: Object.assign(cleanGitEnv(), { [main.PROJECT_ENV]: repoRoot }),
+    timeout: 30000,
+    windowsHide: true,
+  });
+  assert.strictEqual(proc.status, 0, `the documented config must launch: ${proc.stderr}`);
+  const reply = JSON.parse(proc.stdout.split('\n').filter((l) => l.length)[0]);
+  assert.ok(reply.result && reply.result.serverInfo, `and answer the protocol: ${proc.stdout}`);
+  assert.strictEqual(reply.result.serverInfo.version, pkg.version);
+  assert.ok(reply.result.protocolVersions.includes('2026-07-28'),
+    'the modern revision is on offer to a Claude Code client');
 });
 
 ok('I7 --help through the real binary exits 0 with a clean stdout', () => {

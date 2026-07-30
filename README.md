@@ -1,4 +1,4 @@
-![Torque Loop](src/assets/banner.png)
+![Torque Loop — Claude, Codex, and MCP support](src/assets/banner-mcp.png)
 
 # Torque Loop
 
@@ -6,36 +6,57 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-black.svg)](LICENSE)
 [![Node.js ≥ 18](https://img.shields.io/badge/node-%E2%89%A518-black.svg)](package.json)
 
-**Mutate. Test. Keep the delta.**
+**No proof → no keep.**
 
-A Claude Code and Codex plugin for evolving one artifact through evidence-gated improvement
-loops.
+A Claude Code and Codex plugin — and an MCP server — that turns ambiguous work into
+shipped, tested, serialized artifacts through evidence-gated loops.
 
 > Not affiliated with, endorsed by, or sponsored by Anthropic or OpenAI.
 
-Torque Loop is **not a prompt library.** A prompt library gives Claude better words. Torque
-Loop gives Claude a job:
+Torque Loop is **not a prompt library.** A prompt library gives an agent better words.
+Torque Loop gives it a job:
 
 > **frame → choose → build → attack → patch → serialize → advance**
 
-It bundles two things:
+It bundles three things:
 
-- **The Ratchet command family** (`/ratchet:*`) — a consequence engine that turns ambiguity
-  into shipped, falsifiable artifacts through adversarial execution loops.
+- **The Ratchet command family** (`/ratchet:*`) — 21 commands that turn ambiguity into
+  shipped, falsifiable artifacts through adversarial execution loops.
 - **`/ratchet:evolve`** — a narrower, bounded loop that mutates one artifact, tests it, and
   keeps only proven improvement.
+- **`ratchet-mcp`** — an MCP server that serves session state to any MCP client over stdio,
+  where every read is bound to a capability rather than a path you asked for.
 
 Every command produces *pressure*, not just insight. Each one forces a choice, creates an
 artifact, tests an artifact, patches a defect, serializes state, kills an option, or pushes
 to a higher-yield move. Everything else is smoke.
 
 The whole system is a one-way progress mechanism — it only turns forward, and it remembers
-where it stopped. Session state persists to disk, so the next session resumes instead of
-restarting. *Ambiguity in. Artifact out. Failure tested. State advanced.*
+where it stopped. State persists to disk, so the next session resumes instead of restarting.
+One command reads it back in under a minute, in the same eight sections every time:
+
+```text
+TARGET · DELTA · PROOF · VERDICT · RISK · AUTHORITY · STATE · NEXT
+```
+
+*Ambiguity in. Artifact out. Failure tested. State advanced.*
 
 ---
 
-## The thesis — verified guardrails lift cognitive load
+## Contents
+
+- [The thesis](#the-thesis-verified-guardrails-lift-cognitive-load) — why gates lift load instead of adding it
+- [Commands](#commands) — the 21 `/ratchet:*` commands and the evolve loop
+- [Why seam fidelity matters](#why-seam-fidelity-matters) — the real session where a +21.4% win was a regression
+- [The state engine](#the-state-engine-ratchet-cli) — the `ratchet` CLI and the receipt
+- [The MCP server](#the-mcp-server-ratchet-mcp) — serve state to any MCP client
+- [Install](#install) — Claude Code, Codex, standalone CLI
+- [How it works](#how-it-works) — layout, agents, hooks
+- [Development](#development) · [Contributing](#contributing) · [License](#license)
+
+---
+
+## The thesis: verified guardrails lift cognitive load
 
 Most "process" *adds* load: another checklist to hold, another gate to satisfy. Torque Loop
 does the inverse. It externalizes state — the ledger holds the open defects, the map holds
@@ -54,190 +75,6 @@ So the gates are not ceremony. **No proof → no keep** and **wrong proof → no
 *price of being allowed to stop re-checking* — the up-front cost, paid in verification, that
 makes the offload real instead of imaginary. Everything below is the machinery that charges
 that price.
-
----
-
-## Install
-
-Torque Loop has two halves: the **agent plugin** (skills/commands, agents, and Claude-only
-hooks) and the **`ratchet` CLI** (the state engine the skills call). Claude Code exposes the
-skills as `/ratchet:*` slash commands. Codex installs the same skills under the
-`torque-loop` plugin and can use them from Codex CLI or the Codex app.
-
-### Requirements
-
-- Claude Code or Codex CLI/app
-- Node.js ≥ 18 (`node --version`)
-- On Windows, the bundled hooks call the CLI via `node`, so no shell-specific setup is
-  needed.
-
-### A. Install as a Claude Code plugin — global
-
-The repo doubles as a single-plugin marketplace, so you can install it directly.
-
-```bash
-# 1. get the repo
-git clone https://github.com/Megaprompting/torque-loop.git
-
-# 2. in Claude Code, register it as a marketplace and install
-/plugin marketplace add /absolute/path/to/torque-loop
-/plugin install ratchet@torque-loop
-```
-
-Or point at the GitHub repo without cloning first:
-
-```text
-/plugin marketplace add Megaprompting/torque-loop
-/plugin install ratchet@torque-loop
-```
-
-Then reload when prompted. Verify with `/help` — you should see the `/ratchet:*` commands.
-Manage or remove later from the interactive `/plugin` menu.
-
-### B. Install for a single project only (local, checked into the repo)
-
-Scope the plugin to one project so teammates get it automatically when they open that repo.
-Add it to the project's `.claude/settings.json`:
-
-```jsonc
-// <your-project>/.claude/settings.json
-{
-  "plugins": {
-    "marketplaces": {
-      "torque-loop": { "source": "/absolute/path/to/torque-loop" }
-    },
-    "install": ["ratchet@torque-loop"]
-  }
-}
-```
-
-Or vendor it directly inside the project and reference the local path. Either way the
-commands appear only when that project is open. (Prefer an absolute path, or a path relative
-to the settings file, so it resolves on every machine.)
-
-### C. Install as a Codex plugin — CLI
-
-The repo also contains a Codex marketplace manifest at
-`.agents/plugins/marketplace.json` and a Codex plugin manifest at
-`.codex-plugin/plugin.json`.
-
-```bash
-# 1. get the repo
-git clone https://github.com/Megaprompting/torque-loop.git
-
-# 2. register this repo as a Codex marketplace
-codex plugin marketplace add /absolute/path/to/torque-loop
-
-# 3. install the plugin from that marketplace
-codex plugin add torque-loop@torque-loop
-
-# 4. verify Codex can see it
-codex plugin list --marketplace torque-loop
-```
-
-For local development, re-run `codex plugin add torque-loop@torque-loop` after manifest
-changes, then start a new Codex thread so the refreshed skills are loaded.
-
-### D. Install as a Codex plugin — app
-
-Register the marketplace once with the Codex CLI:
-
-```bash
-codex plugin marketplace add /absolute/path/to/torque-loop
-```
-
-Then open the Codex app, go to **Plugins**, find **Torque Loop** under Developer Tools,
-and install it. The app and CLI share the configured marketplace source.
-
-### E. Install the `ratchet` CLI on its own (optional)
-
-Claude Code puts the bundled CLI on `PATH` while the plugin is enabled. Codex skills can
-use a globally installed `ratchet`, or you can run the bundled CLI from the plugin root.
-
-```bash
-cd torque-loop
-
-# global — puts `ratchet` on your PATH everywhere
-npm install -g .
-
-# or local dev link — symlinks the CLI while you hack on it
-npm link
-
-# or no install at all — run it in place
-node bin/ratchet --help
-```
-
-Verify:
-
-```bash
-ratchet --version      # -> ratchet 0.9.0
-ratchet init
-ratchet status
-```
-
-### F. The MCP server (`ratchet-mcp`)
-
-`bin/ratchet-mcp` serves Torque state to any MCP client over stdio. Installing the Claude
-Code plugin registers it automatically — `.claude-plugin/plugin.json` launches it with the
-project directory as its single workspace root, and its tools appear under `torque`.
-
-To run it by hand, or to register it with another client:
-
-```bash
-# stdin/stdout carry newline-delimited JSON-RPC; diagnostics go to stderr
-node bin/ratchet-mcp --root /absolute/path/to/repo
-
-# repeatable, for more than one allowed workspace
-node bin/ratchet-mcp --root /srv/work/alpha --root /srv/work/beta
-
-# or by environment, used only when no --root is passed
-RATCHET_MCP_ROOTS="/srv/work/alpha:/srv/work/beta" node bin/ratchet-mcp
-```
-
-**Roots are never inferred.** With no `--root` and no `RATCHET_MCP_ROOTS`, the server
-refuses to start rather than falling back to its working directory — which is whatever the
-client happened to spawn it in, and would widen the allowlist by accident on every launch.
-An unknown argument is refused for the same reason: a `--roots` typo must not quietly become
-an empty allowlist.
-
-What it exposes today: one tool, `workspace.open`, which takes a path inside a configured
-root and returns an opaque workspace handle, the repository and worktree identities, the
-current `stateRev`, and read-only resource links. Reads are addressed by handle
-(`torque://workspace/{handle}/{state|ledger|receipt}`), never by re-supplying a path — a
-handle is a capability bound to one connection and one filesystem object, and it dies when
-either changes.
-
-Registering with a non-Claude client uses that client's own MCP configuration. For Codex,
-register the server with the exact checkout containing `bin/ratchet-mcp` and the exact
-workspace roots it may open:
-
-```bash
-codex mcp add torque -- node /absolute/path/to/torque-loop/bin/ratchet-mcp \
-  --root /absolute/path/to/allowed/repo
-
-codex mcp get torque --json
-```
-
-Repeat `--root` in the first command to authorize more than one workspace. Codex stores this
-configuration in `~/.codex/config.toml`; its app, CLI, and IDE surfaces share it.
-
-The `.codex-plugin/` manifest deliberately does **not** auto-declare this server. Codex does
-support bundled MCP servers through a root-level `.mcp.json`, but resolves their working
-directory inside the installed plugin. It does not provide a documented per-session workspace
-substitution for the server's arguments. Passing `--root .` there would authorize the plugin
-cache instead of the project; omitting `--root` fails closed. Explicit registration preserves
-the same root boundary as a manual launch.
-
-### State location
-
-State survives plugin updates. It is written to, in order of preference:
-
-1. `$CLAUDE_PLUGIN_DATA` — set by Claude Code for enabled plugins.
-2. `$RATCHET_DATA_DIR` — override it yourself.
-3. `~/.ratchet` — fallback.
-
-State is scoped per project (by working-directory path), so multiple repos never collide in
-one shared data directory.
 
 ---
 
@@ -376,7 +213,29 @@ The seam gate is why a production-code `KEEP` in `/ratchet:evolve` must declare 
 ship-seam match (or a named human waiver), and why verification that merely repeats the
 builder's own search method is rejected as not independent.
 
-### v0.3 state & quality verbs (`ratchet` CLI)
+---
+
+## The state engine (`ratchet` CLI)
+
+The skills carry the reasoning; the CLI carries the state. A skill loads context by calling
+the CLI, does its work, and writes the result back:
+
+```bash
+ratchet receipt                    # one stable resume read: target·delta·proof·seam·verdict·authority·state·next
+ratchet status                     # what the ratchet knows right now
+ratchet snapshot repo              # cheap ground-truth read of the codebase
+ratchet score friction '[...]'     # rank obstacles: Leverage × Certainty × Time × Risk (1–10)
+ratchet score confidence           # three scoped layers: artifact · session · ledger health
+ratchet artifact add '{...}'       # record an artifact
+ratchet defect add '{...}'         # record a defect (also lands in the QA ledger)
+ratchet export markdown            # the full compile / handoff
+```
+
+Run `ratchet --help` for the complete surface.
+
+### State & quality verbs
+
+Every irreversible verb is gated and names its owner — there is no ungated destructive verb:
 
 | Command | Purpose |
 | --- | --- |
@@ -388,7 +247,7 @@ builder's own search method is rejected as not independent.
 | `ratchet git status-refs` | Ahead/behind vs every base ref — each one named. |
 | `ratchet doctor cold-start` | Scan for stale steering (opt-in surfaces via `.ratchet/cold-start.json`). |
 
-### The receipt — one control surface (`ratchet receipt`)
+### The receipt — one control surface
 
 `ratchet receipt` is the cockpit: one stable read a cold human or agent can parse in under a
 minute, so state never lives only in the transcript. Eight fixed sections, same order every
@@ -417,6 +276,241 @@ TARGET · DELTA · PROOF · VERDICT · RISK · AUTHORITY · STATE · NEXT
 
 ---
 
+## The MCP server (`ratchet-mcp`)
+
+`bin/ratchet-mcp` serves Torque state to any MCP client over stdio, on the modern
+`2026-07-28` revision or the legacy revisions `2025-11-25` and `2025-06-18`. Installing the
+Claude Code plugin registers it automatically; Codex and other clients register it explicitly.
+
+**A read is authority you already hold, never a path you asked for.** The surface is
+deliberately small: today it is **one tool and three read-only resources**. `workspace.open`
+is the only call that accepts a pathname — it takes a path inside a configured root and
+returns an opaque workspace handle, the repository and worktree identities, the current
+`stateRev`, and read-only resource links. Every later read names that handle in a URI
+(`torque://workspace/{handle}/{state|ledger|receipt}`) rather than re-supplying a path, so the
+server never re-interprets client input:
+
+| Guarantee | What it means |
+| --- | --- |
+| Canonical containment | Every path component is resolved through the filesystem in order, so a symlink or a `..` cannot leave the configured roots. |
+| Capability, not a name | A handle is minted only by the server, is useless on any other connection, and dies when its connection closes. |
+| Verify on use | A grant records *which object* it was issued over (device + inode). If something else later answers to that name, the read is refused, not inherited. |
+| Uniform refusal | Malformed, fabricated, revoked, closed, and cross-connection URIs all get one identical answer, so the registry cannot be used to enumerate handles. |
+
+**Roots are never inferred.** With no root flag and no `RATCHET_MCP_ROOTS`, the server
+refuses to start rather than falling back to its working directory — which is whatever the
+client happened to spawn it in, and would widen the allowlist by accident on every launch.
+An unknown argument is refused for the same reason: a `--roots` typo must not quietly become
+an empty allowlist.
+
+`--project-root` is the one exception, and it is not an exception to the rule: it reads
+`CLAUDE_PROJECT_DIR`, which an MCP host sets in a spawned server's environment to name the
+project it opened. That is the host *stating* a workspace, not this server guessing one from
+how it happened to be spawned. It refuses if the variable is unset, and the root it names
+must still be absolute — the documented `${CLAUDE_PROJECT_DIR:-.}` fallback expanding to `.`
+is rejected rather than resolved against an undocumented working directory.
+
+### Running it by hand
+
+```bash
+# stdin/stdout carry newline-delimited JSON-RPC; diagnostics go to stderr
+node bin/ratchet-mcp --root /absolute/path/to/repo
+
+# repeatable, for more than one allowed workspace
+node bin/ratchet-mcp --root /srv/work/alpha --root /srv/work/beta
+
+# or by environment, used only when no root flag is passed
+RATCHET_MCP_ROOTS="/srv/work/alpha:/srv/work/beta" node bin/ratchet-mcp
+
+# or let an MCP host name the project it opened, via CLAUDE_PROJECT_DIR
+node bin/ratchet-mcp --project-root
+```
+
+### Registering with Claude Code
+
+Installing the plugin is enough — `.claude-plugin/plugin.json` already declares the server,
+launched with the opened project as its single root, and its tools appear under `torque`.
+
+To register it directly instead (for a checkout you are developing against, or to scope it to
+one project):
+
+```bash
+claude mcp add torque --scope local -- \
+  node /absolute/path/to/torque-loop/bin/ratchet-mcp \
+  --root /absolute/path/to/allowed/repo
+
+claude mcp get torque      # -> ✔ Connected
+```
+
+Repeat `--root` to authorize more than one workspace. Use `--scope user` for every project,
+`--scope local` for this one only. The tools appear as `mcp__torque__*` once Claude Code
+reconnects.
+
+To wire it into a project you own via a checked-in `.mcp.json`:
+
+```jsonc
+// <your-project>/.mcp.json
+{
+  "mcpServers": {
+    "torque": {
+      "command": "node",
+      "args": ["/absolute/path/to/torque-loop/bin/ratchet-mcp", "--project-root"]
+    }
+  }
+}
+```
+
+`--project-root` is what makes that portable: in a project `.mcp.json`, `CLAUDE_PROJECT_DIR`
+is set in the spawned server's environment rather than substituted into `args`, so the server
+reads it there instead of trusting an expansion that may not have happened.
+
+### Registering with Codex
+
+Register the server with the exact checkout containing `bin/ratchet-mcp` and the exact
+workspace roots it may open:
+
+```bash
+codex mcp add torque -- node /absolute/path/to/torque-loop/bin/ratchet-mcp \
+  --root /absolute/path/to/allowed/repo
+
+codex mcp get torque --json
+```
+
+Repeat `--root` to authorize more than one workspace. Codex stores this configuration in
+`~/.codex/config.toml`; its app, CLI, and IDE surfaces share it.
+
+**This repo intentionally ships no root `.mcp.json`.** It is itself a plugin, and Codex treats
+a plugin's root `.mcp.json` as a bundled server config resolved inside the plugin cache — so a
+file meant for Claude Code here would be inherited by Codex installs as a server that cannot
+work. Codex also provides no documented per-session workspace substitution for a bundled
+server's arguments, so there is nothing correct to put there: `--root .` would authorize the
+plugin cache instead of the project, and omitting `--root` fails closed. Registration stays
+explicit per host, which preserves the same root boundary as a manual launch.
+
+---
+
+## Install
+
+Torque Loop has two halves: the **agent plugin** (skills/commands, agents, and Claude-only
+hooks) and the **`ratchet` CLI** (the state engine the skills call). Claude Code exposes the
+skills as `/ratchet:*` slash commands. Codex installs the same skills under the
+`torque-loop` plugin and can use them from Codex CLI or the Codex app. Any MCP client can
+reach the state through [`ratchet-mcp`](#the-mcp-server-ratchet-mcp).
+
+### Requirements
+
+- Claude Code, Codex CLI/app, or any MCP client
+- Node.js ≥ 18 (`node --version`)
+- On Windows, the bundled hooks call the CLI via `node`, so no shell-specific setup is
+  needed.
+
+### Claude Code
+
+The repo doubles as a single-plugin marketplace, so you can install it directly.
+
+```bash
+# 1. get the repo
+git clone https://github.com/Megaprompting/torque-loop.git
+
+# 2. in Claude Code, register it as a marketplace and install
+/plugin marketplace add /absolute/path/to/torque-loop
+/plugin install ratchet@torque-loop
+```
+
+Or point at the GitHub repo without cloning first:
+
+```text
+/plugin marketplace add Megaprompting/torque-loop
+/plugin install ratchet@torque-loop
+```
+
+Then reload when prompted. Verify with `/help` — you should see the `/ratchet:*` commands.
+Manage or remove later from the interactive `/plugin` menu.
+
+**Scoped to one project instead**, so teammates get it automatically when they open that
+repo — add it to the project's `.claude/settings.json`:
+
+```jsonc
+// <your-project>/.claude/settings.json
+{
+  "plugins": {
+    "marketplaces": {
+      "torque-loop": { "source": "/absolute/path/to/torque-loop" }
+    },
+    "install": ["ratchet@torque-loop"]
+  }
+}
+```
+
+Or vendor it directly inside the project and reference the local path. Either way the
+commands appear only when that project is open. (Prefer an absolute path, or a path relative
+to the settings file, so it resolves on every machine.)
+
+### Codex
+
+The repo contains a Codex marketplace manifest at `.agents/plugins/marketplace.json` and a
+Codex plugin manifest at `.codex-plugin/plugin.json`.
+
+```bash
+# 1. get the repo
+git clone https://github.com/Megaprompting/torque-loop.git
+
+# 2. register this repo as a Codex marketplace
+codex plugin marketplace add /absolute/path/to/torque-loop
+
+# 3. install the plugin from that marketplace
+codex plugin add torque-loop@torque-loop
+
+# 4. verify Codex can see it
+codex plugin list --marketplace torque-loop
+```
+
+For local development, re-run `codex plugin add torque-loop@torque-loop` after manifest
+changes, then start a new Codex thread so the refreshed skills are loaded.
+
+For the **Codex app**, register the marketplace once with the CLI (step 2 above), then open
+the app, go to **Plugins**, find **Torque Loop** under Developer Tools, and install it. The
+app and CLI share the configured marketplace source.
+
+### The `ratchet` CLI on its own (optional)
+
+Claude Code puts the bundled CLI on `PATH` while the plugin is enabled. Codex skills can
+use a globally installed `ratchet`, or you can run the bundled CLI from the plugin root.
+
+```bash
+cd torque-loop
+
+# global — puts `ratchet` on your PATH everywhere
+npm install -g .
+
+# or local dev link — symlinks the CLI while you hack on it
+npm link
+
+# or no install at all — run it in place
+node bin/ratchet --help
+```
+
+Verify:
+
+```bash
+ratchet --version      # -> ratchet 0.9.0
+ratchet init
+ratchet status
+```
+
+### State location
+
+State survives plugin updates. It is written to, in order of preference:
+
+1. `$CLAUDE_PLUGIN_DATA` — set by Claude Code for enabled plugins.
+2. `$RATCHET_DATA_DIR` — override it yourself.
+3. `~/.ratchet` — fallback.
+
+State is scoped per project (by working-directory path), so multiple repos never collide in
+one shared data directory.
+
+---
+
 ## How it works
 
 ```
@@ -428,24 +522,9 @@ bin/ratchet-evolve  →  the evolution-loop helper CLI (snapshot · score · ver
 bin/ratchet-mcp     →  the MCP server over stdio (handle-scoped reads for any MCP client)
 src/*.js            →  state, scoring, ledger, artifact indexing, snapshots, rendering
 src/evolve/*.js     →  snapshot · pressure · mutation scoring · verify runner · journal
+src/mcp/*.js        →  RPC kernel · stdio framing · containment · handles · git identity · server
 templates/*         →  copy-paste shapes for decision / artifact / defect records
 ```
-
-The skills carry the reasoning; the CLI carries the state. A skill loads context by calling
-the CLI, does its work, and writes the result back:
-
-```bash
-ratchet receipt                    # one stable resume read: target·delta·proof·seam·verdict·authority·state·next
-ratchet status                     # what the ratchet knows right now
-ratchet snapshot repo              # cheap ground-truth read of the codebase
-ratchet score friction '[...]'     # rank obstacles: Leverage × Certainty × Time × Risk (1–10)
-ratchet score confidence           # three scoped layers: artifact · session · ledger health
-ratchet artifact add '{...}'       # record an artifact
-ratchet defect add '{...}'         # record a defect (also lands in the QA ledger)
-ratchet export markdown            # the full compile / handoff
-```
-
-Run `ratchet --help` for the complete surface.
 
 ### The agents
 
@@ -472,10 +551,34 @@ Ratchet creates pressure, not surprise. The hooks never run tests or edits on th
 
 ## Development
 
+Zero runtime dependencies, zero dev dependencies, no build step — the repo runs in place on
+Node ≥ 18.
+
 ```bash
-npm test        # zero-dependency smoke test over the state engine
-npm run ratchet -- status
+npm test                              # every suite; must be green before any PR
+npm run preflight                     # the pre-PR hostile pass (see below)
+node bin/ratchet doctor               # plugin shape + state dir + repo snapshot
+node test/mcp-toctou.test.js          # or run one suite directly
+npm run ratchet -- status             # drive the CLI through npm
 ```
+
+`npm test` runs eleven zero-dependency suites in one chain:
+
+| Suite | Guards |
+| --- | --- |
+| `cli` · `evolve` · `concurrency` | the state engine, the evolution loop, and two-writer locking |
+| `plugin-shape` | the drift police — version alignment across all five fields, README ↔ skill-folder sync, PROMPTS.md wiring, template presence, MCP manifest validity |
+| `mcp-rpc` · `mcp-workspace` · `mcp-handles` | protocol era pinning, path containment, capability handles |
+| `mcp-repository` · `mcp-server` · `mcp-toctou` · `mcp-entry` | Git identity, composition, filesystem-replacement attacks, and the spawned-binary interop run |
+
+`npm run preflight` runs twelve checks before a PR — green world, version alignment,
+dependency gate, private-path leak scan, trace tags — and deliberately leaves the
+judgment-dependent ones (testless change, weakened falsifier, prose-masquerading-as-invariant,
+diff minimality) for a human to rule on. It reports; it never silently fixes.
+
+Two rules are worth knowing before you open a PR: every behavior change ships with a test
+that would fail without it, and a suite that exists but is not wired into `npm test` is a
+suite nobody runs — `plugin-shape` fails if you leave one out.
 
 ## Contributing
 
