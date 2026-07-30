@@ -22,7 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     the same file are two different capabilities.
   - Scoped to exactly one live connection: useless on another connection *even from the
     same client*, dead the instant its connection closes, and never minted by a closed
-    one. A revoked value is never reissued, so a dead capability cannot become someone
+    one. Retired values are remembered for the registry's lifetime, not just by the
+    issuing connection, so an RNG collision cannot make a dead capability become someone
     else's live one.
   - **The registry is not an existence oracle.** Unknown, malformed, wrong-typed,
     revoked, closed, and belonging-to-another-connection all raise one identical
@@ -30,12 +31,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     different, specific refusal — naming the missing authority reveals nothing you had
     not already proven.
   - Kinds are `file`, `directory`, `create-file`, `create-directory`, checked against
-    what is actually there at issue time. This is also where the trailing-separator
-    limitation from step 2.1 is answered: a "create" intent survives in the capability
-    instead of being lost in a returned pathname. Unknown kinds and unknown or empty
-    operation sets are refused at grant.
-  - A returned grant is a copy, so a holder cannot edit its own record into more
-    authority.
+    what is actually there at issue time; `file` means a regular file, not a socket, pipe,
+    or device. This is also where the trailing-separator limitation from step 2.1 is
+    answered: a nonexistent name ending in a separator may mint `create-directory`, but
+    is refused as `create-file`, so the directory assertion is not silently discarded.
+    Unknown kinds and unknown or empty operation sets are refused at grant.
+  - Requested operations are snapshotted once before validation, and connection metadata
+    is copied both when the connection opens and when a grant is returned, so getters or
+    caller mutation cannot edit a stored record into more authority.
+  - When configured roots are nested, a target binds to the most-specific containing
+    root, so workspace identity does not depend on allowlist order.
+  - Filesystem examination errors distinguish absence from an object that could not be
+    examined. Both fail closed, but the refusal no longer sends the reader to the wrong
+    cause.
   - **Boundaries named, not closed:** a handle does not eliminate the race between
     validation and use — the filesystem underneath can still change; what it removes is
     client-controlled path substitution and repeated authority interpretation at the
@@ -43,8 +51,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     not claimed as a timing-attack defence. And "handles are the *only* accepted
     workspace authority" is enforced by the tool surface that does not exist yet
     (step 2.4); what this step proves is that a raw path is not accepted *as a handle*.
-- **`test/mcp-handles.test.js` — 16-case capability suite**, written red against an
-  absent module and wired into `npm test`.
+- **`test/mcp-handles.test.js` — 25-case capability suite**, with the initial 16 written
+  red against an absent module, eight combined-boundary review falsifiers written red
+  against the interrupted `196c9e3` draft, and an explicit containment/handle seam case
+  covering both internal and escaping symlinks. Wired into `npm test`.
 - **`src/mcp/workspace.js` — the root allowlist and canonical path containment**
   (Torque MCP build-order step 2.1). The invariant, **with its boundary named**: no
   client-controlled path is accepted unless the components this module observed, as it

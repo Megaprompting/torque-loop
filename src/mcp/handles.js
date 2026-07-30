@@ -6,8 +6,9 @@
 // only by the server, only from a path that step 2.1 already judged contained,
 // and the registry entry keeps the facts established at that moment — which
 // connection asked, which workspace it belongs to, what it is, and exactly what
-// may be done with it. Downstream methods take handles and nothing else, so a
-// client never re-supplies a path and the server never re-interprets one.
+// may be done with it. Downstream workspace methods will take handles and
+// nothing else, so a client never re-supplies a path and the server never
+// re-interprets one.
 //
 // What this does NOT do: close the window between validation and use. The
 // filesystem underneath a handle can still change; what a handle removes is
@@ -32,6 +33,7 @@ const HANDLE_BYTES = 32;
 
 const KINDS = ['file', 'directory', 'create-file', 'create-directory'];
 const OPERATIONS = ['read', 'write', 'list'];
+const TRAILING_SEPARATOR = process.platform === 'win32' ? /[\\/]$/ : /\/$/;
 
 function refuse(code, message) {
   const err = new Error(message);
@@ -50,18 +52,51 @@ function mintToken() {
   return crypto.randomBytes(HANDLE_BYTES).toString('base64url');
 }
 
+function statIfPresent(target, label) {
+  try {
+    return fs.statSync(target);
+  } catch (e) {
+    if (e && (e.code === 'ENOENT' || e.code === 'ENOTDIR')) return null;
+    const code = e && e.code ? e.code : 'unknown error';
+    throw refuse('ERATCHETHANDLEKIND', `${label} could not be examined (${code})`);
+  }
+}
+
 function createRegistry({ roots }) {
   if (!roots || typeof roots.resolve !== 'function') {
     throw refuse('ERATCHETHANDLE', 'a handle registry needs the contained-path resolver to mint from');
   }
 
+  // Uniqueness belongs to the registry, not to one connection. Otherwise an
+  // RNG collision could make a token retired by connection A become live again
+  // on connection B — exactly the cross-connection substitution this boundary
+  // exists to prevent.
+  const connectionTokens = new Set();
+  const issuedHandles = new Set();
+  const issuanceTokens = new Set();
+
+  function uniqueToken(retired) {
+    let token = mintToken();
+    while (retired.has(token)) token = mintToken();
+    retired.add(token);
+    return token;
+  }
+
+  function copyClient(value) {
+    if (value === undefined) return undefined;
+    try {
+      return structuredClone(value);
+    } catch (_e) {
+      throw refuse('ERATCHETHANDLECLIENT', 'connection client metadata must be cloneable');
+    }
+  }
+
   function open(options) {
-    const id = 'conn-' + mintToken();
+    const id = 'conn-' + uniqueToken(connectionTokens);
+    // Connection identity is a fact fixed when the connection opens. Keeping a
+    // caller-owned object here would let later mutation rewrite every grant.
+    const client = copyClient(options && options.client);
     const live = new Map();
-    // Issued values are remembered after revocation so a handle is never
-    // recycled inside a connection: a dead capability stays dead rather than
-    // becoming someone else's live one.
-    const issued = new Set();
     let closed = false;
 
     function grant(request) {
@@ -69,13 +104,19 @@ function createRegistry({ roots }) {
       const req = request || {};
 
       const kind = req.kind;
+      const requestedOperations = req.operations;
+      const requestedPath = req.path;
       if (KINDS.indexOf(kind) === -1) {
         throw refuse('ERATCHETHANDLEKIND', `a handle kind must be one of: ${KINDS.join(', ')}`);
       }
-      if (!Array.isArray(req.operations) || req.operations.length === 0) {
+      if (!Array.isArray(requestedOperations) || requestedOperations.length === 0) {
         throw refuse('ERATCHETHANDLEOP', `a handle must grant at least one operation: ${OPERATIONS.join(', ')}`);
       }
-      for (const op of req.operations) {
+      // Snapshot first, then validate and store that same inert array. Reading a
+      // getter once for validation and again for storage lets the request grant
+      // more authority than the value that passed validation.
+      const operations = requestedOperations.slice();
+      for (const op of operations) {
         if (OPERATIONS.indexOf(op) === -1) {
           throw refuse('ERATCHETHANDLEOP', `unknown operation ${JSON.stringify(op)}; known: ${OPERATIONS.join(', ')}`);
         }
@@ -83,32 +124,26 @@ function createRegistry({ roots }) {
 
       // Containment first: a handle can only ever be minted from a path step
       // 2.1 accepted, so there is no second way into the workspace.
-      const target = roots.resolve(req.path);
+      const target = roots.resolve(requestedPath);
+      if (kind === 'create-file' && TRAILING_SEPARATOR.test(requestedPath)) {
+        throw refuse('ERATCHETHANDLEKIND',
+          'a path ending in a separator asserts directory, not create-file');
+      }
 
       // The kind is a claim about what is there, checked once, now — which is
       // also how a "create" intent survives into the capability instead of
       // being lost in a returned pathname.
       const wantsExisting = kind === 'file' || kind === 'directory';
-      let stat = null;
-      try {
-        stat = fs.statSync(target);
-      } catch (_e) {
-        stat = null;
-      }
+      const stat = statIfPresent(target, 'the handle target');
       if (wantsExisting) {
         if (!stat) throw refuse('ERATCHETHANDLEKIND', `nothing is there to grant a ${kind} handle over`);
-        const actual = stat.isDirectory() ? 'directory' : 'file';
+        const actual = stat.isDirectory() ? 'directory' : stat.isFile() ? 'file' : 'special filesystem object';
         if (actual !== kind) {
           throw refuse('ERATCHETHANDLEKIND', `that is a ${actual}, not a ${kind}`);
         }
       } else {
         if (stat) throw refuse('ERATCHETHANDLEKIND', `something is already there, so it cannot be created`);
-        let parent = null;
-        try {
-          parent = fs.statSync(path.dirname(target));
-        } catch (_e) {
-          parent = null;
-        }
+        const parent = statIfPresent(path.dirname(target), 'the parent directory');
         if (!parent || !parent.isDirectory()) {
           throw refuse('ERATCHETHANDLEKIND', 'the parent directory this would be created in does not exist');
         }
@@ -117,21 +152,19 @@ function createRegistry({ roots }) {
       const root = owningRoot(target);
       if (!root) throw refuse('ERATCHETPATHESCAPE', 'this path resolves outside every configured root');
 
-      let token = mintToken();
-      while (issued.has(token)) token = mintToken(); // never recycled, even by chance
-      issued.add(token);
+      const token = uniqueToken(issuedHandles);
 
       live.set(token, {
         connection: id,
-        client: options && options.client,
+        client,
         root,
         path: target,
         relative: path.relative(root, target),
         kind,
-        operations: req.operations.slice(),
+        operations,
         // Distinguishes this issuance from any other grant over the same path,
         // including a reissue after revocation.
-        issued: mintToken(),
+        issued: uniqueToken(issuanceTokens),
       });
       return token;
     }
@@ -154,7 +187,7 @@ function createRegistry({ roots }) {
       // A copy, so a holder cannot edit its own record into more authority.
       return {
         connection: entry.connection,
-        client: entry.client,
+        client: copyClient(entry.client),
         root: entry.root,
         path: entry.path,
         relative: entry.relative,
@@ -178,10 +211,13 @@ function createRegistry({ roots }) {
   }
 
   function owningRoot(target) {
+    let owner = null;
     for (const root of roots.list()) {
-      if (target === root || target.startsWith(root.endsWith(path.sep) ? root : root + path.sep)) return root;
+      const within = target === root ||
+        target.startsWith(root.endsWith(path.sep) ? root : root + path.sep);
+      if (within && (!owner || root.length > owner.length)) owner = root;
     }
-    return null;
+    return owner;
   }
 
   return { open, KINDS: KINDS.slice(), OPERATIONS: OPERATIONS.slice() };

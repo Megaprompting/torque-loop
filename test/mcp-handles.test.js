@@ -15,12 +15,16 @@
 // removes client-controlled path substitution and repeated authority
 // interpretation at the protocol boundary. The filesystem underneath can still
 // change. That boundary is named, not closed.
-// Written RED first against an absent module. Traced by: claude-fable-5
+// H1-H16 were written RED first against an absent module. H17-H24 were written
+// RED against the interrupted 196c9e3 draft during its combined-boundary review;
+// H25 exercises the resulting containment/handle seam end to end.
+// Traced by: claude-fable-5
 
 const os = require('os');
 const path = require('path');
 const fs = require('fs');
 const assert = require('assert');
+const crypto = require('crypto');
 
 const tmp = path.join(os.tmpdir(), 'ratchet-mcp-handles-test-' + process.pid);
 fs.rmSync(tmp, { recursive: true, force: true });
@@ -346,6 +350,194 @@ ok('H16 handles are per-connection, and one connection closing does not touch an
   refusesUniformly(a, ta, 'the closed connection\'s handle');
   assert.ok(b.use(tb, 'read'), 'the other connection is untouched');
   assert.notStrictEqual(a.id(), b.id(), 'connections are distinguishable');
+});
+
+ok('H17 grant snapshots requested operations before validating authority', () => {
+  const { root, registry } = world('h17');
+  const session = registry.open();
+  let reads = 0;
+  const token = session.grant({
+    path: path.join(root, 'file.txt'),
+    kind: 'file',
+    get operations() {
+      reads++;
+      return reads < 4 ? ['read'] : ['write'];
+    },
+  });
+  assert.strictEqual(reads, 1, 'authority input must be read exactly once');
+  assert.ok(session.use(token, 'read'), 'the authority that was validated must be stored');
+  let err = null;
+  try {
+    session.use(token, 'write');
+  } catch (e) {
+    err = e;
+  }
+  assert.strictEqual(err && err.code, 'ERATCHETHANDLEOP',
+    'a later getter value must not escalate the stored authority');
+});
+
+ok('H18 a retired handle value cannot become live on a later connection', () => {
+  const { root, registry } = world('h18');
+  const originalRandomBytes = crypto.randomBytes;
+  const sequence = [1, 2, 3, 4, 2, 5, 6];
+  let calls = 0;
+  crypto.randomBytes = (size) => Buffer.alloc(size, sequence[calls++] || 9);
+  try {
+    const first = registry.open();
+    const dead = first.grant({
+      path: path.join(root, 'file.txt'), kind: 'file', operations: ['read'],
+    });
+    first.close();
+
+    const second = registry.open();
+    const replacement = second.grant({
+      path: path.join(root, 'file.txt'), kind: 'file', operations: ['read'],
+    });
+    assert.notStrictEqual(replacement, dead,
+      'a collision with any retired handle in the registry must be retried');
+    refusesUniformly(second, dead, 'a retired value after a collision on a later connection');
+  } finally {
+    crypto.randomBytes = originalRandomBytes;
+  }
+});
+
+ok('H19 a nested target binds to the most-specific configured workspace root', () => {
+  const { root } = world('h19');
+  const nested = path.join(root, 'dir');
+  const registry = handles.createRegistry({ roots: workspace.createRoots([root, nested]) });
+  const session = registry.open();
+  const token = session.grant({
+    path: path.join(nested, 'new.txt'), kind: 'create-file', operations: ['write'],
+  });
+  assert.strictEqual(session.use(token, 'write').root, fs.realpathSync.native(nested),
+    'workspace identity must not depend on configured-root order');
+});
+
+ok('H20 connection metadata is snapshotted when the connection opens', () => {
+  const { root, registry } = world('h20');
+  const client = { identity: { name: 'original' } };
+  const session = registry.open({ client });
+  client.identity.name = 'mutated-after-open';
+  const token = session.grant({
+    path: path.join(root, 'file.txt'), kind: 'file', operations: ['read'],
+  });
+  assert.strictEqual(session.use(token, 'read').client.identity.name, 'original',
+    'later caller mutation must not rewrite connection identity');
+});
+
+ok('H21 returned connection metadata is a copy, not the registry record', () => {
+  const { root, registry } = world('h21');
+  const session = registry.open({ client: { identity: { name: 'original' } } });
+  const token = session.grant({
+    path: path.join(root, 'file.txt'), kind: 'file', operations: ['read'],
+  });
+  const grant = session.use(token, 'read');
+  grant.client.identity.name = 'mutated-through-return';
+  assert.strictEqual(session.use(token, 'read').client.identity.name, 'original',
+    'mutating a returned grant must not rewrite nested registry state');
+});
+
+ok('H22 typed create handles preserve a trailing separator directory assertion', () => {
+  const { root, registry } = world('h22');
+  const session = registry.open();
+  const target = path.join(root, 'dir', 'new-entry') + path.sep;
+  let err = null;
+  try {
+    session.grant({ path: target, kind: 'create-file', operations: ['write'] });
+  } catch (e) {
+    err = e;
+  }
+  assert.strictEqual(err && err.code, 'ERATCHETHANDLEKIND',
+    'a trailing separator must not silently become create-file authority');
+
+  const directory = session.grant({
+    path: target, kind: 'create-directory', operations: ['write'],
+  });
+  assert.strictEqual(session.use(directory, 'write').kind, 'create-directory',
+    'the matching typed directory intent remains usable');
+});
+
+ok('H23 file handles are only issued for regular files', () => {
+  const { root, registry } = world('h23');
+  const session = registry.open();
+  const target = fs.realpathSync.native(path.join(root, 'file.txt'));
+  const originalStatSync = fs.statSync;
+  fs.statSync = (candidate, ...args) => {
+    if (candidate === target) {
+      return { isDirectory: () => false, isFile: () => false };
+    }
+    return originalStatSync(candidate, ...args);
+  };
+  try {
+    let err = null;
+    try {
+      session.grant({ path: target, kind: 'file', operations: ['read'] });
+    } catch (e) {
+      err = e;
+    }
+    assert.strictEqual(err && err.code, 'ERATCHETHANDLEKIND',
+      'a socket, pipe, device, or other special object must not be called a file');
+  } finally {
+    fs.statSync = originalStatSync;
+  }
+});
+
+ok('H24 an unexaminable target is not reported as absent', () => {
+  const { root, registry } = world('h24');
+  const session = registry.open();
+  const target = fs.realpathSync.native(path.join(root, 'file.txt'));
+  const originalStatSync = fs.statSync;
+  fs.statSync = (candidate, ...args) => {
+    if (candidate === target) {
+      const err = new Error('denied for test');
+      err.code = 'EACCES';
+      throw err;
+    }
+    return originalStatSync(candidate, ...args);
+  };
+  try {
+    let err = null;
+    try {
+      session.grant({ path: target, kind: 'file', operations: ['read'] });
+    } catch (e) {
+      err = e;
+    }
+    assert.strictEqual(err && err.code, 'ERATCHETHANDLEKIND');
+    assert.match(err.message, /could not be examined.*EACCES/,
+      'the refusal must distinguish unreadable from nonexistent');
+  } finally {
+    fs.statSync = originalStatSync;
+  }
+});
+
+ok('H25 handle minting follows internal links but cannot cross a root through one', () => {
+  const { root, outside, registry } = world('h25');
+  const session = registry.open();
+  const internalDir = path.join(root, 'real-dir');
+  fs.mkdirSync(internalDir, { recursive: true });
+  fs.writeFileSync(path.join(internalDir, 'inside.txt'), 'yours', 'utf8');
+  const internalLink = path.join(root, 'internal-link');
+  const escapingLink = path.join(root, 'escaping-link');
+  fs.symlinkSync(internalDir, internalLink, 'junction');
+  fs.symlinkSync(outside, escapingLink, 'junction');
+
+  const internal = session.grant({
+    path: path.join(internalLink, 'inside.txt'), kind: 'file', operations: ['read'],
+  });
+  assert.strictEqual(session.use(internal, 'read').path,
+    fs.realpathSync.native(path.join(internalDir, 'inside.txt')),
+    'an internal link is canonicalized and remains usable');
+
+  let err = null;
+  try {
+    session.grant({
+      path: path.join(escapingLink, 'secret.txt'), kind: 'file', operations: ['read'],
+    });
+  } catch (e) {
+    err = e;
+  }
+  assert.strictEqual(err && err.code, 'ERATCHETPATHESCAPE',
+    'the registry must preserve the resolver rejection for an indirect escape');
 });
 
 fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
