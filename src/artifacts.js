@@ -5,6 +5,7 @@ const schemas = require('./schemas');
 const scoring = require('./scoring');
 const lifecycle = require('./lifecycle');
 const journal = require('./evolve/journal');
+const wal = require('./wal');
 
 // A domain refusal both boundaries must tell apart from damage carries a code:
 // the CLI prints the message, the MCP funnel maps the code to its one
@@ -212,14 +213,53 @@ function resolveAttachment(cwd, s, item) {
   const live = lifecycle.liveArtifacts(s);
   if (live.length === 1) return { artifact: live[0].id, attachedBy: 'auto' };
   if (live.length === 0) return { artifact: '', attachedBy: 'none' };
-  throw new Error(
+  throw coded(
+    'ERATCHETATTACH',
     `${live.length} live artifacts (${live.map((a) => `${a.id} "${a.title}"`).join(', ')}) — name the one this ` +
       'defect attacks with "artifact": "<id>". An unattached defect drains every artifact and blocks closure for all of them.'
   );
 }
 
-function addDefect(cwd, item, { alsoLedger = true } = {}) {
-  const s = state.loadState(cwd);
+// Ledger mirror ids are collision-checked against the ledger they will enter —
+// the derived-id rule extends over the mirror collections (4b spec).
+function mintLedgerId(ledger, mintId) {
+  const id = mintId(schemas.LEDGER_COLLECTIONS.defects, 'ledger');
+  if ((ledger.defects || []).some((x) => x && x.id === id)) {
+    throw coded('ERATCHETIDCONFLICT', `derived ledger id ${id} already names a record`);
+  }
+  return id;
+}
+
+// The mirror op for a defect that already lives in state. Exactly one linked
+// mirror → replace it in place. Anything else — no link, a link to nothing, a
+// duplicated id — is the D2b admission: mint a complete mirror from the
+// post-transition defect, back-link it in the SAME state post-image, and leave
+// every old row untouched; admission never guesses which row to overwrite.
+function mirrorOpFor(ledger, defect, now, mintId) {
+  const linked = String(defect.ledgerId || '');
+  const matches = linked ? (ledger.defects || []).filter((x) => x && x.id === linked) : [];
+  if (matches.length === 1) {
+    const after = { ...matches[0], severity: defect.severity, updatedAt: now };
+    return { collection: 'defects', id: linked, mode: 'replace', after };
+  }
+  const mirror = {
+    id: mintLedgerId(ledger, mintId),
+    at: now,
+    feature: '',
+    severity: defect.severity,
+    summary: defect.summary,
+    status: defect.status || 'open',
+    foundAt: defect.at || now,
+  };
+  defect.ledgerId = mirror.id;
+  return { collection: 'defects', id: mirror.id, mode: 'insert', after: mirror };
+}
+
+// The 4b defect.add core, shared by the CLI and MCP doors: mutates the open
+// transaction's state and returns MATERIALIZED mirror ops — ids, timestamps
+// and post-images final before any intent publishes. `ledger` is null only on
+// the alsoLedger:false path, which writes one file and owes no mirror.
+function prepareDefectAdd(cwd, s, ledger, item, mintId) {
   const now = schemas.nowIso();
   const sev = (item.severity || 'medium').toLowerCase();
   const severity = schemas.SEVERITIES.includes(sev) ? sev : 'medium';
@@ -236,33 +276,28 @@ function addDefect(cwd, item, { alsoLedger = true } = {}) {
 
   // The same finding reported twice is one defect, not two drains. Match on the
   // pair that identifies it — which artifact, and what it says — while it is
-  // still live. A repeat that is worse escalates the record in place.
+  // still live. A repeat that is worse escalates the record in place; a repeat
+  // that is not is a no-op decided BEFORE any intent exists.
   const key = summary.trim().toLowerCase();
   const dup = (s.defects || []).find(
     (d) => d && scoring.isDefectOpen(d) && String(d.artifact || '') === artifact && String(d.summary || '').trim().toLowerCase() === key
   );
   if (dup) {
     const from = dup.severity;
-    if (schemas.SEVERITIES.indexOf(severity) < schemas.SEVERITIES.indexOf(from)) {
-      dup.severity = severity;
-      dup.log = Array.isArray(dup.log) ? dup.log : [];
-      dup.log.push({ at: now, from, to: severity, note: 'severity escalated by a repeat report' });
-      s.dirty = true;
-      s.history.push({ id: state.makeId('hist'), at: now, event: 'defect.escalated', note: `${dup.id}: ${from} → ${severity}` });
-      state.saveState(cwd, s);
-      if (dup.ledgerId) {
-        try {
-          require('./ledger').upsert(cwd, 'defects', { id: dup.ledgerId, severity }, { via: 'transition' });
-        } catch (_e) {
-          /* ledger sync is best-effort */
-        }
-      }
+    if (schemas.SEVERITIES.indexOf(severity) >= schemas.SEVERITIES.indexOf(from)) {
+      return { kind: 'noop', action: 'deduped', record: dup, result: { state: dup, ledger: null, deduped: true } };
     }
-    return { state: dup, ledger: null, deduped: true };
+    dup.severity = severity;
+    dup.log = Array.isArray(dup.log) ? dup.log : [];
+    dup.log.push({ at: now, from, to: severity, note: 'severity escalated by a repeat report' });
+    s.dirty = true;
+    s.history.push({ id: mintId('hist', 'history'), at: now, event: 'defect.escalated', note: `${dup.id}: ${from} → ${severity}` });
+    const ledgerOps = ledger ? [mirrorOpFor(ledger, dup, now, mintId)] : [];
+    return { kind: 'commit', action: 'escalated', record: dup, ledgerOps, result: { state: dup, ledger: null, deduped: true } };
   }
 
   const record = {
-    id: item.id || state.makeId('def'),
+    id: item.id || mintId('def', 'record'),
     at: now,
     severity,
     summary,
@@ -290,27 +325,50 @@ function addDefect(cwd, item, { alsoLedger = true } = {}) {
       record.attachError = e && e.message ? e.message : String(e);
     }
   }
-  s.defects.push(record);
-  s.dirty = true;
-  s.history.push({ id: state.makeId('hist'), at: now, event: 'defect.add', note: `[${record.severity}] ${record.summary}` });
-  state.saveState(cwd, s);
-
-  let ledgerRecord = null;
-  if (alsoLedger) {
-    const ledger = require('./ledger');
-    ledgerRecord = ledger.upsert(cwd, 'defects', {
+  let mirror = null;
+  const ledgerOps = [];
+  if (ledger) {
+    mirror = {
+      id: mintLedgerId(ledger, mintId),
+      at: now,
       feature: item.feature || '',
       severity: record.severity,
       summary: record.summary,
       status: record.status,
       foundAt: now,
-    }, { via: 'transition' }).item;
-    // Link the state defect to its ledger mirror so lifecycle transitions can
-    // keep both surfaces honest instead of letting the ledger silently drift.
-    record.ledgerId = ledgerRecord.id;
-    state.saveState(cwd, s);
+    };
+    // The back-link rides the SAME post-image as the defect — the old second
+    // state save (and its crash window) is what 4b exists to remove.
+    record.ledgerId = mirror.id;
+    ledgerOps.push({ collection: 'defects', id: mirror.id, mode: 'insert', after: mirror });
   }
-  return { state: record, ledger: ledgerRecord };
+  s.defects.push(record);
+  s.dirty = true;
+  s.history.push({ id: mintId('hist', 'history'), at: now, event: 'defect.add', note: `[${record.severity}] ${record.summary}` });
+  return { kind: 'commit', action: 'created', record, ledgerOps, result: { state: record, ledger: mirror } };
+}
+
+function addDefect(cwd, item, { alsoLedger = true } = {}) {
+  if (!alsoLedger) {
+    // One canonical file — the ordinary boundary; no mirror, no intent.
+    return state.withWorkspaceMutation(cwd, { action: 'defect add' }, (s) =>
+      prepareDefectAdd(cwd, s, null, item, (prefix) => state.makeId(prefix)).result
+    ).result;
+  }
+  // The CLI door of the 4b protocol. The operation id is an internal WAL id
+  // and the args hash a diagnostic — a repeated CLI command is made safe by
+  // recovery plus the dedup no-op, never by pretending it has the old id.
+  return state.withMirroredMutation(cwd, {
+    action: 'defect add',
+    door: 'cli',
+    tool: 'defect add',
+    operationId: state.makeId('wal'),
+    argsHash: wal.hashBytes(Buffer.from(JSON.stringify(item === undefined ? null : item), 'utf8')),
+  }, (s, ledger) => {
+    const prep = prepareDefectAdd(cwd, s, ledger, item, (prefix) => state.makeId(prefix));
+    if (prep.kind === 'noop') return { kind: 'noop', result: prep.result };
+    return { kind: 'commit', ledgerOps: prep.ledgerOps, result: prep.result };
+  }).result;
 }
 
 // Move a defect through its lifecycle: open/patched/reopened → resolved | waived
@@ -537,6 +595,7 @@ function applyClose(cwd, s, id, opts, mintId) {
 module.exports = {
   addArtifact,
   addDefect,
+  prepareDefectAdd,
   transitionDefect,
   retractArtifact,
   assertArtifactInput,

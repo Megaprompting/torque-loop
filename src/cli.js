@@ -459,7 +459,9 @@ function cmdDefect(cwd, argv, asJson) {
   switch (sub) {
     case 'add': {
       const payload = readPayload(positionals[2]);
-      const rec = mutate(cwd, 'defect add', () => artifacts.addDefect(cwd, payload));
+      // No outer transaction: addDefect owns the 4b mirrored boundary (state +
+      // ledger behind one write-ahead intent), and a boundary cannot nest.
+      const rec = artifacts.addDefect(cwd, payload);
       return out(`defect ${rec.state.id} added: [${rec.state.severity}] ${rec.state.summary}`);
     }
     case 'list': {
@@ -816,6 +818,27 @@ function cmdDoctor(cwd, asJson) {
     stateDetail = e.message;
   }
   add('state dir writable', stateOk, stateDetail);
+
+  // 4b WAL slot — read-only diagnosis, never a repair. A recoverable slot is
+  // informational (any supported write recovers it on its way in); a slot
+  // strict recovery cannot prove legal is the operator's, by name.
+  try {
+    const slot = state.diagnoseIntent(cwd);
+    if (!slot.pending) add('WAL intent slot', true, 'no pending intent');
+    else if (slot.verdict === 'ambiguous') {
+      add('WAL intent slot', false,
+        `${slot.reason} Do not delete the slot blindly — repair the named condition; recovery clears it.`);
+    } else {
+      const meaning = {
+        discarded: 'discardable — the state decision never published',
+        completed: 'mirror owed — the next supported write completes it',
+        cleared: 'clearable — the mirror already landed',
+      };
+      add('WAL intent slot', true, `pending intent, ${meaning[slot.verdict] || slot.verdict}`);
+    }
+  } catch (e) {
+    add('WAL intent slot', false, e.message);
+  }
 
   let snapOk = true;
   let snapDetail = '';

@@ -7,6 +7,7 @@ const crypto = require('crypto');
 const { isDeepStrictEqual } = require('util');
 
 const schemas = require('./schemas');
+const wal = require('./wal');
 
 // ---------------------------------------------------------------------------
 // Location. State survives plugin updates when CLAUDE_PLUGIN_DATA is set.
@@ -145,6 +146,11 @@ function ledgerPath(cwd) {
   return path.join(projectDir(cwd), 'ledger.json');
 }
 
+// The 4b write-ahead intent slot. One per store, beside the records it binds.
+function intentPath(cwd) {
+  return path.join(projectDir(cwd), 'intent.json');
+}
+
 function ensureDir(dir) {
   fs.mkdirSync(dir, { recursive: true });
 }
@@ -190,8 +196,25 @@ function writeFileAtomic(file, data, beforePublish) {
     }
     fs.closeSync(fd);
     fd = undefined;
-    if (beforePublish) beforePublish();
-    fs.renameSync(tmp, file);
+    // Windows can refuse a rename over a destination some other process holds
+    // open for an instant (an indexer, a scanner, a reader mid-poll) — EPERM
+    // on a publish that would succeed 10ms later. Retry briefly, re-running
+    // the fence each attempt so a holding broken in the window still refuses;
+    // a persistent refusal still throws, it is never swallowed.
+    let publishError = null;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        if (beforePublish) beforePublish();
+        fs.renameSync(tmp, file);
+        publishError = null;
+        break;
+      } catch (renameError) {
+        if (!renameError || (renameError.code !== 'EPERM' && renameError.code !== 'EACCES')) throw renameError;
+        publishError = renameError;
+        sleepSync(10);
+      }
+    }
+    if (publishError) throw publishError;
   } catch (e) {
     // A half-written temp file is residue, not a record. Name it, then drop it.
     if (fd !== undefined) {
@@ -693,6 +716,77 @@ function assertLockOrder(what) {
   }
 }
 
+// 4b: the recovery choke point. Every supported canonical writer reaches the
+// store through one of the two lock APIs below, so recovery lives HERE — in
+// the shared post-acquire path — not in each caller. A nested helper joins a
+// scope that has already recovered; the re-entry guard keeps recovery's own
+// strict reads and fenced publishes from recursing into a second recovery.
+// An occupied slot recovery cannot prove legal throws ERATCHETMIRROR: no
+// writer proceeds over a store whose mirror cannot be made truthful, and the
+// refusal moves zero bytes (spec: 4b WAL design, ratified 2026-07-31).
+let _recovering = false;
+
+function recoverPendingIntentLocked(cwd) {
+  if (_recovering) return;
+  const file = intentPath(cwd);
+  // One stat per acquisition is the whole fast-path cost.
+  if (!fs.existsSync(file)) return;
+  _recovering = true;
+  try {
+    wal.recover({
+      intentFile: file,
+      statePath: statePath(cwd),
+      ledgerPath: ledgerPath(cwd),
+      publishLedger: (bytes) => writeFileAtomic(ledgerPath(cwd), bytes, () => fenceForFile(ledgerPath(cwd))),
+      clearIntent: () => {
+        fenceForFile(file);
+        fs.unlinkSync(file);
+      },
+      validateMcpReceipt: validateMirrorReceipt,
+    });
+  } finally {
+    _recovering = false;
+  }
+}
+
+// An MCP state after-image must carry exactly the receipt its intent names —
+// an after-hash match with a missing or contradicting receipt is a store this
+// build cannot explain. CLI intents carry no receipt; the exact state hash is
+// their evidence.
+function validateMirrorReceipt(stateObj, intent) {
+  if (intent.door !== 'mcp') return true;
+  const ring = Array.isArray(stateObj.operations) ? stateObj.operations : [];
+  const hits = ring.filter((e) => e && e.id === intent.operationId);
+  if (hits.length !== 1) return false;
+  const hit = hits[0];
+  return (
+    hit.argsHash === intent.argsHash &&
+    String(hit.gen || '') === intent.stateGen &&
+    hit.rev === intent.targetStateRev &&
+    Boolean(hit.result) && typeof hit.result === 'object' && hit.result.ok === true
+  );
+}
+
+// Read-only 4b diagnosis for doctor and tests: what recovery WOULD do with the
+// slot, or the exact local reason it refuses. Never publishes, clears, backs
+// up, or repairs — the lock-free read is safe because it moves nothing.
+function diagnoseIntent(cwd) {
+  try {
+    const res = wal.recover({
+      intentFile: intentPath(cwd),
+      statePath: statePath(cwd),
+      ledgerPath: ledgerPath(cwd),
+      publishLedger: () => {},
+      clearIntent: () => {},
+      validateMcpReceipt: validateMirrorReceipt,
+    }, { dryRun: true });
+    return res.pending ? { pending: true, verdict: res.verdict } : { pending: false };
+  } catch (e) {
+    if (e && e.code === 'ERATCHETMIRROR') return { pending: true, verdict: 'ambiguous', reason: e.message };
+    throw e;
+  }
+}
+
 // Lock a store directory for the duration of fn. Use this for a public command
 // whose write is not a state.json revision (ledger upserts, the init/reset wipe)
 // — everything that revises state goes through withWorkspaceMutation below.
@@ -708,6 +802,7 @@ function withWorkspaceLock(cwd, action, fn) {
   const handle = acquireLock(path.join(dir, LOCK_DIR_NAME), action);
   _scope = { dir, action, state: null, handle };
   try {
+    recoverPendingIntentLocked(cwd);
     return fn();
   } finally {
     _scope = null;
@@ -1237,6 +1332,7 @@ function withWorkspaceMutation(cwd, opts, mutate) {
   const handle = acquireLock(path.join(dir, LOCK_DIR_NAME), action);
   _scope = { dir, action, state: null, handle };
   try {
+    recoverPendingIntentLocked(cwd);
     // The second lock, if the verb asked for one, wraps everything below —
     // validation AND commit — and is released by withFileLock's own finally.
     return o.alsoLockFile
@@ -1292,6 +1388,145 @@ function runMutation(cwd, o, action, mutate) {
   }
 }
 
+// THE cross-file transaction boundary (4b). One operation writes state.json
+// AND ledger.json behind one write-ahead intent: recover → prepare in memory →
+// materialize exact post-image bytes → publish the intent create-exclusive →
+// commit state (the decision) → publish the mirror → clear the slot. A death
+// anywhere leaves one of the three legal hash pairs, and the next supported
+// writer's recovery finishes or discards the work — never half-keeps it.
+//
+// `prepare(s, ledger)` mutates the transaction's state object like any verb
+// and returns:
+//   null / { kind: 'skip' }            — zero writes (refusal carried by the caller)
+//   { kind: 'noop', result }           — zero writes, an idempotent answer
+//   { kind: 'commit', ledgerOps, result } — the full protocol
+// Both records are STRICTLY loaded: present-but-unprovable bytes refuse
+// (ERATCHETMIRROR) instead of meeting the repairing loaders — a WAL that
+// hashes bytes cannot stand on a loader that rewrites them.
+function withMirroredMutation(cwd, opts, prepare) {
+  const o = opts || {};
+  const action = o.action || 'mirrored mutation';
+  if (_scope) {
+    throw new Error(
+      `nested workspace mutation refused: "${action}" inside "${_scope.action}" — one public command is one ` +
+        'transaction, and helpers mutate the open transaction instead of opening their own.'
+    );
+  }
+  assertMayWrite(action);
+  const dir = projectDir(cwd);
+  assertLockOrder(action);
+  const handle = acquireLock(path.join(dir, LOCK_DIR_NAME), action);
+  _scope = { dir, action, state: null, handle };
+  try {
+    recoverPendingIntentLocked(cwd);
+    return runMirrored(cwd, o, action, prepare);
+  } finally {
+    _scope = null;
+    releaseLock(handle);
+  }
+}
+
+// Strict in-scope read for the WAL path: exact bytes plus their parse, with an
+// ENOENT escape the caller may answer by creating the record (a first CLI
+// defect on a fresh store must still work). Never a backup, never a repair.
+function readForMirror(file, what) {
+  let bytes;
+  try {
+    bytes = fs.readFileSync(file);
+  } catch (e) {
+    if (e && e.code === 'ENOENT') return null;
+    const err = new Error(`${what} exists but cannot be read strictly (${e && e.code ? e.code : 'unknown'})`);
+    err.code = 'ERATCHETMIRROR';
+    throw err;
+  }
+  try {
+    const parsed = JSON.parse(bytes.toString('utf8'));
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not a record');
+    return { bytes, parsed };
+  } catch (_e) {
+    const err = new Error(`${what} is present but not a readable record — repair it before a mirrored write`);
+    err.code = 'ERATCHETMIRROR';
+    throw err;
+  }
+}
+
+function runMirrored(cwd, o, action, prepare) {
+  // Absent records are created through the ordinary boundaries (that is a
+  // plain single-file write), then re-read strictly so the hashes cover the
+  // exact bytes on disk.
+  if (!fs.existsSync(statePath(cwd))) loadState(cwd);
+  if (!fs.existsSync(ledgerPath(cwd))) loadLedger(cwd);
+  const stateRead = readForMirror(statePath(cwd), 'state record');
+  const ledgerRead = readForMirror(ledgerPath(cwd), 'ledger record');
+  if (!stateRead || !ledgerRead) {
+    const err = new Error('canonical record vanished inside the transaction');
+    err.code = 'ERATCHETMIRROR';
+    throw err;
+  }
+  const s = rememberBase(cwd, stateRead.parsed);
+  const baseRev = revOf(s);
+  _scope.state = s;
+  const prep = prepare(s, ledgerRead.parsed);
+  _scope.state = null;
+  if (!prep || prep.kind === 'skip') return { committed: false, rev: baseRev, state: s, result: prep && prep.result };
+  if (prep.kind === 'noop') return { committed: false, rev: baseRev, state: s, result: prep.result };
+
+  // MATERIALIZE once: every stamp is final before the intent publishes, and
+  // the hashes cover the exact bytes both publishes will write.
+  assertStillOwner(cwd, `state rev ${baseRev + 1}`);
+  const now = schemas.nowIso();
+  s.updatedAt = now;
+  s.rev = baseRev + 1;
+  const stateAfterBytes = wal.serializeRecord(s);
+  const ledgerAfter = wal.applyLedgerOps(ledgerRead.parsed, prep.ledgerOps, now);
+  const ledgerAfterBytes = wal.serializeRecord(ledgerAfter);
+  const intent = {
+    version: 1,
+    door: o.door,
+    operationId: o.operationId,
+    tool: o.tool || action,
+    argsHash: o.argsHash,
+    stateGen: String(s.gen || '') || '(none)',
+    baseStateRev: baseRev,
+    targetStateRev: baseRev + 1,
+    stateBeforeHash: wal.hashBytes(stateRead.bytes),
+    stateAfterHash: wal.hashBytes(stateAfterBytes),
+    ledgerBeforeHash: wal.hashBytes(ledgerRead.bytes),
+    ledgerAfterHash: wal.hashBytes(ledgerAfterBytes),
+    ledgerUpdatedAt: now,
+    ledgerOps: prep.ledgerOps,
+    at: now,
+  };
+  // Self-check: the slot we publish must be one our own recovery accepts —
+  // cap included. Failing closed here costs nothing; failing open costs a
+  // store nobody can recover.
+  wal.parseIntent(Buffer.from(wal.serializeRecord(intent), 'utf8'));
+  if (!createJsonExclusive(intentPath(cwd), intent)) {
+    const err = new Error('the intent slot is occupied — recovery should have resolved it; refusing to overwrite');
+    err.code = 'ERATCHETMIRROR';
+    throw err;
+  }
+
+  // THE decision: the exact hashed state bytes, one rename.
+  writeFileAtomic(statePath(cwd), stateAfterBytes, () => fenceForFile(statePath(cwd)));
+  rememberBase(cwd, s);
+
+  // Post-decision: a failure here leaves the slot for the next writer's
+  // recovery. The operation HAS happened; only the answer must say "pending".
+  try {
+    writeFileAtomic(ledgerPath(cwd), ledgerAfterBytes, () => fenceForFile(ledgerPath(cwd)));
+    fenceForFile(intentPath(cwd));
+    fs.unlinkSync(intentPath(cwd));
+  } catch (e) {
+    const err = new Error(
+      `the state change committed (rev ${s.rev}) but the mirror is pending recovery — re-run the command: ${e && e.message}`
+    );
+    err.code = 'ERATCHETMIRRORPENDING';
+    throw err;
+  }
+  return { committed: true, rev: s.rev, state: s, result: prep.result };
+}
+
 function loadLedger(cwd) {
   const existing = readJsonResilient(ledgerPath(cwd));
   if (existing) return existing;
@@ -1340,6 +1575,7 @@ module.exports = {
   projectDir,
   statePath,
   ledgerPath,
+  intentPath,
   ensureDir,
   readJson,
   writeJson,
@@ -1350,7 +1586,9 @@ module.exports = {
   saveState,
   withWorkspaceLock,
   withWorkspaceMutation,
+  withMirroredMutation,
   withFileLock,
+  diagnoseIntent,
   loadLedger,
   saveLedger,
   makeId,
