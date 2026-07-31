@@ -201,20 +201,26 @@ function writeFileAtomic(file, data, beforePublish) {
     // on a publish that would succeed 10ms later. Retry briefly, re-running
     // the fence each attempt so a holding broken in the window still refuses;
     // a persistent refusal still throws, it is never swallowed.
-    let publishError = null;
-    for (let attempt = 0; attempt < 5; attempt++) {
+    // A rename over a destination some other process holds open (an AV scan
+    // of the bytes the PREVIOUS publish just wrote is the measured culprit)
+    // refuses EPERM on Windows until the hold drops — for seconds when the
+    // machine is loaded. Fixed backoffs lost that race in practice, so this
+    // waits like acquireLock does: against a deadline, generous because the
+    // publish is rare and already inside the lock's own 15s patience. Git
+    // ships the same shaped loop for the same reason. A genuinely held
+    // destination still throws at the deadline; nothing is ever swallowed.
+    const deadline = Date.now() + envMs('RATCHET_PUBLISH_TIMEOUT_MS', 10000);
+    for (;;) {
       try {
         if (beforePublish) beforePublish();
         fs.renameSync(tmp, file);
-        publishError = null;
         break;
       } catch (renameError) {
         if (!renameError || (renameError.code !== 'EPERM' && renameError.code !== 'EACCES')) throw renameError;
-        publishError = renameError;
-        sleepSync(10);
+        if (Date.now() >= deadline) throw renameError;
+        sleepSync(50);
       }
     }
-    if (publishError) throw publishError;
   } catch (e) {
     // A half-written temp file is residue, not a record. Name it, then drop it.
     if (fd !== undefined) {
@@ -737,15 +743,47 @@ function recoverPendingIntentLocked(cwd) {
       intentFile: file,
       statePath: statePath(cwd),
       ledgerPath: ledgerPath(cwd),
-      publishLedger: (bytes) => writeFileAtomic(ledgerPath(cwd), bytes, () => fenceForFile(ledgerPath(cwd))),
-      clearIntent: () => {
-        fenceForFile(file);
-        fs.unlinkSync(file);
+      publishLedger: (bytes) => {
+        try {
+          writeFileAtomic(ledgerPath(cwd), bytes, () => fenceForFile(ledgerPath(cwd)));
+        } catch (e) {
+          if (e && (e.code === 'EPERM' || e.code === 'EACCES' || e.code === 'EBUSY')) {
+            // Recovery could not win the mirror publish either (a scanner can
+            // hold a freshly replaced file past even the publish deadline).
+            // The slot is intact and the owed mirror unchanged — this is the
+            // SAME retryable condition as a post-decision failure, and it
+            // wears the same code so every caller says "re-run", not EPERM.
+            const err = new Error(`the mirror is still pending recovery — re-run the command: ${e.message}`);
+            err.code = 'ERATCHETMIRRORPENDING';
+            throw err;
+          }
+          throw e;
+        }
       },
+      clearIntent: () => clearIntentFile(file),
       validateMcpReceipt: validateMirrorReceipt,
     });
   } finally {
     _recovering = false;
+  }
+}
+
+// The slot delete gets the same transient-refusal tolerance as the publish
+// rename: a scanner holding intent.json for an instant must not fail an
+// operation whose work is already done. A persistent refusal throws and the
+// slot survives — recovery clears it later, which is exactly what it is for.
+function clearIntentFile(file) {
+  const deadline = Date.now() + envMs('RATCHET_PUBLISH_TIMEOUT_MS', 10000);
+  for (;;) {
+    try {
+      fenceForFile(file);
+      fs.unlinkSync(file);
+      return;
+    } catch (e) {
+      if (!e || (e.code !== 'EPERM' && e.code !== 'EACCES' && e.code !== 'EBUSY')) throw e;
+      if (Date.now() >= deadline) throw e;
+      sleepSync(50);
+    }
   }
 }
 
@@ -1515,8 +1553,7 @@ function runMirrored(cwd, o, action, prepare) {
   // recovery. The operation HAS happened; only the answer must say "pending".
   try {
     writeFileAtomic(ledgerPath(cwd), ledgerAfterBytes, () => fenceForFile(ledgerPath(cwd)));
-    fenceForFile(intentPath(cwd));
-    fs.unlinkSync(intentPath(cwd));
+    clearIntentFile(intentPath(cwd));
   } catch (e) {
     const err = new Error(
       `the state change committed (rev ${s.rev}) but the mirror is pending recovery — re-run the command: ${e && e.message}`

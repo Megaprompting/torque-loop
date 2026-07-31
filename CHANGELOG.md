@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Known limitation (parked, owner: Danny): a host-environment hold can stall the
+  mirror publish.** On the development host, replacing a freshly written `ledger.json`
+  intermittently refuses `EPERM` for longer than any bounded retry we ship (measured:
+  the source tmp stays movable, the destination opens `r+`, the replace alone refuses —
+  a holder sharing read/write but not delete; ~1–3% of operations, only under sustained
+  machine load, never reproduced by isolated probes). The canonical publish now waits
+  against a deadline (`RATCHET_PUBLISH_TIMEOUT_MS`, default 10s, the same shape git
+  ships for Windows renames), recovery's own mirror publish wears the same retryable
+  `ERATCHETMIRRORPENDING` code instead of leaking raw `EPERM`, and both doors answer
+  "re-run the command" — which provably converges (the WAL suite's M4, and its settled
+  harness). What is NOT claimed: that a single call always succeeds on such a host.
+  Diagnosing the holder needs OS-level tooling (handle enumeration), which is an
+  operator investigation, not a code path.
+
+<!-- Traced by: claude-fable-5 -->
+
 - **The defect transitions ride the slot — the mirror stops being best-effort.** Step
   4b.2: `defect.resolve`, `defect.reopen`, `defect.supersede` join the wire (18-tool
   `--write` roster), and every transition on BOTH doors — the CLI-only `defect waive`
