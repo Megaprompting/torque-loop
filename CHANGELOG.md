@@ -9,6 +9,94 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The artifact verbs and the read that writes — the safe core is complete.** Step 4.3
+  of the ratified write-tools design: `artifact.add`, `artifact.close`,
+  `artifact.retract` and `score.aperture` complete the ten-tool `--write` roster, each a
+  thin boundary over the same domain mutation the CLI runs — `artifact add`/`retract`
+  split into transaction-shaped cores (`src/artifacts.js`), the closure gate moved there
+  from the CLI router, and the aperture fog write moved to `src/verbs.js`, all shared by
+  both doors. The lifecycle gates the CLI earned hold unchanged on the wire
+  (**MCP-boundary enforced** where the rule is static, domain-refused where it needs the
+  record): terminal statuses and reserved lifecycle fields refuse at the boundary; an
+  identical revision is a no-op that costs no revision and invalidates no proof; a close
+  is earned only by a KEEP bound to the exact revision and hash, inside one transaction
+  that spans the journal lock, commit included; and a probe exit must state
+  `disposed:`/`promoted:` with a recorded non-probe replacement. **There are no waiver
+  arguments on this wire, permanently**: record-scope proof and holes-waived closure
+  refuse `HumanAuthorityRequired` — typed self-authorization is not a named human, so
+  those closures stay CLI acts. Four new allowlisted refusals (`ArtifactClosed`,
+  `ClosureBlocked`, `HumanAuthorityRequired`, `RetractRefused`) join the funnel; raw
+  domain messages, which may name store files, never cross. `score.aperture` names
+  `expectedStateRev`/`expectedStateGen` like every write — the fog write's
+  first-racer-wins guard legitimately re-arms when a map lands, so CAS, not an
+  idempotence claim, is what keeps a stale retry out; a score that owes no fog is
+  byte-pure and commits nothing, and `recordedFog` is truthful on both outcomes. Six new
+  falsifiers in `test/mcp-write.test.js` (contract pins, CLI-equivalence per verb,
+  byte-pure refusals, verbatim replay of a closure certificate); the refusal mapping, the
+  identical-revision no-op, and the one-fog-write guard were each seen red against a
+  deliberately broken variant.
+
+<!-- Traced by: claude-fable-5 -->
+
+- **The five MCP session verbs — the roster rides the proven envelope.** Step 4.2 of the
+  ratified write-tools design: `state.append`, `open_loop.close`, `open_loop.park`,
+  `assumption.close` and `compile.done` join `state.set` on a `--write` server, each a
+  thin boundary over the same domain mutation the CLI verb runs — the meanings of
+  `state append`, `state close` and `compile done` moved to `src/verbs.js`, shared by
+  both doors, so the two surfaces cannot drift into two meanings for one verb. Every
+  tool carries the full 4.1 envelope (revision + generation CAS, operation receipts,
+  deterministic ids, one error funnel) through one shared outcome mapping. CLI gates
+  travel to the wire as schema (**MCP-boundary enforced**): evidence, owner,
+  revisit-trigger and the tested|killed outcome are required non-empty fields; the
+  `collection` enum excludes `artifacts` and `defects`, whose gated constructors a raw
+  append would bypass; and a claimed non-birth status never crosses the boundary — loops
+  are born `open`, assumptions `untested`, on both doors. Transitions on records that do
+  not exist refuse the new allowlisted `UnknownRecordId` with zero bytes moved; a
+  same-text loop or assumption dedups under the lock as a no-op naming the existing
+  record. `state.append` is the one non-destructive hint in the roster — a status
+  transition or checkpoint overwrite is not additive merely because provenance survives.
+  Twelve new falsifiers in `test/mcp-write.test.js` (roster contracts, CLI-equivalence
+  per verb, byte-pure refusals, a replayed checkpoint stamp), each seen red before the
+  roster existed; the `UnknownRecordId` mapping and the birth-status boundary check were
+  additionally each seen red against a deliberately broken variant. Cross-file verbs
+  still wait for 4b.
+
+<!-- Traced by: claude-fable-5 -->
+
+- **The first MCP write tool — and the machinery that makes a retried write safe to
+  retry.** `state.set` joins the registry ONLY when the server is launched with `--write`:
+  an unflagged server registers no write tools at all, so `tools/list` never advertises
+  capability the operator did not grant, and `--write` under a propose-only
+  `RATCHET_AGENT` refuses at startup instead of failing every call (**CLI-enforced**,
+  with `assertMayWrite` still the backstop underneath). Every write names
+  `expectedStateRev` AND `expectedStateGen` — the revision and store lineage it decided
+  against — and is refused stale, never merged; a recreated store that reuses a numeric
+  revision still refuses on the generation. Every write carries an `operationId` whose
+  receipt is durable **inside the state record** (`state.operations`, ring of 32,
+  committed in the same atomic rename as the revision it describes), so a verbatim retry
+  — same connection or a fresh one after a server crash, new handle and all — returns the
+  persisted result marked `replayed` instead of applying twice; the same id with a
+  different meaning refuses `OperationIdConflict`. The binding hashes tool + semantic
+  arguments + revision + generation, never the handle: transports die, decisions don't.
+  Ids minted by an MCP write derive from that binding, so a crash-boundary re-application
+  converges on the same record — and a derived id that already names a record refuses
+  `DeterministicIdConflict` rather than letting entropy impersonate an address. A no-op
+  commits nothing and records no receipt (the 0.9 property, kept on purpose; its
+  observability limit is stated in the spec). All refusals cross one funnel with an
+  allowlisted sentence each — no path, errno, or store location rides the wire — and
+  every structured result, success and refusal alike, conforms to the declared
+  `oneOf` output schema (**MCP-boundary enforced**). Five crash-boundary replay tests,
+  each seen red against a deliberately broken variant, include a real child process dying
+  at the commit rename and a real reconnect over `bin/ratchet-mcp --write`. The verb's
+  meaning moved to `src/verbs.js`, shared by the CLI and the MCP boundary — one
+  implementation, two doors. `workspace.open` now reports `stateGen` beside `stateRev`,
+  from the same snapshot. Safe core per the ratified step-4 design
+  (docs/superpowers/specs/2026-07-31-mcp-write-tools-design.md): cross-file verbs
+  (`defect.*`, `ledger.update`) wait for 4b's WAL design; waivers stay CLI acts, never
+  wire arguments.
+
+<!-- Traced by: claude-fable-5 -->
+
 - **The 16 canonical ratchet prompts are now an MCP prompt surface.** `prompts/list`
   advertises each prompt and its body-derived required arguments; `prompts/get` substitutes
   those arguments into a fresh copy of the canonical body for both supported protocol eras.

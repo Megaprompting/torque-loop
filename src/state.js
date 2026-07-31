@@ -297,9 +297,12 @@ function rejectUnusable(file, raw, why) {
 const WRITER_AGENTS = new Set(['scribe']);
 
 // Returns the propose-only agent name if one is active, else ''. The main caller
-// (RATCHET_AGENT unset) and the scribe both return '' — they may write.
-function proposeOnlyAgent() {
-  const a = (process.env.RATCHET_AGENT || '').trim().toLowerCase();
+// (RATCHET_AGENT unset) and the scribe both return '' — they may write. `env` is
+// injectable so a launch-time guard judging an INJECTED environment (the MCP
+// entry point's io.env) asks this one function instead of growing a second copy
+// of the role rule that could drift from it.
+function proposeOnlyAgent(env) {
+  const a = (((env || process.env).RATCHET_AGENT) || '').trim().toLowerCase();
   return a && !WRITER_AGENTS.has(a) ? a : '';
 }
 

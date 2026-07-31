@@ -22,6 +22,7 @@ const path = require('path');
 const pkg = require('../../package.json');
 const mcp = require('./server');
 const stdio = require('./stdio');
+const state = require('../state');
 
 const VERSION = pkg.version;
 const ROOTS_ENV = 'RATCHET_MCP_ROOTS';
@@ -43,6 +44,8 @@ const USAGE = [
   '                   Must be an existing, fully qualified directory.',
   `  --project-root   Allow the directory named by ${PROJECT_ENV}. For an MCP`,
   '                   host that states the project it opened; refuses if unset.',
+  '  --write          Register the write tools. Without it the server is',
+  '                   read-only and advertises no write capability.',
   '  --help, -h       Show this message.',
   '  --version        Print the version.',
   '',
@@ -60,7 +63,7 @@ const USAGE = [
 // direction to be wrong in.
 function parseArgs(argv) {
   const roots = [];
-  const flags = { help: false, version: false, projectRoot: false };
+  const flags = { help: false, version: false, projectRoot: false, write: false };
   const errors = [];
 
   for (let i = 0; i < argv.length; i++) {
@@ -75,6 +78,10 @@ function parseArgs(argv) {
     }
     if (arg === '--project-root') {
       flags.projectRoot = true;
+      continue;
+    }
+    if (arg === '--write') {
+      flags.write = true;
       continue;
     }
     let value = null;
@@ -165,9 +172,22 @@ function start(argv, io) {
     return { exitCode: 2 };
   }
 
+  // A propose-only agent may run a read-only server — orientation is its job.
+  // Granting it writes is a misconfiguration, refused HERE so the operator
+  // sees it at launch instead of every write failing with a per-call mystery.
+  // assertMayWrite at the mutation boundary remains the backstop underneath.
+  if (parsed.flags.write) {
+    const role = state.proposeOnlyAgent(io.env);
+    if (role) {
+      err.write(`ratchet-mcp: --write conflicts with RATCHET_AGENT=${role}, a propose-only role\n`);
+      err.write('ratchet-mcp: unset RATCHET_AGENT (or set it to scribe), or launch without --write\n');
+      return { exitCode: 2 };
+    }
+  }
+
   let server;
   try {
-    server = mcp.createServer({ roots });
+    server = mcp.createServer({ roots, write: parsed.flags.write });
   } catch (e) {
     // Root validation is the one configuration check that must fail loudly:
     // createRoots refuses a root that does not exist, is not a directory, or is
@@ -177,7 +197,7 @@ function start(argv, io) {
   }
 
   const attached = stdio.attach(server, { input: io.stdin, output: out });
-  err.write(`ratchet-mcp ${VERSION} — ${roots.length} root(s) from ${source}\n`);
+  err.write(`ratchet-mcp ${VERSION} — ${roots.length} root(s) from ${source}${parsed.flags.write ? ', writes enabled' : ''}\n`);
   return { exitCode: null, attached, server };
 }
 
