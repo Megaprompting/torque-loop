@@ -649,6 +649,60 @@ ok('cold-start scanner is clean on healthy state and flags unimplemented checks 
   assert.strictEqual((r.checks.find((c) => c.name.includes('no-closed-work-as-next')) || {}).level, 'warn');
 });
 
+ok('cold-start refuses a surface that resolves outside the workspace root', () => {
+  // resolveSurface used to hand path.resolve whatever the config said, so an
+  // absolute or `..` surface was opened and its matching lines were quoted into
+  // a check detail. Over MCP that turns a checked-in config file into authority
+  // wider than the handle; on the CLI it is a scan reporting on a file that is
+  // not the workspace. Both end the same way: it is never opened.
+  const proj = path.join(tmp, 'cold-containment');
+  fs.mkdirSync(path.join(proj, '.ratchet'), { recursive: true });
+  state.initProject(proj, { force: true });
+  const outsideDir = path.join(tmp, 'cold-containment-outside');
+  fs.mkdirSync(outsideDir, { recursive: true });
+  const absolute = path.join(outsideDir, 'absolute.md');
+  fs.writeFileSync(absolute, 'OUTSIDEPOISON 43 ahead\n');
+  fs.writeFileSync(path.join(tmp, 'sibling.md'), 'OUTSIDEPOISON 43 ahead\n');
+  // The same KIND of offending line INSIDE the root, so the refusal is proved
+  // to be containment and not the scanner quietly going blind.
+  fs.writeFileSync(path.join(proj, 'inside.md'), 'INSIDEPOISON 43 ahead\n');
+  fs.writeFileSync(
+    path.join(proj, '.ratchet', 'cold-start.json'),
+    JSON.stringify({
+      surfaces: [
+        { path: absolute, checks: ['base-qualified-git'] },
+        { path: '../sibling.md', checks: ['base-qualified-git'] },
+        { path: 'inside.md', checks: ['base-qualified-git'] },
+      ],
+    })
+  );
+
+  const opened = [];
+  const realRead = fs.readFileSync;
+  let r;
+  try {
+    fs.readFileSync = function spy(file, ...rest) {
+      opened.push(String(file));
+      return realRead.call(fs, file, ...rest);
+    };
+    r = coldStart.scan(proj);
+  } finally {
+    fs.readFileSync = realRead;
+  }
+
+  const escapes = r.checks.filter((c) => c.detail === 'surface escapes workspace root — not read');
+  assert.strictEqual(escapes.length, 2, `both escaping surfaces are named: ${JSON.stringify(r.checks)}`);
+  assert.ok(escapes.some((c) => c.name.includes(absolute)), 'the absolute surface is named');
+  assert.ok(escapes.some((c) => c.name.includes('../sibling.md')), 'the .. surface is named');
+  assert.ok(!JSON.stringify(r).includes('OUTSIDEPOISON'),
+    'no outside content reaches the result');
+  assert.ok(!opened.includes(absolute) && !opened.includes(path.join(tmp, 'sibling.md')),
+    `an escaping surface is never opened: ${opened.join(', ')}`);
+  const inside = r.checks.find((c) => c.name.includes('inside.md'));
+  assert.strictEqual(inside.level, 'fail', 'a contained surface is still scanned');
+  assert.match(inside.detail, /INSIDEPOISON/, 'and its own offending line is still quoted');
+});
+
 // --- scores name their scope (no confidence gaslighting) --------------------
 
 ok('every score names its scope', () => {

@@ -467,6 +467,98 @@ ok('I11 the documented project .mcp.json shape launches and serves', () => {
     'the modern revision is on offer to a Claude Code client');
 });
 
+// The derived read tools are handle-bound, so open-then-call has to happen in
+// ONE conversation on ONE era — the same reason I4 needs a client process. This
+// one is parameterized by era, because "works over the real wire" has to be
+// true for the Codex-era handshake as well as the modern one.
+// Traced by: claude-opus-5
+const TOOLS_CLIENT = path.join(tmp, 'interop-tools-client.js');
+fs.writeFileSync(TOOLS_CLIENT, [
+  "'use strict';",
+  'const cp = require("child_process");',
+  'const [bin, root, meta, era] = process.argv.slice(2);',
+  'const _meta = JSON.parse(meta);',
+  'const modern = era === "modern";',
+  'const child = cp.spawn(process.execPath, [bin, "--root", root], { windowsHide: true });',
+  'const seen = [];',
+  'let id = 0;',
+  'function handle() {',
+  '  const opened = seen.find((r) => r.result && r.result.structuredContent && r.result.structuredContent.workspaceHandle);',
+  '  return opened ? opened.result.structuredContent.workspaceHandle : "no-handle-yet";',
+  '}',
+  'const plan = [];',
+  'if (!modern) plan.push(() => ["initialize", { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "tools-client", version: "0" } }]);',
+  'plan.push(() => ["tools/call", { name: "workspace.open", arguments: { path: root } }]);',
+  'plan.push(() => ["tools/call", { name: "workspace.scan", arguments: { workspaceHandle: handle() } }]);',
+  'plan.push(() => ["tools/call", { name: "score.confidence", arguments: { workspaceHandle: handle() } }]);',
+  'plan.push(() => ["tools/call", { name: "score.friction", arguments: { obstacles: [',
+  '  { name: "lock contention", leverage: 9, certainty: 8, speed: 4, risk: 9 },',
+  '  { name: "stale docs", leverage: 2, certainty: 2, speed: 2, risk: 2 },',
+  '] } }]);',
+  'function next() {',
+  '  if (!plan.length) {',
+  '    child.stdin.end();',
+  '    process.stdout.write(JSON.stringify({ replies: seen }));',
+  '    process.exit(0);',
+  '  }',
+  '  const [method, params] = plan.shift()();',
+  '  child.stdin.write(JSON.stringify({',
+  '    jsonrpc: "2.0", id: ++id, method, params: modern ? Object.assign({}, params, { _meta }) : params,',
+  '  }) + "\\n");',
+  '}',
+  'let buffered = "";',
+  'child.stdout.on("data", (d) => {',
+  '  buffered += d;',
+  '  let nl;',
+  '  while ((nl = buffered.indexOf("\\n")) !== -1) {',
+  '    const line = buffered.slice(0, nl); buffered = buffered.slice(nl + 1);',
+  '    if (!line.length) continue;',
+  '    seen.push(JSON.parse(line));',
+  '    next();',
+  '  }',
+  '});',
+  'next();',
+  'setTimeout(() => { process.stdout.write(JSON.stringify({ timeout: true, seen })); process.exit(1); }, 25000);',
+].join('\n'), 'utf8');
+
+ok('I12 the derived read tools answer over the real transport, on both protocol eras', () => {
+  for (const era of ['modern', 'legacy']) {
+    const repo = initRepo(`i12-${era}`);
+    const proc = childProcess.spawnSync(
+      process.execPath,
+      [TOOLS_CLIENT, BIN, repo, JSON.stringify(modernMeta()), era],
+      { encoding: 'utf8', env: cleanGitEnv(), timeout: 40000, windowsHide: true }
+    );
+    assert.strictEqual(proc.status, 0,
+      `the ${era} client must complete the exchange: ${proc.stdout} ${proc.stderr}`);
+    const { replies } = JSON.parse(proc.stdout);
+    // Legacy spends its first reply on the handshake, so index from the end.
+    const [open, scan, confidence, friction] = replies.slice(-4);
+    const structured = (reply, what) => {
+      assert.strictEqual(reply.error, undefined, `${era} ${what}: ${JSON.stringify(reply.error)}`);
+      assert.strictEqual(reply.result.isError, undefined, `${era} ${what}: ${JSON.stringify(reply.result)}`);
+      assert.deepStrictEqual(reply.result.structuredContent, JSON.parse(reply.result.content[0].text),
+        `${era} ${what} carries one answer in both blocks`);
+      return reply.result.structuredContent;
+    };
+
+    const opened = structured(open, 'workspace.open');
+    assert.match(opened.workspaceHandle, /^[A-Za-z0-9_-]{43}$/);
+    const scanned = structured(scan, 'workspace.scan');
+    assert.ok(Array.isArray(scanned.checks) && scanned.checks.length, `${era} scan returns checks`);
+    assert.strictEqual(scanned.configured, false, `${era} scan states an unconfigured workspace`);
+    const scored = structured(confidence, 'score.confidence');
+    assert.strictEqual(scored.stateRev, opened.stateRev, `${era} stateRev agrees with the open`);
+    assert.deepStrictEqual(scored.journal, { counted: 0, malformed: 0 },
+      `${era} states an empty journal rather than omitting it`);
+    for (const layer of ['artifact', 'session', 'ledger', 'closure']) {
+      assert.ok(scored[layer] && typeof scored[layer] === 'object', `${era} carries the ${layer} read`);
+    }
+    const ranked = structured(friction, 'score.friction');
+    assert.strictEqual(ranked.winner.name, 'lock contention', `${era} ranking survives the wire`);
+  }
+});
+
 ok('I7 --help through the real binary exits 0 with a clean stdout', () => {
   const proc = childProcess.spawnSync(process.execPath, [BIN, '--help'], {
     input: '', encoding: 'utf8', env: cleanGitEnv(), timeout: 30000, windowsHide: true,

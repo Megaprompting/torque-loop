@@ -20,6 +20,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <!-- Traced by: openai-codex-gpt-5 -->
 
+- **Three derived MCP read tools — and the proof that a read is a read.** `workspace.scan`,
+  `score.confidence` and `score.friction` join `workspace.open` in `tools/list`, in one
+  deterministic order produced by the same descriptor/handler registry the dispatcher selects
+  from — so a listed tool cannot lack an implementation and an implemented tool cannot stay
+  undiscoverable (**MCP-boundary enforced**, pinned by whole-descriptor assertions). They are
+  derived computations, never a second spelling of a canonical document: `status`, `export`
+  and defect reads stay resources, and `score.aperture` is excluded because a map-required
+  result records fog, which is a write.
+  - `workspace.open` now initializes the **ledger** alongside state before it issues a handle,
+    and issues none if either record fails to open. This repaired a live defect: `loadLedger`
+    creates the ledger under lock when it is missing, so the shipped first `resources/read` of
+    `ledger` on a fresh workspace *wrote bytes*. Every read path is now provably pure over the
+    store that open initialized, proved by a byte-snapshot over the store, the workspace
+    `.ratchet` directory, the evolution log and a configured cold-start surface across all
+    three resources and all three tools. Scope, named: a canonical record deleted or corrupted
+    *after* open — server-local damage no client authority can cause — still meets the
+    loaders' designed locked self-repair; fail-closed-vs-repair for that case is a parked
+    public-shape decision (owner: Danny, see the Step 3b spec's named limit).
+  - Every handle-bound read — resources and tools alike — crosses **one** connection-local
+    authority check. Missing, non-string, malformed, fabricated, stale, revoked, closed and
+    foreign-connection handles all return `-32602` with one non-enumerating message on both
+    doors (**MCP-boundary enforced**).
+  - `score.confidence` loads state **once**: the reported `stateRev` is the revision of the
+    snapshot the layers were computed from, never a re-read. Journal damage rides the wire as
+    `journal: { counted, malformed }` instead of a stderr warning no MCP client can see; an
+    absent log is stated as zero, not omitted.
+  - `score.friction` takes no handle and reads no ambient workspace. Malformed arguments —
+    including an unknown field on an obstacle — are refused at the MCP boundary; clamping and
+    the `obstacle` / `timeToUnblock` / `riskOfIgnoring` aliases remain domain behavior.
+
+### Changed
+
+- **The cold-start scanner refuses a surface that resolves outside the workspace root.**
+  `.ratchet/cold-start.json` surfaces were resolved with `path.resolve`, so an absolute or
+  `..` path was opened and its matching lines were quoted into a check detail — over MCP, a
+  checked-in config file could widen authority past the handle it was read through. An
+  escaping surface is now never opened and is reported as a named check
+  ("surface escapes workspace root — not read"), so the refusal is stated rather than silent.
+  **CLI-enforced in the cold-start domain**, so `ratchet doctor cold-start` and the receipt
+  inherit it; it warns rather than fails, because nothing outside was read.
+- **A store conflict is distinguishable.** `projectSlug`'s legacy/normalized collision now
+  throws with code `ERATCHETSTORECONFLICT`, and the MCP boundary maps it to one actionable
+  sentence ("workspace store has conflicting project records — operator must merge or delete
+  one") instead of collapsing it into the generic "workspace state could not be opened", which
+  had already cost one diagnosis round-trip. No server path crosses the wire.
+
+<!-- Traced by: claude-opus-5 -->
+
 ## [1.0.0] - 2026-07-30 — Boundary Gate
 
 0.2 gated proof; 0.3 the seam; 0.6 the fog; 0.7 the probe; 0.8 closure; 0.9 the write.
