@@ -259,6 +259,13 @@ ok('U4 derived ids keep 128 bits, are deterministic, and vary by role', () => {
 // Discovery and the write opt-in.
 // ---------------------------------------------------------------------------
 
+const ENVELOPE_KEYS = ['workspaceHandle', 'expectedStateRev', 'expectedStateGen', 'operationId'];
+const SESSION_VERBS = ['state.append', 'open_loop.close', 'open_loop.park', 'assumption.close', 'compile.done'];
+const WRITE_ROSTER = [
+  'workspace.open', 'workspace.scan', 'score.confidence', 'score.friction',
+  'state.set', ...SESSION_VERBS,
+];
+
 ok('W1 a flagless server registers no write tools and cannot dispatch one', () => {
   const repo = initRepo('w1-repo');
   const conn = service([repo], false).createConnection();
@@ -276,8 +283,7 @@ ok('W2 a --write server advertises state.set with the pinned descriptor, both er
   const server = service([repo], true);
   const conn = server.createConnection();
   const tools = modern(conn, 'tools/list', {}).result.tools;
-  assert.deepStrictEqual(tools.map((t) => t.name),
-    ['workspace.open', 'workspace.scan', 'score.confidence', 'score.friction', 'state.set']);
+  assert.deepStrictEqual(tools.map((t) => t.name), WRITE_ROSTER);
   const descriptor = tools[4];
   assert.deepStrictEqual(descriptor.annotations,
     { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false });
@@ -886,6 +892,306 @@ ok('W20 a reconnect after server death replays the receipt through a new handle'
   const disk = readState(repo);
   assert.strictEqual(disk.rev, report.firstOpen.stateRev + 1, 'one commit total');
   assert.strictEqual(disk.history.length, 1, 'one application total');
+});
+
+// ---------------------------------------------------------------------------
+// Step 4.2: the session verbs — state.append, open_loop.close/park,
+// assumption.close, compile.done. The mechanism is proven on the canary above;
+// these prove each verb's meaning is the CLI's meaning, its gates travel as
+// schema, and its refusals stay byte-pure.
+// ---------------------------------------------------------------------------
+
+ok('V1 the --write roster advertises all six write tools with pinned contracts', () => {
+  const repo = initRepo('v1-repo');
+  const conn = service([repo], true).createConnection();
+  const tools = modern(conn, 'tools/list', {}).result.tools;
+  assert.deepStrictEqual(tools.map((t) => t.name), WRITE_ROSTER);
+  const byName = new Map(tools.map((t) => [t.name, t]));
+  // Only the additive writes are non-destructive; a status transition or an
+  // overwrite is not additive merely because provenance survives.
+  for (const [name, destructive] of [
+    ['state.append', false], ['open_loop.close', true], ['open_loop.park', true],
+    ['assumption.close', true], ['compile.done', true],
+  ]) {
+    const tool = byName.get(name);
+    assert.deepStrictEqual(tool.annotations,
+      { readOnlyHint: false, destructiveHint: destructive, idempotentHint: true, openWorldHint: false }, name);
+    assert.strictEqual(tool.inputSchema.additionalProperties, false, name);
+    assert.strictEqual(tool.outputSchema.oneOf.length, 2, `${name} has success and error branches`);
+    assert.deepStrictEqual(tool.outputSchema.oneOf[1].properties.error.enum, [
+      'StateNotInitialized', 'StaleGeneration', 'StaleStateRev',
+      'OperationIdConflict', 'DeterministicIdConflict', 'UnknownRecordId', 'WriteFailed',
+    ], name);
+  }
+  const required = (name) => byName.get(name).inputSchema.required;
+  assert.deepStrictEqual(required('state.append'), [...ENVELOPE_KEYS, 'collection', 'item']);
+  assert.deepStrictEqual(required('open_loop.close'), [...ENVELOPE_KEYS, 'id', 'evidence']);
+  assert.deepStrictEqual(required('open_loop.park'), [...ENVELOPE_KEYS, 'id', 'owner', 'revisitTrigger']);
+  assert.deepStrictEqual(required('assumption.close'), [...ENVELOPE_KEYS, 'id', 'outcome', 'evidence']);
+  assert.deepStrictEqual(required('compile.done'), [...ENVELOPE_KEYS]);
+  const success = (name) => byName.get(name).outputSchema.oneOf[0].required;
+  const COMMON = ['ok', 'committed', 'stateRev', 'replayed'];
+  assert.deepStrictEqual(success('state.append'), [...COMMON, 'collection', 'recordId', 'deduped']);
+  assert.deepStrictEqual(success('open_loop.close'), [...COMMON, 'openLoopId', 'status']);
+  assert.deepStrictEqual(success('open_loop.park'), [...COMMON, 'openLoopId', 'status']);
+  assert.deepStrictEqual(success('assumption.close'), [...COMMON, 'assumptionId', 'status']);
+  assert.deepStrictEqual(success('compile.done'), [...COMMON, 'checkpointed', 'lastCompileAt']);
+  // The gated constructors are not appendable — the enum itself says so.
+  assert.deepStrictEqual(byName.get('state.append').inputSchema.properties.collection.enum,
+    ['decisions', 'assumptions', 'openLoops', 'touchedFiles', 'history']);
+});
+
+ok('V2 no session verb is listed or dispatchable on a flagless server', () => {
+  const repo = initRepo('v2-repo');
+  const conn = service([repo], false).createConnection();
+  const listed = modern(conn, 'tools/list', {}).result.tools.map((t) => t.name);
+  const open = openWorkspace(conn, repo);
+  for (const tool of SESSION_VERBS) {
+    assert.ok(!listed.includes(tool), `${tool} must not be advertised`);
+    const response = callTool(conn, 'modern', tool, envelopeFor(open, {}));
+    assert.strictEqual(response.error && response.error.code, -32602, tool);
+    assert.match(response.error.message, /unknown tool/);
+  }
+});
+
+ok('V3 state.append commits one record with a derived id; the CLI writes the same record', () => {
+  const mcpRepo = initRepo('v3-mcp');
+  const cliRepo = initRepo('v3-cli');
+  const conn = service([mcpRepo], true).createConnection();
+  const open = openWorkspace(conn, mcpRepo);
+  const result = payload(callTool(conn, 'modern', 'state.append',
+    envelopeFor(open, { collection: 'decisions', item: { text: 'ship 4.2' } })));
+  assert.strictEqual(result.ok, true);
+  assert.strictEqual(result.committed, true);
+  assert.strictEqual(result.stateRev, open.stateRev + 1);
+  assert.strictEqual(result.collection, 'decisions');
+  assert.strictEqual(result.deduped, false);
+  assert.match(result.recordId, /^dec-[0-9a-f]{32}$/, 'MCP-minted record ids are derived');
+  childProcess.execFileSync(process.execPath,
+    [RATCHET, 'state', 'append', 'decisions', '{"text":"ship 4.2"}'],
+    { cwd: cliRepo, encoding: 'utf8', env: cleanGitEnv(), windowsHide: true });
+  const viaMcp = readState(mcpRepo);
+  const viaCli = readState(cliRepo);
+  assert.strictEqual(viaMcp.decisions[0].id, result.recordId);
+  assert.strictEqual(viaMcp.decisions[0].text, viaCli.decisions[0].text);
+  assert.strictEqual(viaMcp.dirty, true);
+  assert.strictEqual(viaCli.dirty, true);
+  assert.match(viaCli.decisions[0].id, /^dec-[0-9a-z]+-[0-9a-f]+$/, 'the CLI keeps random ids');
+  assert.strictEqual(viaMcp.operations.length, 1, 'the receipt rode the same commit');
+});
+
+ok('V4 a claimed non-birth status never crosses the boundary; an unclaimed record births open', () => {
+  const repo = initRepo('v4-repo');
+  const conn = service([repo], true).createConnection();
+  const open = openWorkspace(conn, repo);
+  const before = storeSnapshot(repo);
+  const refused = boundaryRefusal(callTool(conn, 'modern', 'state.append',
+    envelopeFor(open, { collection: 'openLoops', item: { text: 'x', status: 'closed' } })));
+  assert.match(refused.message, /born "open"/);
+  boundaryRefusal(callTool(conn, 'modern', 'state.append',
+    envelopeFor(open, { collection: 'assumptions', item: { text: 'x', status: 'tested' } })));
+  assert.deepStrictEqual(storeSnapshot(repo), before, 'no claimed status moved a byte');
+  const result = payload(callTool(conn, 'modern', 'state.append',
+    envelopeFor(open, { collection: 'openLoops', item: { text: 'a loop' } })));
+  const disk = readState(repo).openLoops[0];
+  assert.strictEqual(disk.status, 'open', 'birth status is forced, not accepted');
+  assert.strictEqual(disk.id, result.recordId);
+});
+
+ok('V5 a same-text loop dedups as a no-op naming the existing record', () => {
+  const repo = initRepo('v5-repo');
+  const conn = service([repo], true).createConnection();
+  const open = openWorkspace(conn, repo);
+  const first = payload(callTool(conn, 'modern', 'state.append',
+    envelopeFor(open, { collection: 'openLoops', item: { text: 'The Same Loop' } })));
+  const before = storeSnapshot(repo);
+  const dup = payload(callTool(conn, 'modern', 'state.append', envelopeFor(
+    { ...open, stateRev: open.stateRev + 1 },
+    { collection: 'openLoops', item: { text: '  the same loop ' } }
+  )));
+  assert.deepStrictEqual(dup, {
+    ok: true, committed: false, stateRev: open.stateRev + 1, replayed: false,
+    collection: 'openLoops', recordId: first.recordId, deduped: true,
+  });
+  assert.deepStrictEqual(storeSnapshot(repo), before,
+    'a dedup is a no-op — no revision, no receipt, no second record');
+});
+
+ok('V6 open_loop.close transitions with evidence; one meaning on both boundaries', () => {
+  const mcpRepo = initRepo('v6-mcp');
+  const cliRepo = initRepo('v6-cli');
+  const conn = service([mcpRepo], true).createConnection();
+  const open = openWorkspace(conn, mcpRepo);
+  payload(callTool(conn, 'modern', 'state.append',
+    envelopeFor(open, { collection: 'openLoops', item: { id: 'loop-fixed', text: 'close me' } })));
+  const result = payload(callTool(conn, 'modern', 'open_loop.close', envelopeFor(
+    { ...open, stateRev: open.stateRev + 1 },
+    { id: 'loop-fixed', evidence: 'the test passed' }
+  )));
+  assert.deepStrictEqual(result, {
+    ok: true, committed: true, stateRev: open.stateRev + 2, replayed: false,
+    openLoopId: 'loop-fixed', status: 'closed',
+  });
+  const cli = (args) => childProcess.execFileSync(process.execPath, [RATCHET, ...args],
+    { cwd: cliRepo, encoding: 'utf8', env: cleanGitEnv(), windowsHide: true });
+  cli(['state', 'append', 'openLoops', '{"id":"loop-fixed","text":"close me"}']);
+  cli(['state', 'close', 'openLoops', 'loop-fixed', '--evidence', 'the test passed']);
+  const viaMcp = readState(mcpRepo);
+  const viaCli = readState(cliRepo);
+  const strip = (r) => ({ id: r.id, text: r.text, status: r.status, evidence: r.evidence });
+  assert.deepStrictEqual(strip(viaMcp.openLoops[0]), strip(viaCli.openLoops[0]));
+  assert.ok(viaMcp.openLoops[0].closedAt, 'the transition is stamped');
+  const event = (h) => ({ event: h.event, note: h.note });
+  assert.deepStrictEqual(viaMcp.history.map(event), viaCli.history.map(event),
+    'one verb meaning on both boundaries');
+  assert.match(viaMcp.history[0].id, /^hist-[0-9a-f]{32}$/);
+});
+
+ok('V7 open_loop.park assigns an owner and a revisit trigger — attribution, not a waiver', () => {
+  const repo = initRepo('v7-repo');
+  const conn = service([repo], true).createConnection();
+  const open = openWorkspace(conn, repo);
+  payload(callTool(conn, 'modern', 'state.append',
+    envelopeFor(open, { collection: 'openLoops', item: { id: 'loop-parkme', text: 'park me' } })));
+  const result = payload(callTool(conn, 'modern', 'open_loop.park', envelopeFor(
+    { ...open, stateRev: open.stateRev + 1 },
+    { id: 'loop-parkme', owner: 'Danny', revisitTrigger: 'when 4.3 lands' }
+  )));
+  assert.deepStrictEqual(result, {
+    ok: true, committed: true, stateRev: open.stateRev + 2, replayed: false,
+    openLoopId: 'loop-parkme', status: 'parked',
+  });
+  const disk = readState(repo).openLoops[0];
+  assert.strictEqual(disk.status, 'parked');
+  assert.strictEqual(disk.owner, 'Danny');
+  assert.strictEqual(disk.revisitTrigger, 'when 4.3 lands');
+  assert.strictEqual(disk.evidence, undefined, 'a park closes nothing and proves nothing');
+  assert.strictEqual(readState(repo).history[0].event, 'loop.parked');
+});
+
+ok('V8 assumption.close ends an assumption proven or dead, never otherwise', () => {
+  const repo = initRepo('v8-repo');
+  const conn = service([repo], true).createConnection();
+  const open = openWorkspace(conn, repo);
+  payload(callTool(conn, 'modern', 'state.append',
+    envelopeFor(open, { collection: 'assumptions', item: { id: 'asm-fixed', text: 'it holds' } })));
+  const before = storeSnapshot(repo);
+  boundaryRefusal(callTool(conn, 'modern', 'assumption.close', envelopeFor(
+    { ...open, stateRev: open.stateRev + 1 },
+    { id: 'asm-fixed', outcome: 'maybe', evidence: 'wishful' }
+  )));
+  assert.deepStrictEqual(storeSnapshot(repo), before, 'a third outcome never crosses');
+  const result = payload(callTool(conn, 'modern', 'assumption.close', envelopeFor(
+    { ...open, stateRev: open.stateRev + 1 },
+    { id: 'asm-fixed', outcome: 'killed', evidence: 'contradicted by V8' }
+  )));
+  assert.deepStrictEqual(result, {
+    ok: true, committed: true, stateRev: open.stateRev + 2, replayed: false,
+    assumptionId: 'asm-fixed', status: 'killed',
+  });
+  const disk = readState(repo).assumptions[0];
+  assert.strictEqual(disk.status, 'killed');
+  assert.strictEqual(disk.evidence, 'contradicted by V8');
+  assert.strictEqual(readState(repo).history[0].event, 'assumption.killed');
+});
+
+ok('V9 a transition on a record that does not exist refuses UnknownRecordId with zero bytes', () => {
+  const repo = initRepo('v9-repo');
+  const conn = service([repo], true).createConnection();
+  const open = openWorkspace(conn, repo);
+  const before = storeSnapshot(repo);
+  for (const [tool, semantic] of [
+    ['open_loop.close', { id: 'loop-ghost', evidence: 'e' }],
+    ['open_loop.park', { id: 'loop-ghost', owner: 'o', revisitTrigger: 't' }],
+    ['assumption.close', { id: 'asm-ghost', outcome: 'tested', evidence: 'e' }],
+  ]) {
+    const structured = refusal(callTool(conn, 'modern', tool, envelopeFor(open, semantic)));
+    assert.strictEqual(structured.error, 'UnknownRecordId', tool);
+  }
+  assert.deepStrictEqual(storeSnapshot(repo), before, 'no ghost transition moved a byte');
+});
+
+ok('V10 compile.done clears dirty in one move; the verbatim retry replays the same stamp', () => {
+  const mcpRepo = initRepo('v10-mcp');
+  const cliRepo = initRepo('v10-cli');
+  const conn = service([mcpRepo], true).createConnection();
+  const open = openWorkspace(conn, mcpRepo);
+  payload(callTool(conn, 'modern', 'state.set',
+    envelopeFor(open, { key: 'objective', value: 'checkpoint me' })));
+  assert.strictEqual(readState(mcpRepo).dirty, true);
+  const envelope = envelopeFor({ ...open, stateRev: open.stateRev + 1 }, {});
+  const result = payload(callTool(conn, 'modern', 'compile.done', envelope));
+  assert.strictEqual(result.committed, true);
+  assert.strictEqual(result.stateRev, open.stateRev + 2);
+  assert.strictEqual(result.checkpointed, true);
+  const disk = readState(mcpRepo);
+  assert.strictEqual(disk.dirty, false, 'the checkpoint clears dirty');
+  assert.strictEqual(disk.lastCompileAt, result.lastCompileAt);
+  const before = storeSnapshot(mcpRepo);
+  const retry = payload(callTool(conn, 'modern', 'compile.done', envelope));
+  assert.deepStrictEqual(retry, { ...result, replayed: true },
+    'the retry is the recorded stamp, not a new one');
+  assert.deepStrictEqual(storeSnapshot(mcpRepo), before);
+  const cli = (args) => childProcess.execFileSync(process.execPath, [RATCHET, ...args],
+    { cwd: cliRepo, encoding: 'utf8', env: cleanGitEnv(), windowsHide: true });
+  cli(['state', 'set', 'objective', 'checkpoint me']);
+  cli(['compile', 'done']);
+  const viaCli = readState(cliRepo);
+  assert.strictEqual(viaCli.dirty, false);
+  const event = (h) => ({ event: h.event, note: h.note });
+  assert.deepStrictEqual(disk.history.map(event), viaCli.history.map(event),
+    'one checkpoint meaning on both boundaries');
+});
+
+ok('V11 malformed verb arguments refuse at the boundary with zero bytes moved', () => {
+  const repo = initRepo('v11-repo');
+  const conn = service([repo], true).createConnection();
+  const open = openWorkspace(conn, repo);
+  const before = storeSnapshot(repo);
+  const cases = [
+    ['state.append', { collection: 'artifacts', item: {} }],
+    ['state.append', { collection: 'defects', item: {} }],
+    ['state.append', { collection: 'nope', item: {} }],
+    ['state.append', { collection: 'decisions', item: [] }],
+    ['state.append', { collection: 'decisions', item: 'text' }],
+    ['state.append', { collection: 'decisions', item: { id: '', text: 'x' } }],
+    ['state.append', { collection: 'decisions' }],
+    ['open_loop.close', { id: 'x', evidence: '' }],
+    ['open_loop.close', { id: 'x', evidence: '   ' }],
+    ['open_loop.close', { id: '', evidence: 'e' }],
+    ['open_loop.close', { id: 'x' }],
+    ['open_loop.park', { id: 'x', owner: '', revisitTrigger: 't' }],
+    ['open_loop.park', { id: 'x', owner: 'o', revisitTrigger: '' }],
+    ['assumption.close', { id: 'x', outcome: 'maybe', evidence: 'e' }],
+    ['assumption.close', { id: 'x', outcome: 'tested', evidence: '' }],
+    ['compile.done', { extra: true }],
+  ];
+  for (const [tool, semantic] of cases) {
+    boundaryRefusal(callTool(conn, 'modern', tool, envelopeFor(open, semantic)));
+  }
+  assert.deepStrictEqual(storeSnapshot(repo), before, 'no malformed argument moved a byte');
+  const gated = boundaryRefusal(callTool(conn, 'modern', 'state.append',
+    envelopeFor(open, { collection: 'artifacts', item: {} })));
+  assert.match(gated.message, /artifact/, 'the refusal names the gated door');
+});
+
+ok('V12 every session verb answers a foreign handle with the one non-enumerating refusal', () => {
+  const repo = initRepo('v12-repo');
+  const server = service([repo], true);
+  const conn = server.createConnection();
+  const open = openWorkspace(conn, repo);
+  const foreign = server.createConnection();
+  const messages = new Set();
+  for (const [tool, semantic] of [
+    ['state.append', { collection: 'decisions', item: { text: 'x' } }],
+    ['open_loop.close', { id: 'x', evidence: 'e' }],
+    ['open_loop.park', { id: 'x', owner: 'o', revisitTrigger: 't' }],
+    ['assumption.close', { id: 'x', outcome: 'tested', evidence: 'e' }],
+    ['compile.done', {}],
+  ]) {
+    messages.add(boundaryRefusal(callTool(foreign, 'modern', tool, envelopeFor(open, semantic))).message);
+  }
+  assert.strictEqual(messages.size, 1, 'one answer for every foreign handle');
 });
 
 // ---------------------------------------------------------------------------

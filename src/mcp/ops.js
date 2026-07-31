@@ -126,9 +126,9 @@ function clone(value) {
 // ring lookup would turn every legitimate replay into a dead end.
 //
 // Outcome kinds: replayed | conflict | stateMissing | staleGen | staleRev |
-// noop | committed | idConflict | capOverflow. Every kind except `committed`
-// moves zero bytes — a refusal that leaves a fresh store or a half-applied
-// verb behind is not a refusal.
+// noop | committed | idConflict | capOverflow | unknownId. Every kind except
+// `committed` moves zero bytes — a refusal that leaves a fresh store or a
+// half-applied verb behind is not a refusal.
 function executeWrite(opts) {
   const { state, root, tool, operationId, expectedStateRev, expectedStateGen, semanticArgs, apply } = opts;
   const argsHash = bindingHash(tool, semanticArgs, expectedStateRev, expectedStateGen);
@@ -203,10 +203,11 @@ function executeWrite(opts) {
     });
   } catch (error) {
     // A throw inside the transaction aborts it — nothing was committed. The
-    // two coded throws become outcomes; anything else is the caller's to map
+    // coded throws become outcomes; anything else is the caller's to map
     // through its one error funnel.
     if (error && error.code === 'ERATCHETIDCONFLICT') return { kind: 'idConflict' };
     if (error && error.code === 'ERATCHETRECEIPTCAP') return { kind: 'capOverflow' };
+    if (error && error.code === 'ERATCHETUNKNOWNID') return { kind: 'unknownId' };
     throw error;
   }
   return outcome;

@@ -301,31 +301,11 @@ function cmdState(cwd, sub, rest, asJson, flags = new Set(), argv = []) {
         );
       }
       const item = readPayload(payloadArg);
-      // Birth status is forced, not accepted: an assumption born "tested" and a
-      // loop born "closed" are exactly the two lies that make the drain lie.
-      const BIRTH_STATUS = { assumptions: 'untested', openLoops: 'open' };
-      const birth = BIRTH_STATUS[collection];
-      const appended = mutate(cwd, 'state append', (s) => {
-        if (birth) {
-          const claimed = item.status == null ? '' : String(item.status);
-          if (claimed && claimed !== birth) {
-            throw new Error(
-              `${collection} are born "${birth}", never "${claimed}" — reaching any other status is a transition ` +
-                `(ratchet state close ${collection} <id> …), not a birth field`
-            );
-          }
-          item.status = birth;
-          const key = String(item.text || '').trim().toLowerCase();
-          const dup = key && (s[collection] || []).find((x) => String((x && x.text) || '').trim().toLowerCase() === key);
-          // The dedup runs UNDER the lock against the reloaded record, so two
-          // processes appending the same text produce one entry, not two.
-          if (dup) return { dup };
-        }
-        const record = { id: item.id || state.makeId(schemas.STATE_COLLECTIONS[collection]), at: schemas.nowIso(), ...item };
-        s[collection].push(record);
-        s.dirty = true;
-        return { record };
-      });
+      // Birth forcing, dedup-under-lock, and the record shape live in the
+      // shared verb (src/verbs.js) — one meaning on both boundaries.
+      const appended = mutate(cwd, 'state append', (s) =>
+        verbs.appendItem(s, collection, item, (prefix) => state.makeId(prefix))
+      );
       if (appended.dup) return out(`already recorded in ${collection}: ${appended.dup.id}`);
       return out(`appended to ${collection}: ${appended.record.id}`);
     }
@@ -382,59 +362,18 @@ function cmdStateClose(cwd, argv) {
   }
   need(id, `usage: ratchet state close ${collection} <id> ...`);
 
-  const to = mutate(cwd, `state close ${collection}`, (s) => closeRecord(s, collection, id, opts));
+  // The transition rules live in the shared verb (src/verbs.js); this boundary
+  // owns the flag spelling and the load/save.
+  const to = mutate(cwd, `state close ${collection}`, (s) =>
+    verbs.closeRecord(s, collection, id, {
+      park: opts.park === true,
+      owner: strOpt(opts.owner),
+      revisitTrigger: strOpt(opts['revisit-trigger']),
+      evidence: strOpt(opts.evidence),
+      outcome: strOpt(opts.outcome),
+    }, (prefix) => state.makeId(prefix))
+  );
   return out(`${collection} ${id} → ${to}`);
-}
-
-// The transition itself, applied to the transaction's state. Split out only so
-// the boundary above owns the load/save and this owns the rules.
-function closeRecord(s, collection, id, opts) {
-  const need = (val, msg) => {
-    if (!val) throw new Error(msg);
-    return val;
-  };
-  const record = (s[collection] || []).find((x) => x && x.id === id);
-  if (!record) throw new Error(`no ${collection} entry with id "${id}"`);
-  const now = schemas.nowIso();
-  const evidence = strOpt(opts.evidence);
-  let to;
-
-  if (collection === 'openLoops') {
-    if (opts.park === true) {
-      const owner = need(strOpt(opts.owner), 'parking a loop requires --owner "<who carries it>"');
-      const trigger = need(
-        strOpt(opts['revisit-trigger']),
-        'parking a loop requires --revisit-trigger "<what brings it back>" — a park with no trigger is a drop'
-      );
-      to = 'parked';
-      record.owner = owner;
-      record.revisitTrigger = trigger;
-    } else {
-      need(evidence, 'closing a loop requires --evidence "<what actually closed it>" — no proof, no close');
-      to = 'closed';
-      record.evidence = evidence;
-    }
-  } else {
-    const outcome = strOpt(opts.outcome);
-    if (outcome !== 'tested' && outcome !== 'killed') {
-      throw new Error('closing an assumption requires --outcome tested|killed — an assumption ends proven or dead');
-    }
-    need(evidence, 'closing an assumption requires --evidence "<the result that settled it>"');
-    to = outcome;
-    record.evidence = evidence;
-  }
-
-  const from = record.status || '';
-  record.status = to;
-  record.closedAt = now;
-  s.dirty = true;
-  s.history.push({
-    id: state.makeId('hist'),
-    at: now,
-    event: `${collection === 'openLoops' ? 'loop' : 'assumption'}.${to}`,
-    note: `${id}: ${from} → ${to}${evidence ? ` — ${evidence}` : ''}`,
-  });
-  return to;
 }
 
 // The closure gate. `compile done` says the record is current; this says the
@@ -844,11 +783,8 @@ function cmdHook(cwd, sub) {
 // state, and it must never be mistaken for closure: it says the record is
 // current, not that the work is finished.
 function cmdCompileDone(cwd, asJson) {
-  const now = schemas.nowIso();
   const s = mutate(cwd, 'compile done', (st) => {
-    st.lastCompileAt = now;
-    st.dirty = false;
-    st.history.push({ id: state.makeId('hist'), at: now, event: 'compile.done', note: 'state serialized' });
+    verbs.compileDone(st, (prefix) => state.makeId(prefix));
     return st;
   });
 

@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The five MCP session verbs — the roster rides the proven envelope.** Step 4.2 of the
+  ratified write-tools design: `state.append`, `open_loop.close`, `open_loop.park`,
+  `assumption.close` and `compile.done` join `state.set` on a `--write` server, each a
+  thin boundary over the same domain mutation the CLI verb runs — the meanings of
+  `state append`, `state close` and `compile done` moved to `src/verbs.js`, shared by
+  both doors, so the two surfaces cannot drift into two meanings for one verb. Every
+  tool carries the full 4.1 envelope (revision + generation CAS, operation receipts,
+  deterministic ids, one error funnel) through one shared outcome mapping. CLI gates
+  travel to the wire as schema (**MCP-boundary enforced**): evidence, owner,
+  revisit-trigger and the tested|killed outcome are required non-empty fields; the
+  `collection` enum excludes `artifacts` and `defects`, whose gated constructors a raw
+  append would bypass; and a claimed non-birth status never crosses the boundary — loops
+  are born `open`, assumptions `untested`, on both doors. Transitions on records that do
+  not exist refuse the new allowlisted `UnknownRecordId` with zero bytes moved; a
+  same-text loop or assumption dedups under the lock as a no-op naming the existing
+  record. `state.append` is the one non-destructive hint in the roster — a status
+  transition or checkpoint overwrite is not additive merely because provenance survives.
+  Twelve new falsifiers in `test/mcp-write.test.js` (roster contracts, CLI-equivalence
+  per verb, byte-pure refusals, a replayed checkpoint stamp), each seen red before the
+  roster existed; the `UnknownRecordId` mapping and the birth-status boundary check were
+  additionally each seen red against a deliberately broken variant. Cross-file verbs
+  still wait for 4b.
+
+<!-- Traced by: claude-fable-5 -->
+
 - **The first MCP write tool — and the machinery that makes a retried write safe to
   retry.** `state.set` joins the registry ONLY when the server is launched with `--write`:
   an unflagged server registers no write tools at all, so `tools/list` never advertises

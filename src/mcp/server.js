@@ -300,6 +300,7 @@ const WRITE_ERROR_BRANCH = Object.freeze({
         'StaleStateRev',
         'OperationIdConflict',
         'DeterministicIdConflict',
+        'UnknownRecordId',
         'WriteFailed',
       ],
     },
@@ -360,6 +361,164 @@ const STATE_SET_TOOL = Object.freeze({
   },
 });
 
+// A status transition or an overwrite is destructive; only genuinely additive
+// writes get destructiveHint:false. Provenance surviving in history does not
+// make an overwrite additive.
+const WRITE_DESTRUCTIVE = Object.freeze({
+  readOnlyHint: false,
+  destructiveHint: true,
+  idempotentHint: true,
+  openWorldHint: false,
+});
+
+// The appendable collections: STATE_COLLECTIONS minus the two whose gated
+// constructors a raw append would bypass — that is how a "closed" artifact or
+// a "resolved" defect gets minted with no transition behind it.
+const APPENDABLE = Object.freeze(
+  Object.keys(schemas.STATE_COLLECTIONS).filter((name) => name !== 'artifacts' && name !== 'defects')
+);
+
+const STATE_APPEND_USAGE =
+  'state.append requires exactly: workspaceHandle, expectedStateRev, expectedStateGen, operationId, collection, item (an object)';
+
+const STATE_APPEND_TOOL = Object.freeze({
+  name: 'state.append',
+  title: 'Append one record to a Torque session collection',
+  description:
+    'Append one record to a session-state collection (decisions, assumptions, openLoops, touchedFiles, history) on an opened workspace. Assumptions and open loops are born in their birth status — never closed, tested, or killed — and dedup by text against the live record. Artifacts and defects are not appendable: their constructors are gated (artifact.add, the CLI defect verbs). CAS-bound like every write.',
+  inputSchema: {
+    type: 'object',
+    properties: Object.assign({}, WRITE_ENVELOPE_PROPS, {
+      collection: { type: 'string', enum: [...APPENDABLE] },
+      item: {
+        type: 'object',
+        description: 'The record to append. A status field on assumptions/openLoops may only claim the birth status; ids are minted deterministically when absent.',
+      },
+    }),
+    required: [...WRITE_ENVELOPE_KEYS, 'collection', 'item'],
+    additionalProperties: false,
+  },
+  outputSchema: {
+    oneOf: [
+      writeSuccessBranch({
+        collection: { type: 'string', enum: [...APPENDABLE] },
+        recordId: { type: 'string' },
+        deduped: { type: 'boolean' },
+      }),
+      WRITE_ERROR_BRANCH,
+    ],
+  },
+  annotations: {
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+  },
+});
+
+const OPEN_LOOP_CLOSE_USAGE =
+  'open_loop.close requires exactly: workspaceHandle, expectedStateRev, expectedStateGen, operationId, id, evidence (non-empty strings)';
+
+const OPEN_LOOP_CLOSE_TOOL = Object.freeze({
+  name: 'open_loop.close',
+  title: 'Close an open loop with evidence',
+  description:
+    'Close one open loop on an opened workspace with the evidence that actually closed it — no proof, no close. CAS-bound like every write.',
+  inputSchema: {
+    type: 'object',
+    properties: Object.assign({}, WRITE_ENVELOPE_PROPS, {
+      id: { type: 'string', minLength: 1 },
+      evidence: { type: 'string', minLength: 1, description: 'What actually closed the loop.' },
+    }),
+    required: [...WRITE_ENVELOPE_KEYS, 'id', 'evidence'],
+    additionalProperties: false,
+  },
+  outputSchema: {
+    oneOf: [
+      writeSuccessBranch({ openLoopId: { type: 'string' }, status: { const: 'closed' } }),
+      WRITE_ERROR_BRANCH,
+    ],
+  },
+  annotations: WRITE_DESTRUCTIVE,
+});
+
+const OPEN_LOOP_PARK_USAGE =
+  'open_loop.park requires exactly: workspaceHandle, expectedStateRev, expectedStateGen, operationId, id, owner, revisitTrigger (non-empty strings)';
+
+const OPEN_LOOP_PARK_TOOL = Object.freeze({
+  name: 'open_loop.park',
+  title: 'Park an open loop with an owner and a revisit trigger',
+  description:
+    'Park one open loop on an opened workspace. Parking stops the nagging but the loop still drains confidence: the owner is attribution for an unanswered question, never a waiver or an approval token. CAS-bound like every write.',
+  inputSchema: {
+    type: 'object',
+    properties: Object.assign({}, WRITE_ENVELOPE_PROPS, {
+      id: { type: 'string', minLength: 1 },
+      owner: { type: 'string', minLength: 1, description: 'Who carries the parked loop. Attribution, not authorization.' },
+      revisitTrigger: { type: 'string', minLength: 1, description: 'What brings the loop back — a park with no trigger is a drop.' },
+    }),
+    required: [...WRITE_ENVELOPE_KEYS, 'id', 'owner', 'revisitTrigger'],
+    additionalProperties: false,
+  },
+  outputSchema: {
+    oneOf: [
+      writeSuccessBranch({ openLoopId: { type: 'string' }, status: { const: 'parked' } }),
+      WRITE_ERROR_BRANCH,
+    ],
+  },
+  annotations: WRITE_DESTRUCTIVE,
+});
+
+const ASSUMPTION_CLOSE_USAGE =
+  'assumption.close requires exactly: workspaceHandle, expectedStateRev, expectedStateGen, operationId, id, outcome (tested|killed), evidence (non-empty)';
+
+const ASSUMPTION_CLOSE_TOOL = Object.freeze({
+  name: 'assumption.close',
+  title: 'Close an assumption as tested or killed',
+  description:
+    'Close one assumption on an opened workspace with the result that settled it — an assumption ends proven or dead, never merely dropped. CAS-bound like every write.',
+  inputSchema: {
+    type: 'object',
+    properties: Object.assign({}, WRITE_ENVELOPE_PROPS, {
+      id: { type: 'string', minLength: 1 },
+      outcome: { type: 'string', enum: ['tested', 'killed'] },
+      evidence: { type: 'string', minLength: 1, description: 'The result that settled it.' },
+    }),
+    required: [...WRITE_ENVELOPE_KEYS, 'id', 'outcome', 'evidence'],
+    additionalProperties: false,
+  },
+  outputSchema: {
+    oneOf: [
+      writeSuccessBranch({ assumptionId: { type: 'string' }, status: { enum: ['tested', 'killed'] } }),
+      WRITE_ERROR_BRANCH,
+    ],
+  },
+  annotations: WRITE_DESTRUCTIVE,
+});
+
+const COMPILE_DONE_USAGE =
+  'compile.done requires exactly: workspaceHandle, expectedStateRev, expectedStateGen, operationId';
+
+const COMPILE_DONE_TOOL = Object.freeze({
+  name: 'compile.done',
+  title: 'Checkpoint the Torque session state',
+  description:
+    'Mark the session state CHECKPOINTED on an opened workspace: clear dirty and stamp lastCompileAt in one move. A checkpoint says the record is current, never that the work is finished. CAS-bound like every write.',
+  inputSchema: {
+    type: 'object',
+    properties: Object.assign({}, WRITE_ENVELOPE_PROPS),
+    required: [...WRITE_ENVELOPE_KEYS],
+    additionalProperties: false,
+  },
+  outputSchema: {
+    oneOf: [
+      writeSuccessBranch({ checkpointed: { const: true }, lastCompileAt: { type: 'string' } }),
+      WRITE_ERROR_BRANCH,
+    ],
+  },
+  annotations: WRITE_DESTRUCTIVE,
+});
+
 // The one sentence each refusal speaks. A table, so the funnel test can assert
 // every wire sentence against this allowlist — no verb-specific catch can leak
 // a path, an errno, or a store location.
@@ -369,6 +528,7 @@ const WRITE_REFUSALS = Object.freeze({
   StaleStateRev: 'workspace record moved since it was read — re-read the state and re-decide against the current revision',
   OperationIdConflict: 'operationId was already used for a different operation — mint a fresh operationId',
   DeterministicIdConflict: 'derived record id already names an existing record — the operation refuses to address it',
+  UnknownRecordId: 'no record with that id exists in the target collection — re-read the state and re-decide',
   WriteFailed: 'workspace write could not be completed',
 });
 
@@ -411,6 +571,61 @@ function writeArguments(arguments_, semanticKeys, usage) {
     throw rpc.rpcError(-32602, usage);
   }
   return args;
+}
+
+// A semantic string the schema calls non-empty: whitespace does not count as
+// evidence, an owner, or a trigger.
+function nonEmpty(value) {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+// ONE outcome mapping for every write tool. The verb supplies its meaning
+// (`apply`) and its semantic arguments; everything past the boundary happens
+// inside ops.executeWrite's single locked transaction, and every outcome —
+// success, replay, or refusal — leaves as a conforming structured result.
+function runWrite(record, tool, args, semanticArgs, apply) {
+  let outcome;
+  try {
+    outcome = ops.executeWrite({
+      state,
+      root: record.root,
+      tool,
+      operationId: args.operationId,
+      expectedStateRev: args.expectedStateRev,
+      expectedStateGen: args.expectedStateGen,
+      semanticArgs,
+      apply,
+    });
+  } catch (error) {
+    return safeWriteError(error);
+  }
+  switch (outcome.kind) {
+    case 'replayed':
+      return toolResult(Object.assign(outcome.result, { replayed: true }));
+    case 'committed':
+    case 'noop':
+      return toolResult(outcome.result);
+    case 'stateMissing':
+      return writeRefusal('StateNotInitialized', { actualStateRev: null, actualStateGen: null });
+    case 'staleGen':
+      return writeRefusal('StaleGeneration', {
+        expectedStateGen: args.expectedStateGen,
+        actualStateGen: outcome.actualStateGen,
+      });
+    case 'staleRev':
+      return writeRefusal('StaleStateRev', {
+        expectedStateRev: args.expectedStateRev,
+        actualStateRev: outcome.actualStateRev,
+      });
+    case 'conflict':
+      return writeRefusal('OperationIdConflict');
+    case 'idConflict':
+      return writeRefusal('DeterministicIdConflict');
+    case 'unknownId':
+      return writeRefusal('UnknownRecordId');
+    default:
+      return writeRefusal('WriteFailed');
+  }
 }
 
 const RESOURCE_TEMPLATES = Object.freeze(RESOURCE_NAMES.map((name) => Object.freeze({
@@ -715,11 +930,11 @@ function createServer(options) {
       }
     }
 
-    // The canary write verb. Envelope and semantics are refused at the
-    // boundary; everything past resolveHandle happens inside ops.executeWrite's
-    // single locked transaction, and every outcome maps to a conforming
-    // structured result. The verb's meaning lives in src/verbs.js, shared with
-    // the CLI — one implementation, two boundaries.
+    // The write verbs. Envelope and semantics are refused at the boundary;
+    // everything past resolveHandle happens inside ops.executeWrite's single
+    // locked transaction (via runWrite's one outcome mapping), and each verb's
+    // meaning lives in src/verbs.js, shared with the CLI — one implementation,
+    // two boundaries.
     function stateSet(arguments_) {
       const args = writeArguments(arguments_, ['key', 'value'], STATE_SET_USAGE);
       if (typeof args.key !== 'string' || !schemas.STATE_SCALARS.has(args.key)) {
@@ -727,49 +942,86 @@ function createServer(options) {
       }
       if (typeof args.value !== 'string') throw rpc.rpcError(-32602, STATE_SET_USAGE);
       const record = resolveHandle(args.workspaceHandle, 'write');
-      let outcome;
-      try {
-        outcome = ops.executeWrite({
-          state,
-          root: record.root,
-          tool: 'state.set',
-          operationId: args.operationId,
-          expectedStateRev: args.expectedStateRev,
-          expectedStateGen: args.expectedStateGen,
-          semanticArgs: { key: args.key, value: args.value },
-          apply: (s, mintId) => {
-            verbs.setScalar(s, args.key, args.value, mintId);
-            return { key: args.key };
-          },
+      return runWrite(record, 'state.set', args, { key: args.key, value: args.value }, (s, mintId) => {
+        verbs.setScalar(s, args.key, args.value, mintId);
+        return { key: args.key };
+      });
+    }
+
+    function stateAppend(arguments_) {
+      const args = writeArguments(arguments_, ['collection', 'item'], STATE_APPEND_USAGE);
+      if (typeof args.collection !== 'string' || !APPENDABLE.includes(args.collection)) {
+        throw rpc.rpcError(-32602,
+          `state.append collection must be one of: ${APPENDABLE.join(', ')} — ` +
+          'artifacts and defects have gated constructors (artifact.add, the CLI defect verbs)');
+      }
+      const item = args.item;
+      if (!item || typeof item !== 'object' || Array.isArray(item)) {
+        throw rpc.rpcError(-32602, STATE_APPEND_USAGE);
+      }
+      if (item.id !== undefined && !nonEmpty(item.id)) throw rpc.rpcError(-32602, STATE_APPEND_USAGE);
+      // Birth status is a fact of the collection, not a request field. The
+      // shared verb re-checks; refusing here keeps a claimed status from ever
+      // entering the transaction.
+      const birth = verbs.BIRTH_STATUS[args.collection];
+      if (birth && item.status != null && String(item.status) !== birth) {
+        throw rpc.rpcError(-32602,
+          `state.append ${args.collection} are born "${birth}" — reaching any other status is a transition verb, not a birth field`);
+      }
+      const record = resolveHandle(args.workspaceHandle, 'write');
+      return runWrite(record, 'state.append', args, { collection: args.collection, item }, (s, mintId) => {
+        const appended = verbs.appendItem(s, args.collection, item, mintId);
+        if (appended.dup) return { collection: args.collection, recordId: String(appended.dup.id), deduped: true };
+        return { collection: args.collection, recordId: String(appended.record.id), deduped: false };
+      });
+    }
+
+    function openLoopClose(arguments_) {
+      const args = writeArguments(arguments_, ['id', 'evidence'], OPEN_LOOP_CLOSE_USAGE);
+      if (!nonEmpty(args.id) || !nonEmpty(args.evidence)) throw rpc.rpcError(-32602, OPEN_LOOP_CLOSE_USAGE);
+      const record = resolveHandle(args.workspaceHandle, 'write');
+      return runWrite(record, 'open_loop.close', args, { id: args.id, evidence: args.evidence }, (s, mintId) => {
+        verbs.closeRecord(s, 'openLoops', args.id, { evidence: args.evidence }, mintId);
+        return { openLoopId: args.id, status: 'closed' };
+      });
+    }
+
+    function openLoopPark(arguments_) {
+      const args = writeArguments(arguments_, ['id', 'owner', 'revisitTrigger'], OPEN_LOOP_PARK_USAGE);
+      if (!nonEmpty(args.id) || !nonEmpty(args.owner) || !nonEmpty(args.revisitTrigger)) {
+        throw rpc.rpcError(-32602, OPEN_LOOP_PARK_USAGE);
+      }
+      const record = resolveHandle(args.workspaceHandle, 'write');
+      return runWrite(record, 'open_loop.park', args,
+        { id: args.id, owner: args.owner, revisitTrigger: args.revisitTrigger }, (s, mintId) => {
+          verbs.closeRecord(s, 'openLoops', args.id,
+            { park: true, owner: args.owner, revisitTrigger: args.revisitTrigger }, mintId);
+          return { openLoopId: args.id, status: 'parked' };
         });
-      } catch (error) {
-        return safeWriteError(error);
+    }
+
+    function assumptionClose(arguments_) {
+      const args = writeArguments(arguments_, ['id', 'outcome', 'evidence'], ASSUMPTION_CLOSE_USAGE);
+      if (!nonEmpty(args.id) || !nonEmpty(args.evidence)) throw rpc.rpcError(-32602, ASSUMPTION_CLOSE_USAGE);
+      if (args.outcome !== 'tested' && args.outcome !== 'killed') {
+        throw rpc.rpcError(-32602, ASSUMPTION_CLOSE_USAGE);
       }
-      switch (outcome.kind) {
-        case 'replayed':
-          return toolResult(Object.assign(outcome.result, { replayed: true }));
-        case 'committed':
-        case 'noop':
-          return toolResult(outcome.result);
-        case 'stateMissing':
-          return writeRefusal('StateNotInitialized', { actualStateRev: null, actualStateGen: null });
-        case 'staleGen':
-          return writeRefusal('StaleGeneration', {
-            expectedStateGen: args.expectedStateGen,
-            actualStateGen: outcome.actualStateGen,
-          });
-        case 'staleRev':
-          return writeRefusal('StaleStateRev', {
-            expectedStateRev: args.expectedStateRev,
-            actualStateRev: outcome.actualStateRev,
-          });
-        case 'conflict':
-          return writeRefusal('OperationIdConflict');
-        case 'idConflict':
-          return writeRefusal('DeterministicIdConflict');
-        default:
-          return writeRefusal('WriteFailed');
-      }
+      const record = resolveHandle(args.workspaceHandle, 'write');
+      return runWrite(record, 'assumption.close', args,
+        { id: args.id, outcome: args.outcome, evidence: args.evidence }, (s, mintId) => {
+          verbs.closeRecord(s, 'assumptions', args.id,
+            { outcome: args.outcome, evidence: args.evidence }, mintId);
+          return { assumptionId: args.id, status: args.outcome };
+        });
+    }
+
+    function markCompileDone(arguments_) {
+      const args = writeArguments(arguments_, [], COMPILE_DONE_USAGE);
+      const record = resolveHandle(args.workspaceHandle, 'write');
+      return runWrite(record, 'compile.done', args, {}, (s, mintId) => {
+        const at = verbs.compileDone(s, mintId);
+        return { checkpointed: true, lastCompileAt: at };
+      });
     }
 
     // ONE registry. tools/list renders it and tools/call dispatches from it, so
@@ -781,7 +1033,14 @@ function createServer(options) {
       { descriptor: SCAN_TOOL, run: scanWorkspace },
       { descriptor: CONFIDENCE_TOOL, run: confidenceForWorkspace },
       { descriptor: FRICTION_TOOL, run: rankFriction },
-      ...(writeEnabled ? [{ descriptor: STATE_SET_TOOL, run: stateSet }] : []),
+      ...(writeEnabled ? [
+        { descriptor: STATE_SET_TOOL, run: stateSet },
+        { descriptor: STATE_APPEND_TOOL, run: stateAppend },
+        { descriptor: OPEN_LOOP_CLOSE_TOOL, run: openLoopClose },
+        { descriptor: OPEN_LOOP_PARK_TOOL, run: openLoopPark },
+        { descriptor: ASSUMPTION_CLOSE_TOOL, run: assumptionClose },
+        { descriptor: COMPILE_DONE_TOOL, run: markCompileDone },
+      ] : []),
     ];
 
     function parseResource(uri) {
