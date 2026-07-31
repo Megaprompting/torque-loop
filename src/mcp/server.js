@@ -47,6 +47,7 @@ const prompts = require('./prompts');
 const repository = require('./repository');
 const rpc = require('./rpc');
 const workspace = require('./workspace');
+const artifacts = require('../artifacts');
 const coldStart = require('../coldStart');
 const journal = require('../evolve/journal');
 const lifecycle = require('../lifecycle');
@@ -301,6 +302,10 @@ const WRITE_ERROR_BRANCH = Object.freeze({
         'OperationIdConflict',
         'DeterministicIdConflict',
         'UnknownRecordId',
+        'ArtifactClosed',
+        'ClosureBlocked',
+        'HumanAuthorityRequired',
+        'RetractRefused',
         'WriteFailed',
       ],
     },
@@ -519,6 +524,154 @@ const COMPILE_DONE_TOOL = Object.freeze({
   annotations: WRITE_DESTRUCTIVE,
 });
 
+const ARTIFACT_ADD_USAGE =
+  'artifact.add requires exactly: workspaceHandle, expectedStateRev, expectedStateGen, operationId, item (an object)';
+
+const ARTIFACT_ADD_TOOL = Object.freeze({
+  name: 'artifact.add',
+  title: 'Record or revise a Torque artifact',
+  description:
+    'Record an artifact ({title, kind, path, holes, revises}) on an opened workspace, or revise the one an existing id names. Terminal statuses and lifecycle fields are never accepted as input — they are earned by gated verbs (artifact.close, artifact.retract). An identical revision is a no-op: no revision bump, no proof invalidated. CAS-bound like every write.',
+  inputSchema: {
+    type: 'object',
+    properties: Object.assign({}, WRITE_ENVELOPE_PROPS, {
+      item: {
+        type: 'object',
+        description: 'The artifact payload. An existing id revises that artifact; kind is immutable; a probe is born with its disposal hole.',
+      },
+    }),
+    required: [...WRITE_ENVELOPE_KEYS, 'item'],
+    additionalProperties: false,
+  },
+  outputSchema: {
+    oneOf: [
+      writeSuccessBranch({
+        artifactId: { type: 'string' },
+        artifactRev: { type: 'integer' },
+        action: { type: 'string', enum: ['created', 'revised', 'unchanged'] },
+      }),
+      WRITE_ERROR_BRANCH,
+    ],
+  },
+  // A revision overwrites the mutable fields and invalidates proof bound to
+  // the previous revision — not additive.
+  annotations: WRITE_DESTRUCTIVE,
+});
+
+const ARTIFACT_CLOSE_USAGE =
+  'artifact.close requires exactly: workspaceHandle, expectedStateRev, expectedStateGen, operationId, id (non-empty)';
+
+const ARTIFACT_CLOSE_TOOL = Object.freeze({
+  name: 'artifact.close',
+  title: 'Close an artifact against its bound proof',
+  description:
+    'Close one artifact on an opened workspace — only when a KEEP proof is bound to this exact revision and hash, no open defects are attached, and no holes remain. There are no waiver arguments on this wire: record-scope proof and holes-waived closure require named human authorization and stay CLI acts. A second close of a certified artifact is a no-op. CAS-bound like every write.',
+  inputSchema: {
+    type: 'object',
+    properties: Object.assign({}, WRITE_ENVELOPE_PROPS, {
+      id: { type: 'string', minLength: 1 },
+    }),
+    required: [...WRITE_ENVELOPE_KEYS, 'id'],
+    additionalProperties: false,
+  },
+  outputSchema: {
+    oneOf: [
+      writeSuccessBranch({
+        artifactId: { type: 'string' },
+        artifactRev: { type: 'integer' },
+        status: { const: 'closed' },
+      }),
+      WRITE_ERROR_BRANCH,
+    ],
+  },
+  annotations: WRITE_DESTRUCTIVE,
+});
+
+const ARTIFACT_RETRACT_USAGE =
+  'artifact.retract requires exactly: workspaceHandle, expectedStateRev, expectedStateGen, operationId, id, reason (non-empty), optionally supersededBy (non-empty)';
+
+const ARTIFACT_RETRACT_TOOL = Object.freeze({
+  name: 'artifact.retract',
+  title: 'Retract an artifact whose claim is false or obsolete',
+  description:
+    'Retract one artifact on an opened workspace, keeping the record for provenance. Never silent: a reason is required, and a probe exit must state its outcome — reason starts "disposed:" (code reverted, finding recorded) or "promoted:" with supersededBy naming the recorded build-for-keep that replaced it. CAS-bound like every write.',
+  inputSchema: {
+    type: 'object',
+    properties: Object.assign({}, WRITE_ENVELOPE_PROPS, {
+      id: { type: 'string', minLength: 1 },
+      reason: { type: 'string', minLength: 1, description: 'Why the claim is false or obsolete. Probe exits start with "disposed:" or "promoted:".' },
+      supersededBy: { type: 'string', minLength: 1, description: 'The artifact that replaced this one. Required when a probe is promoted.' },
+    }),
+    required: [...WRITE_ENVELOPE_KEYS, 'id', 'reason'],
+    additionalProperties: false,
+  },
+  outputSchema: {
+    oneOf: [
+      writeSuccessBranch({
+        artifactId: { type: 'string' },
+        status: { const: 'retracted' },
+        supersededBy: { type: ['string', 'null'] },
+      }),
+      WRITE_ERROR_BRANCH,
+    ],
+  },
+  annotations: WRITE_DESTRUCTIVE,
+});
+
+const APERTURE_DIMENSION_KEYS = Object.freeze(['ambiguity', 'terrain', 'taste', 'blastRadius', 'reversibility']);
+
+const SCORE_APERTURE_USAGE =
+  'score.aperture requires exactly: workspaceHandle, expectedStateRev, expectedStateGen, operationId, ambiguity, terrain, taste, blastRadius, reversibility (each an integer 0-2)';
+
+function apertureDimensionProps() {
+  const props = {};
+  for (const key of APERTURE_DIMENSION_KEYS) {
+    props[key] = { type: 'integer', minimum: 0, maximum: 2 };
+  }
+  return props;
+}
+
+const SCORE_APERTURE_TOOL = Object.freeze({
+  name: 'score.aperture',
+  title: 'Meter loop depth from uncertainty',
+  description:
+    'Score the five uncertainty dimensions (each 0-2) into an aperture level A0-A4 with the ratchet sequence to run at that depth. The read that writes: when mapRequired fires and no fog is on the record yet, the fog is serialized as an open loop in the same transaction — so this names the revision and generation it decided against like every write. A stale refusal means the world moved; re-read and re-score.',
+  inputSchema: {
+    type: 'object',
+    properties: Object.assign({}, WRITE_ENVELOPE_PROPS, apertureDimensionProps()),
+    required: [...WRITE_ENVELOPE_KEYS, ...APERTURE_DIMENSION_KEYS],
+    additionalProperties: false,
+  },
+  outputSchema: {
+    oneOf: [
+      writeSuccessBranch({
+        score: { type: 'integer', minimum: 0, maximum: 10 },
+        level: { type: 'string', enum: ['A0', 'A1', 'A2', 'A3', 'A4'] },
+        name: { type: 'string' },
+        implement: { type: 'boolean' },
+        sequence: { type: 'array', items: { type: 'string' } },
+        mapRequired: { type: 'boolean' },
+        dimensions: {
+          type: 'object',
+          properties: apertureDimensionProps(),
+          required: [...APERTURE_DIMENSION_KEYS],
+          additionalProperties: false,
+        },
+        scope: { type: 'string' },
+        recordedFog: { type: 'boolean' },
+      }),
+      WRITE_ERROR_BRANCH,
+    ],
+  },
+  annotations: {
+    readOnlyHint: false,
+    // The only write it performs is additive: one fog loop, first racer wins.
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+  },
+});
+
 // The one sentence each refusal speaks. A table, so the funnel test can assert
 // every wire sentence against this allowlist — no verb-specific catch can leak
 // a path, an errno, or a store location.
@@ -529,6 +682,10 @@ const WRITE_REFUSALS = Object.freeze({
   OperationIdConflict: 'operationId was already used for a different operation — mint a fresh operationId',
   DeterministicIdConflict: 'derived record id already names an existing record — the operation refuses to address it',
   UnknownRecordId: 'no record with that id exists in the target collection — re-read the state and re-decide',
+  ArtifactClosed: 'artifact is closed — closure is a historical fact; record a new artifact naming it in "revises", or retract it',
+  ClosureBlocked: 'artifact closure is blocked — bound proof, open defects, holes, or a damaged proof record stand in the way; the confidence read names each blocker',
+  HumanAuthorityRequired: 'this closure needs named human authorization (record-scope proof or waived holes) — it has no wire spelling; run it from the CLI',
+  RetractRefused: 'retraction refused — a probe exit states its outcome (reason starts "disposed:" or "promoted:"), and a promotion names a recorded non-probe replacement',
   WriteFailed: 'workspace write could not be completed',
 });
 
@@ -552,15 +709,15 @@ function safeWriteError(_error) {
 // semantic fields, every one present, none extra, each envelope field typed.
 // The message names the fields (that reveals no authority); the handle itself
 // is still validated by resolveHandle's one non-enumerating answer.
-function writeArguments(arguments_, semanticKeys, usage) {
+function writeArguments(arguments_, semanticKeys, usage, optionalKeys) {
   const args = arguments_;
   if (!args || typeof args !== 'object' || Array.isArray(args)) throw rpc.rpcError(-32602, usage);
-  const allowed = [...WRITE_ENVELOPE_KEYS, ...semanticKeys];
-  const allowedSet = new Set(allowed);
+  const required = [...WRITE_ENVELOPE_KEYS, ...semanticKeys];
+  const allowedSet = new Set([...required, ...(optionalKeys || [])]);
   for (const key of Object.keys(args)) {
     if (!allowedSet.has(key)) throw rpc.rpcError(-32602, usage);
   }
-  for (const key of allowed) {
+  for (const key of required) {
     if (!Object.prototype.hasOwnProperty.call(args, key)) throw rpc.rpcError(-32602, usage);
   }
   if (!Number.isInteger(args.expectedStateRev) || args.expectedStateRev < 0) {
@@ -583,7 +740,7 @@ function nonEmpty(value) {
 // (`apply`) and its semantic arguments; everything past the boundary happens
 // inside ops.executeWrite's single locked transaction, and every outcome —
 // success, replay, or refusal — leaves as a conforming structured result.
-function runWrite(record, tool, args, semanticArgs, apply) {
+function runWrite(record, tool, args, semanticArgs, apply, alsoLockFile) {
   let outcome;
   try {
     outcome = ops.executeWrite({
@@ -595,6 +752,7 @@ function runWrite(record, tool, args, semanticArgs, apply) {
       expectedStateGen: args.expectedStateGen,
       semanticArgs,
       apply,
+      alsoLockFile,
     });
   } catch (error) {
     return safeWriteError(error);
@@ -623,6 +781,14 @@ function runWrite(record, tool, args, semanticArgs, apply) {
       return writeRefusal('DeterministicIdConflict');
     case 'unknownId':
       return writeRefusal('UnknownRecordId');
+    case 'artifactClosed':
+      return writeRefusal('ArtifactClosed');
+    case 'closureBlocked':
+      return writeRefusal('ClosureBlocked');
+    case 'humanAuthority':
+      return writeRefusal('HumanAuthorityRequired');
+    case 'retractRefused':
+      return writeRefusal('RetractRefused');
     default:
       return writeRefusal('WriteFailed');
   }
@@ -1024,6 +1190,79 @@ function createServer(options) {
       });
     }
 
+    function artifactAdd(arguments_) {
+      const args = writeArguments(arguments_, ['item'], ARTIFACT_ADD_USAGE);
+      const item = args.item;
+      if (!item || typeof item !== 'object' || Array.isArray(item)) {
+        throw rpc.rpcError(-32602, ARTIFACT_ADD_USAGE);
+      }
+      if (item.id !== undefined && !nonEmpty(item.id)) throw rpc.rpcError(-32602, ARTIFACT_ADD_USAGE);
+      // Terminal statuses and reserved lifecycle fields are static shape rules,
+      // so they refuse at the boundary; the shared verb re-checks underneath.
+      // The messages echo only client-supplied values, never server state.
+      try {
+        artifacts.assertArtifactInput(item);
+      } catch (error) {
+        throw rpc.rpcError(-32602, error.message);
+      }
+      const record = resolveHandle(args.workspaceHandle, 'write');
+      return runWrite(record, 'artifact.add', args, { item }, (s, mintId) => {
+        const res = artifacts.applyAdd(s, item, mintId);
+        return { artifactId: String(res.record.id), artifactRev: res.record.rev, action: res.action };
+      });
+    }
+
+    function artifactClose(arguments_) {
+      const args = writeArguments(arguments_, ['id'], ARTIFACT_CLOSE_USAGE);
+      if (!nonEmpty(args.id)) throw rpc.rpcError(-32602, ARTIFACT_CLOSE_USAGE);
+      const record = resolveHandle(args.workspaceHandle, 'write');
+      // No waiver arguments cross this wire (opts stays {}), so record-scope
+      // proof and open holes refuse in the shared gate. The journal lock spans
+      // the whole transaction, commit included — same contract as the CLI.
+      return runWrite(record, 'artifact.close', args, { id: args.id }, (s, mintId) => {
+        const res = artifacts.applyClose(record.root, s, args.id, {}, mintId);
+        const artifactRev = res.already ? res.artifact.closedRev : res.fp.rev;
+        return { artifactId: args.id, artifactRev, status: 'closed' };
+      }, journal.logPath(record.root));
+    }
+
+    function artifactRetract(arguments_) {
+      const args = writeArguments(arguments_, ['id', 'reason'], ARTIFACT_RETRACT_USAGE, ['supersededBy']);
+      if (!nonEmpty(args.id) || !nonEmpty(args.reason)) throw rpc.rpcError(-32602, ARTIFACT_RETRACT_USAGE);
+      if (args.supersededBy !== undefined && !nonEmpty(args.supersededBy)) {
+        throw rpc.rpcError(-32602, ARTIFACT_RETRACT_USAGE);
+      }
+      // Absent and present-but-null are one meaning; normalizing before the
+      // binding hash keeps a verbatim retry hashing identically either way.
+      const supersededBy = args.supersededBy === undefined ? null : args.supersededBy;
+      const record = resolveHandle(args.workspaceHandle, 'write');
+      return runWrite(record, 'artifact.retract', args,
+        { id: args.id, reason: args.reason, supersededBy }, (s, mintId) => {
+          artifacts.applyRetract(s, args.id,
+            { reason: args.reason, supersededBy: supersededBy || '' }, mintId);
+          return { artifactId: args.id, status: 'retracted', supersededBy };
+        });
+    }
+
+    function scoreAperture(arguments_) {
+      const args = writeArguments(arguments_, [...APERTURE_DIMENSION_KEYS], SCORE_APERTURE_USAGE);
+      const dims = {};
+      for (const key of APERTURE_DIMENSION_KEYS) {
+        const v = args[key];
+        if (!Number.isInteger(v) || v < 0 || v > 2) throw rpc.rpcError(-32602, SCORE_APERTURE_USAGE);
+        dims[key] = v;
+      }
+      const record = resolveHandle(args.workspaceHandle, 'write');
+      // The score itself is pure; the conditional fog write is the reason this
+      // rides the write envelope. recordedFog is truthful on both outcomes: a
+      // score that wrote nothing commits nothing (noop, committed:false).
+      const result = scoring.scoreAperture(dims);
+      return runWrite(record, 'score.aperture', args, dims, (s, mintId) => {
+        const recorded = verbs.recordFog(s, result, mintId);
+        return Object.assign({}, result, { recordedFog: recorded });
+      });
+    }
+
     // ONE registry. tools/list renders it and tools/call dispatches from it, so
     // a listed tool cannot silently lack an implementation and an implemented
     // tool cannot stay undiscoverable. The order is the advertised order; the
@@ -1040,6 +1279,10 @@ function createServer(options) {
         { descriptor: OPEN_LOOP_PARK_TOOL, run: openLoopPark },
         { descriptor: ASSUMPTION_CLOSE_TOOL, run: assumptionClose },
         { descriptor: COMPILE_DONE_TOOL, run: markCompileDone },
+        { descriptor: ARTIFACT_ADD_TOOL, run: artifactAdd },
+        { descriptor: ARTIFACT_CLOSE_TOOL, run: artifactClose },
+        { descriptor: ARTIFACT_RETRACT_TOOL, run: artifactRetract },
+        { descriptor: SCORE_APERTURE_TOOL, run: scoreAperture },
       ] : []),
     ];
 

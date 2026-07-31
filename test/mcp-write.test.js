@@ -261,9 +261,11 @@ ok('U4 derived ids keep 128 bits, are deterministic, and vary by role', () => {
 
 const ENVELOPE_KEYS = ['workspaceHandle', 'expectedStateRev', 'expectedStateGen', 'operationId'];
 const SESSION_VERBS = ['state.append', 'open_loop.close', 'open_loop.park', 'assumption.close', 'compile.done'];
+const ARTIFACT_VERBS = ['artifact.add', 'artifact.close', 'artifact.retract', 'score.aperture'];
+const APERTURE_DIMS = ['ambiguity', 'terrain', 'taste', 'blastRadius', 'reversibility'];
 const WRITE_ROSTER = [
   'workspace.open', 'workspace.scan', 'score.confidence', 'score.friction',
-  'state.set', ...SESSION_VERBS,
+  'state.set', ...SESSION_VERBS, ...ARTIFACT_VERBS,
 ];
 
 ok('W1 a flagless server registers no write tools and cannot dispatch one', () => {
@@ -901,7 +903,7 @@ ok('W20 a reconnect after server death replays the receipt through a new handle'
 // schema, and its refusals stay byte-pure.
 // ---------------------------------------------------------------------------
 
-ok('V1 the --write roster advertises all six write tools with pinned contracts', () => {
+ok('V1 the --write roster advertises all ten write tools with pinned contracts', () => {
   const repo = initRepo('v1-repo');
   const conn = service([repo], true).createConnection();
   const tools = modern(conn, 'tools/list', {}).result.tools;
@@ -912,6 +914,8 @@ ok('V1 the --write roster advertises all six write tools with pinned contracts',
   for (const [name, destructive] of [
     ['state.append', false], ['open_loop.close', true], ['open_loop.park', true],
     ['assumption.close', true], ['compile.done', true],
+    ['artifact.add', true], ['artifact.close', true], ['artifact.retract', true],
+    ['score.aperture', false],
   ]) {
     const tool = byName.get(name);
     assert.deepStrictEqual(tool.annotations,
@@ -920,7 +924,9 @@ ok('V1 the --write roster advertises all six write tools with pinned contracts',
     assert.strictEqual(tool.outputSchema.oneOf.length, 2, `${name} has success and error branches`);
     assert.deepStrictEqual(tool.outputSchema.oneOf[1].properties.error.enum, [
       'StateNotInitialized', 'StaleGeneration', 'StaleStateRev',
-      'OperationIdConflict', 'DeterministicIdConflict', 'UnknownRecordId', 'WriteFailed',
+      'OperationIdConflict', 'DeterministicIdConflict', 'UnknownRecordId',
+      'ArtifactClosed', 'ClosureBlocked', 'HumanAuthorityRequired', 'RetractRefused',
+      'WriteFailed',
     ], name);
   }
   const required = (name) => byName.get(name).inputSchema.required;
@@ -929,6 +935,12 @@ ok('V1 the --write roster advertises all six write tools with pinned contracts',
   assert.deepStrictEqual(required('open_loop.park'), [...ENVELOPE_KEYS, 'id', 'owner', 'revisitTrigger']);
   assert.deepStrictEqual(required('assumption.close'), [...ENVELOPE_KEYS, 'id', 'outcome', 'evidence']);
   assert.deepStrictEqual(required('compile.done'), [...ENVELOPE_KEYS]);
+  assert.deepStrictEqual(required('artifact.add'), [...ENVELOPE_KEYS, 'item']);
+  assert.deepStrictEqual(required('artifact.close'), [...ENVELOPE_KEYS, 'id']);
+  // supersededBy is the one optional wire field: allowed by the schema, never required.
+  assert.deepStrictEqual(required('artifact.retract'), [...ENVELOPE_KEYS, 'id', 'reason']);
+  assert.ok(byName.get('artifact.retract').inputSchema.properties.supersededBy);
+  assert.deepStrictEqual(required('score.aperture'), [...ENVELOPE_KEYS, ...APERTURE_DIMS]);
   const success = (name) => byName.get(name).outputSchema.oneOf[0].required;
   const COMMON = ['ok', 'committed', 'stateRev', 'replayed'];
   assert.deepStrictEqual(success('state.append'), [...COMMON, 'collection', 'recordId', 'deduped']);
@@ -936,17 +948,22 @@ ok('V1 the --write roster advertises all six write tools with pinned contracts',
   assert.deepStrictEqual(success('open_loop.park'), [...COMMON, 'openLoopId', 'status']);
   assert.deepStrictEqual(success('assumption.close'), [...COMMON, 'assumptionId', 'status']);
   assert.deepStrictEqual(success('compile.done'), [...COMMON, 'checkpointed', 'lastCompileAt']);
+  assert.deepStrictEqual(success('artifact.add'), [...COMMON, 'artifactId', 'artifactRev', 'action']);
+  assert.deepStrictEqual(success('artifact.close'), [...COMMON, 'artifactId', 'artifactRev', 'status']);
+  assert.deepStrictEqual(success('artifact.retract'), [...COMMON, 'artifactId', 'status', 'supersededBy']);
+  assert.deepStrictEqual(success('score.aperture'), [...COMMON,
+    'score', 'level', 'name', 'implement', 'sequence', 'mapRequired', 'dimensions', 'scope', 'recordedFog']);
   // The gated constructors are not appendable — the enum itself says so.
   assert.deepStrictEqual(byName.get('state.append').inputSchema.properties.collection.enum,
     ['decisions', 'assumptions', 'openLoops', 'touchedFiles', 'history']);
 });
 
-ok('V2 no session verb is listed or dispatchable on a flagless server', () => {
+ok('V2 no session or artifact verb is listed or dispatchable on a flagless server', () => {
   const repo = initRepo('v2-repo');
   const conn = service([repo], false).createConnection();
   const listed = modern(conn, 'tools/list', {}).result.tools.map((t) => t.name);
   const open = openWorkspace(conn, repo);
-  for (const tool of SESSION_VERBS) {
+  for (const tool of [...SESSION_VERBS, ...ARTIFACT_VERBS]) {
     assert.ok(!listed.includes(tool), `${tool} must not be advertised`);
     const response = callTool(conn, 'modern', tool, envelopeFor(open, {}));
     assert.strictEqual(response.error && response.error.code, -32602, tool);
@@ -1157,6 +1174,8 @@ ok('V9 a transition on a record that does not exist refuses UnknownRecordId with
     ['open_loop.close', { id: 'loop-ghost', evidence: 'e' }],
     ['open_loop.park', { id: 'loop-ghost', owner: 'o', revisitTrigger: 't' }],
     ['assumption.close', { id: 'asm-ghost', outcome: 'tested', evidence: 'e' }],
+    ['artifact.close', { id: 'art-ghost' }],
+    ['artifact.retract', { id: 'art-ghost', reason: 'gone' }],
   ]) {
     const structured = refusal(callTool(conn, 'modern', tool, envelopeFor(open, semantic)));
     assert.strictEqual(structured.error, 'UnknownRecordId', tool);
@@ -1218,6 +1237,21 @@ ok('V11 malformed verb arguments refuse at the boundary with zero bytes moved', 
     ['assumption.close', { id: 'x', outcome: 'maybe', evidence: 'e' }],
     ['assumption.close', { id: 'x', outcome: 'tested', evidence: '' }],
     ['compile.done', { extra: true }],
+    ['artifact.add', { item: [] }],
+    ['artifact.add', { item: 'text' }],
+    ['artifact.add', { item: { title: 'x', id: '' } }],
+    ['artifact.add', { item: { title: 'x', status: 'closed' } }],
+    ['artifact.add', { item: { title: 'x', status: 'retracted' } }],
+    ['artifact.add', { item: { title: 'x', closedAt: 'yesterday' } }],
+    ['artifact.add', { item: { title: 'x', retracted: {} } }],
+    ['artifact.close', { id: '' }],
+    ['artifact.retract', { id: '', reason: 'r' }],
+    ['artifact.retract', { id: 'x', reason: '' }],
+    ['artifact.retract', { id: 'x', reason: 'r', supersededBy: '' }],
+    ['score.aperture', { ambiguity: 3, terrain: 0, taste: 0, blastRadius: 0, reversibility: 0 }],
+    ['score.aperture', { ambiguity: '1', terrain: 0, taste: 0, blastRadius: 0, reversibility: 0 }],
+    ['score.aperture', { terrain: 0, taste: 0, blastRadius: 0, reversibility: 0 }],
+    ['score.aperture', { ambiguity: 0, terrain: 0, taste: 0, blastRadius: 0, reversibility: 0, extra: 1 }],
   ];
   for (const [tool, semantic] of cases) {
     boundaryRefusal(callTool(conn, 'modern', tool, envelopeFor(open, semantic)));
@@ -1228,7 +1262,7 @@ ok('V11 malformed verb arguments refuse at the boundary with zero bytes moved', 
   assert.match(gated.message, /artifact/, 'the refusal names the gated door');
 });
 
-ok('V12 every session verb answers a foreign handle with the one non-enumerating refusal', () => {
+ok('V12 every session and artifact verb answers a foreign handle with the one non-enumerating refusal', () => {
   const repo = initRepo('v12-repo');
   const server = service([repo], true);
   const conn = server.createConnection();
@@ -1241,10 +1275,279 @@ ok('V12 every session verb answers a foreign handle with the one non-enumerating
     ['open_loop.park', { id: 'x', owner: 'o', revisitTrigger: 't' }],
     ['assumption.close', { id: 'x', outcome: 'tested', evidence: 'e' }],
     ['compile.done', {}],
+    ['artifact.add', { item: { title: 'x' } }],
+    ['artifact.close', { id: 'x' }],
+    ['artifact.retract', { id: 'x', reason: 'r' }],
+    ['score.aperture', { ambiguity: 0, terrain: 0, taste: 0, blastRadius: 0, reversibility: 0 }],
   ]) {
     messages.add(boundaryRefusal(callTool(foreign, 'modern', tool, envelopeFor(open, semantic))).message);
   }
   assert.strictEqual(messages.size, 1, 'one answer for every foreign handle');
+});
+
+// ---------------------------------------------------------------------------
+// Step 4.3: the artifact verbs + score.aperture. The lifecycle gates the CLI
+// earned (bound proof, probe discipline, no waiver arguments) hold unchanged
+// on the wire, and the one aperture write is serialized exactly once.
+// ---------------------------------------------------------------------------
+
+const journal = require('../src/evolve/journal');
+const lifecycle = require('../src/lifecycle');
+
+function keepFields(artifactId, over) {
+  return {
+    target: 'thing.js',
+    artifactId,
+    verdict: 'KEEP',
+    verification: { commands: [{ command: 'node -e 0', pass: true }], result: 'pass' },
+    seam: { evidenceType: 'test', testedSeam: 'x', shipSeam: 'x', seamMatch: 'exact', independentFromBuilderMethod: true },
+    ...over,
+  };
+}
+
+// An artifact with a real file and a KEEP bound to its exact revision — the
+// smallest store a certified close can be earned from.
+function closableArtifact(repo, conn, open, id) {
+  fs.writeFileSync(path.join(repo, 'thing.js'), 'shipped bytes', 'utf8');
+  payload(callTool(conn, 'modern', 'artifact.add', envelopeFor(
+    { ...open, stateRev: readState(repo).rev },
+    { item: { id, title: 'thing', kind: 'code', path: 'thing.js' } }
+  )));
+  const art = readState(repo).artifacts.find((a) => a.id === id);
+  const fp = lifecycle.fingerprint(repo, art);
+  journal.appendEvent(repo, keepFields(id), { verifiedHash: fp.hash, verifiedRev: fp.rev });
+}
+
+ok('V13 artifact.add creates, revises, and no-ops on one meaning — both boundaries', () => {
+  const mcpRepo = initRepo('v13-mcp');
+  const cliRepo = initRepo('v13-cli');
+  const conn = service([mcpRepo], true).createConnection();
+  const open = openWorkspace(conn, mcpRepo);
+  const created = payload(callTool(conn, 'modern', 'artifact.add',
+    envelopeFor(open, { item: { title: 'spec v0', kind: 'artifact' } })));
+  assert.strictEqual(created.committed, true);
+  assert.strictEqual(created.action, 'created');
+  assert.strictEqual(created.artifactRev, 1);
+  assert.match(created.artifactId, /^art-[0-9a-f]{32}$/, 'MCP-minted artifact ids are derived');
+  const revised = payload(callTool(conn, 'modern', 'artifact.add', envelopeFor(
+    { ...open, stateRev: open.stateRev + 1 },
+    { item: { id: created.artifactId, title: 'spec v1' } }
+  )));
+  assert.deepStrictEqual(revised, {
+    ok: true, committed: true, stateRev: open.stateRev + 2, replayed: false,
+    artifactId: created.artifactId, artifactRev: 2, action: 'revised',
+  });
+  const before = storeSnapshot(mcpRepo);
+  const idem = payload(callTool(conn, 'modern', 'artifact.add', envelopeFor(
+    { ...open, stateRev: open.stateRev + 2 },
+    { item: { id: created.artifactId, title: 'spec v1' } }
+  )));
+  assert.deepStrictEqual(idem, {
+    ok: true, committed: false, stateRev: open.stateRev + 2, replayed: false,
+    artifactId: created.artifactId, artifactRev: 2, action: 'unchanged',
+  });
+  assert.deepStrictEqual(storeSnapshot(mcpRepo), before,
+    'an identical revision moves nothing — proof bound to rev 2 survives');
+  const cli = (args) => childProcess.execFileSync(process.execPath, [RATCHET, ...args],
+    { cwd: cliRepo, encoding: 'utf8', env: cleanGitEnv(), windowsHide: true });
+  cli(['artifact', 'add', '{"title":"spec v0","kind":"artifact"}']);
+  cli(['artifact', 'add', `{"id":"${readState(cliRepo).artifacts[0].id}","title":"spec v1"}`]);
+  const strip = (a) => ({ title: a.title, kind: a.kind, status: a.status, rev: a.rev, holes: a.holes });
+  assert.deepStrictEqual(strip(readState(mcpRepo).artifacts[0]), strip(readState(cliRepo).artifacts[0]));
+  const event = (h) => ({ event: h.event });
+  assert.deepStrictEqual(readState(mcpRepo).history.map(event), readState(cliRepo).history.map(event),
+    'one add-then-revise meaning on both boundaries');
+});
+
+ok('V14 artifact.add refuses claimed lifecycle at the boundary and closed records in the domain', () => {
+  const repo = initRepo('v14-repo');
+  const conn = service([repo], true).createConnection();
+  const open = openWorkspace(conn, repo);
+  const before = storeSnapshot(repo);
+  const claimed = boundaryRefusal(callTool(conn, 'modern', 'artifact.add',
+    envelopeFor(open, { item: { title: 'x', status: 'closed' } })));
+  assert.match(claimed.message, /terminal statuses are earned/);
+  const reserved = boundaryRefusal(callTool(conn, 'modern', 'artifact.add',
+    envelopeFor(open, { item: { title: 'x', closedAt: 'yesterday' } })));
+  assert.match(reserved.message, /gated transition/);
+  assert.deepStrictEqual(storeSnapshot(repo), before, 'no claimed lifecycle moved a byte');
+  closableArtifact(repo, conn, open, 'art-sealed-v14');
+  payload(callTool(conn, 'modern', 'artifact.close',
+    envelopeFor({ ...open, stateRev: readState(repo).rev }, { id: 'art-sealed-v14' })));
+  const sealed = storeSnapshot(repo);
+  const refused = refusal(callTool(conn, 'modern', 'artifact.add',
+    envelopeFor({ ...open, stateRev: readState(repo).rev }, { item: { id: 'art-sealed-v14', title: 'rewrite history' } })));
+  assert.strictEqual(refused.error, 'ArtifactClosed');
+  assert.deepStrictEqual(storeSnapshot(repo), sealed, 'closure stays a historical fact');
+});
+
+ok('V15 artifact.close is earned by bound proof, replays verbatim, no-ops when certified', () => {
+  const repo = initRepo('v15-repo');
+  const conn = service([repo], true).createConnection();
+  const open = openWorkspace(conn, repo);
+  const rev = () => readState(repo).rev;
+  // No proof bound → blocked, zero bytes.
+  payload(callTool(conn, 'modern', 'artifact.add',
+    envelopeFor(open, { item: { id: 'art-unproven-v15', title: 'unproven', kind: 'code', path: 'missing.js' } })));
+  let before = storeSnapshot(repo);
+  const blocked = refusal(callTool(conn, 'modern', 'artifact.close',
+    envelopeFor({ ...open, stateRev: rev() }, { id: 'art-unproven-v15' })));
+  assert.strictEqual(blocked.error, 'ClosureBlocked');
+  assert.deepStrictEqual(storeSnapshot(repo), before, 'a blocked closure moves zero bytes');
+  // Record-scope proof, even bound, has no wire spelling — human authority.
+  payload(callTool(conn, 'modern', 'artifact.add',
+    envelopeFor({ ...open, stateRev: rev() }, { item: { id: 'art-note-v15', title: 'release note', kind: 'docs', path: 'CHANGELOG.md#unreleased' } })));
+  const note = readState(repo).artifacts.find((a) => a.id === 'art-note-v15');
+  const noteFp = lifecycle.fingerprint(repo, note);
+  assert.strictEqual(noteFp.hashScope, 'record');
+  journal.appendEvent(repo, {
+    target: 'CHANGELOG.md', artifactId: 'art-note-v15', verdict: 'KEEP',
+    verification: { manualChecks: ['read end to end'], result: 'manual' },
+  }, { verifiedHash: noteFp.hash, verifiedRev: noteFp.rev });
+  before = storeSnapshot(repo);
+  const scoped = refusal(callTool(conn, 'modern', 'artifact.close',
+    envelopeFor({ ...open, stateRev: rev() }, { id: 'art-note-v15' })));
+  assert.strictEqual(scoped.error, 'HumanAuthorityRequired');
+  assert.deepStrictEqual(storeSnapshot(repo), before, 'record-scope closure moved zero bytes');
+  // Earned close commits once, the verbatim retry replays, a fresh op no-ops.
+  closableArtifact(repo, conn, open, 'art-close-v15');
+  const closeRev = rev();
+  const envelope = envelopeFor({ ...open, stateRev: closeRev }, { id: 'art-close-v15' });
+  const result = payload(callTool(conn, 'modern', 'artifact.close', envelope));
+  assert.deepStrictEqual(result, {
+    ok: true, committed: true, stateRev: closeRev + 1, replayed: false,
+    artifactId: 'art-close-v15', artifactRev: 1, status: 'closed',
+  });
+  const disk = readState(repo).artifacts.find((a) => a.id === 'art-close-v15');
+  assert.strictEqual(disk.status, 'closed');
+  assert.ok(disk.closedBy && disk.closedHash, 'the certificate names its proof');
+  assert.strictEqual(readState(repo).history.at(-1).event, 'artifact.closed');
+  before = storeSnapshot(repo);
+  const retry = payload(callTool(conn, 'modern', 'artifact.close', envelope));
+  assert.deepStrictEqual(retry, { ...result, replayed: true }, 'the retry is the recorded certificate');
+  const again = payload(callTool(conn, 'modern', 'artifact.close',
+    envelopeFor({ ...open, stateRev: rev() }, { id: 'art-close-v15' })));
+  assert.deepStrictEqual(again, {
+    ok: true, committed: false, stateRev: closeRev + 1, replayed: false,
+    artifactId: 'art-close-v15', artifactRev: 1, status: 'closed',
+  });
+  assert.deepStrictEqual(storeSnapshot(repo), before, 'a re-close of a certified artifact moves nothing');
+});
+
+ok('V15b artifact.close means the same thing on both boundaries', () => {
+  const mcpRepo = initRepo('v15b-mcp');
+  const cliRepo = initRepo('v15b-cli');
+  const conn = service([mcpRepo], true).createConnection();
+  const open = openWorkspace(conn, mcpRepo);
+  closableArtifact(mcpRepo, conn, open, 'art-both-v15b');
+  payload(callTool(conn, 'modern', 'artifact.close',
+    envelopeFor({ ...open, stateRev: readState(mcpRepo).rev }, { id: 'art-both-v15b' })));
+  const cli = (args) => childProcess.execFileSync(process.execPath, [RATCHET, ...args],
+    { cwd: cliRepo, encoding: 'utf8', env: cleanGitEnv(), windowsHide: true });
+  fs.writeFileSync(path.join(cliRepo, 'thing.js'), 'shipped bytes', 'utf8');
+  cli(['artifact', 'add', '{"id":"art-both-v15b","title":"thing","kind":"code","path":"thing.js"}']);
+  const art = readState(cliRepo).artifacts[0];
+  const fp = lifecycle.fingerprint(cliRepo, art);
+  journal.appendEvent(cliRepo, keepFields('art-both-v15b'), { verifiedHash: fp.hash, verifiedRev: fp.rev });
+  cli(['artifact', 'close', 'art-both-v15b']);
+  const strip = (a) => ({ id: a.id, status: a.status, closedRev: a.closedRev, closedHash: a.closedHash });
+  assert.deepStrictEqual(strip(readState(mcpRepo).artifacts[0]), strip(readState(cliRepo).artifacts[0]),
+    'same bytes, same certificate on both boundaries');
+  const event = (h) => ({ event: h.event });
+  assert.deepStrictEqual(readState(mcpRepo).history.map(event), readState(cliRepo).history.map(event));
+});
+
+ok('V16 artifact.retract requires its reason; probe discipline holds on the wire — both boundaries', () => {
+  const mcpRepo = initRepo('v16-mcp');
+  const cliRepo = initRepo('v16-cli');
+  const conn = service([mcpRepo], true).createConnection();
+  const open = openWorkspace(conn, mcpRepo);
+  const rev = () => readState(mcpRepo).rev;
+  payload(callTool(conn, 'modern', 'artifact.add',
+    envelopeFor(open, { item: { id: 'art-stale-v16', title: 'stale claim' } })));
+  const result = payload(callTool(conn, 'modern', 'artifact.retract',
+    envelopeFor({ ...open, stateRev: rev() }, { id: 'art-stale-v16', reason: 'premise disproven' })));
+  assert.deepStrictEqual(result, {
+    ok: true, committed: true, stateRev: open.stateRev + 2, replayed: false,
+    artifactId: 'art-stale-v16', status: 'retracted', supersededBy: null,
+  });
+  const disk = readState(mcpRepo).artifacts[0];
+  assert.strictEqual(disk.status, 'retracted');
+  assert.strictEqual(disk.retracted.keptForProvenance, true, 'provenance survives the retraction');
+  // Probe exits: a vague reason, an unnamed promotion, and a probe-for-probe
+  // promotion all refuse with zero bytes.
+  payload(callTool(conn, 'modern', 'artifact.add',
+    envelopeFor({ ...open, stateRev: rev() }, { item: { id: 'art-probe-v16', title: 'probe', kind: 'probe' } })));
+  const before = storeSnapshot(mcpRepo);
+  for (const semantic of [
+    { id: 'art-probe-v16', reason: 'just done with it' },
+    { id: 'art-probe-v16', reason: 'promoted: rebuilt' },
+    { id: 'art-probe-v16', reason: 'promoted: rebuilt', supersededBy: 'art-nobody' },
+  ]) {
+    const refused = refusal(callTool(conn, 'modern', 'artifact.retract',
+      envelopeFor({ ...open, stateRev: rev() }, semantic)));
+    assert.strictEqual(refused.error, 'RetractRefused', JSON.stringify(semantic));
+  }
+  assert.deepStrictEqual(storeSnapshot(mcpRepo), before, 'no undisciplined probe exit moved a byte');
+  const promoted = payload(callTool(conn, 'modern', 'artifact.retract', envelopeFor(
+    { ...open, stateRev: rev() },
+    { id: 'art-probe-v16', reason: 'promoted: rebuilt for keep', supersededBy: 'art-stale-v16' }
+  )));
+  assert.strictEqual(promoted.supersededBy, 'art-stale-v16');
+  const cli = (args) => childProcess.execFileSync(process.execPath, [RATCHET, ...args],
+    { cwd: cliRepo, encoding: 'utf8', env: cleanGitEnv(), windowsHide: true });
+  cli(['artifact', 'add', '{"id":"art-stale-v16","title":"stale claim"}']);
+  cli(['retract', 'art-stale-v16', '--reason', 'premise disproven']);
+  const strip = (a) => ({
+    id: a.id, title: a.title, status: a.status,
+    retracted: { reason: a.retracted.reason, supersededBy: a.retracted.supersededBy, keptForProvenance: a.retracted.keptForProvenance },
+  });
+  assert.deepStrictEqual(strip(readState(mcpRepo).artifacts[0]), strip(readState(cliRepo).artifacts[0]),
+    'one retraction meaning on both boundaries');
+});
+
+ok('V17 score.aperture is byte-pure until fog is owed, serializes it once, and refuses stale', () => {
+  const mcpRepo = initRepo('v17-mcp');
+  const cliRepo = initRepo('v17-cli');
+  const conn = service([mcpRepo], true).createConnection();
+  const open = openWorkspace(conn, mcpRepo);
+  const rev = () => readState(mcpRepo).rev;
+  const calm = { ambiguity: 0, terrain: 0, taste: 0, blastRadius: 0, reversibility: 0 };
+  const foggy = { ambiguity: 1, terrain: 1, taste: 2, blastRadius: 1, reversibility: 1 };
+  const before = storeSnapshot(mcpRepo);
+  const low = payload(callTool(conn, 'modern', 'score.aperture', envelopeFor(open, calm)));
+  assert.strictEqual(low.committed, false);
+  assert.strictEqual(low.recordedFog, false);
+  assert.strictEqual(low.level, 'A0');
+  assert.strictEqual(low.mapRequired, false);
+  assert.ok(low.scope, 'the score names its scope on the wire');
+  assert.deepStrictEqual(storeSnapshot(mcpRepo), before, 'a score that owes no fog is byte-pure');
+  const high = payload(callTool(conn, 'modern', 'score.aperture', envelopeFor(open, foggy)));
+  assert.strictEqual(high.committed, true);
+  assert.strictEqual(high.recordedFog, true);
+  assert.strictEqual(high.mapRequired, true, 'taste 2 forces the map whatever the band');
+  const loop = readState(mcpRepo).openLoops[0];
+  assert.match(loop.id, /^loop-[0-9a-f]{32}$/, 'the fog loop id is derived');
+  assert.strictEqual(readState(mcpRepo).history[0].event, 'fog.recorded');
+  // Fog already on the record: the second score writes nothing.
+  const again = payload(callTool(conn, 'modern', 'score.aperture',
+    envelopeFor({ ...open, stateRev: rev() }, foggy)));
+  assert.strictEqual(again.committed, false);
+  assert.strictEqual(again.recordedFog, false, 'one uncertainty, one drain');
+  // Aperture holds CAS like every write — no idempotence exemption.
+  const stale = refusal(callTool(conn, 'modern', 'score.aperture', envelopeFor(open, foggy)));
+  assert.strictEqual(stale.error, 'StaleStateRev');
+  const cli = (args) => childProcess.execFileSync(process.execPath, [RATCHET, ...args],
+    { cwd: cliRepo, encoding: 'utf8', env: cleanGitEnv(), windowsHide: true });
+  const viaCli = JSON.parse(cli(['score', 'aperture', JSON.stringify(foggy), '--json']));
+  const projection = (r) => ({
+    score: r.score, level: r.level, name: r.name, implement: r.implement, sequence: r.sequence,
+    mapRequired: r.mapRequired, dimensions: r.dimensions, scope: r.scope, recordedFog: r.recordedFog,
+  });
+  assert.deepStrictEqual(projection(high), projection(viaCli), 'one aperture meaning on both boundaries');
+  const stripLoop = (l) => ({ text: l.text, status: l.status });
+  assert.deepStrictEqual(stripLoop(readState(mcpRepo).openLoops[0]), stripLoop(readState(cliRepo).openLoops[0]),
+    'the serialized fog is the same loop on both boundaries');
 });
 
 // ---------------------------------------------------------------------------

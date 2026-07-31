@@ -4,6 +4,16 @@ const state = require('./state');
 const schemas = require('./schemas');
 const scoring = require('./scoring');
 const lifecycle = require('./lifecycle');
+const journal = require('./evolve/journal');
+
+// A domain refusal both boundaries must tell apart from damage carries a code:
+// the CLI prints the message, the MCP funnel maps the code to its one
+// allowlisted sentence and the raw text never crosses the wire.
+function coded(code, message) {
+  const e = new Error(message);
+  e.code = code;
+  return e;
+}
 
 // Thin helpers for the two collections skills touch most: artifacts + defects.
 // Every write flips state.dirty so the Stop hook can nag if nothing was
@@ -118,9 +128,10 @@ function closeFogLoops(s, record, now) {
   }
 }
 
-function reviseArtifact(cwd, s, existing, item, now) {
+function reviseArtifact(s, existing, item, now, mintId) {
   if (lifecycle.isClosed(existing)) {
-    throw new Error(
+    throw coded(
+      'ERATCHETARTIFACTCLOSED',
       `artifact "${existing.id}" is closed — closure is a historical fact and cannot be edited away. ` +
         'Record a new artifact with "revises": "<id>", or retract this one (ratchet retract <id> --reason "<why>").'
     );
@@ -143,7 +154,7 @@ function reviseArtifact(cwd, s, existing, item, now) {
   const changed =
     hasLegacyHolesShape(existing) ||
     ARTIFACT_MUTABLE.some((k) => JSON.stringify(next[k]) !== JSON.stringify(canonicalExisting[k]));
-  if (!changed) return existing;
+  if (!changed) return { record: existing, action: 'unchanged' };
   // '' is the canonical "no lineage" and must not persist as an empty string.
   if (!next.revises) delete next.revises;
 
@@ -151,33 +162,40 @@ function reviseArtifact(cwd, s, existing, item, now) {
   next.updatedAt = now;
   s.artifacts[s.artifacts.indexOf(existing)] = next;
   s.dirty = true;
-  s.history.push({ id: state.makeId('hist'), at: now, event: 'artifact.revised', note: `${next.id} → rev ${next.rev}` });
+  s.history.push({ id: mintId('hist', 'history'), at: now, event: 'artifact.revised', note: `${next.id} → rev ${next.rev}` });
   if (next.kind === 'unknown-map') closeFogLoops(s, next, now);
-  state.saveState(cwd, s);
-  return next;
+  return { record: next, action: 'revised' };
 }
 
-function addArtifact(cwd, item) {
+// The transaction-shaped core, shared with the MCP write tool: mutates the open
+// transaction's state, never loads or saves, mints ids through the caller.
+function applyAdd(s, item, mintId) {
   assertArtifactInput(item);
-  const s = state.loadState(cwd);
   const now = schemas.nowIso();
   const id = item.id ? String(item.id) : '';
   if (id) {
     const existing = findUniqueArtifact(s, id, 'revise');
-    if (existing) return reviseArtifact(cwd, s, existing, item, now);
+    if (existing) return reviseArtifact(s, existing, item, now, mintId);
   }
   const kind = item.kind ? String(item.kind) : 'artifact';
   // Same normalization as a revision — `revises` included, which is provenance
   // only: naming what this supersedes does not retire it. A lineage claim is not
   // a lifecycle event; only `retract` and `close` are.
-  const record = { id: id || state.makeId('art'), at: now, rev: 1, kind, ...canonicalFields(kind, item, null) };
+  const record = { id: id || mintId('art', 'record'), at: now, rev: 1, kind, ...canonicalFields(kind, item, null) };
   if (!record.revises) delete record.revises;
   s.artifacts.push(record);
   s.dirty = true;
-  s.history.push({ id: state.makeId('hist'), at: record.at, event: 'artifact.add', note: record.title });
+  s.history.push({ id: mintId('hist', 'history'), at: record.at, event: 'artifact.add', note: record.title });
   if (record.kind === 'unknown-map') closeFogLoops(s, record, now);
-  state.saveState(cwd, s);
-  return record;
+  return { record, action: 'created' };
+}
+
+function addArtifact(cwd, item) {
+  const s = state.loadState(cwd);
+  const res = applyAdd(s, item, (prefix) => state.makeId(prefix));
+  // An unchanged revision writes nothing — the no-rev-churn rule above.
+  if (res.action !== 'unchanged') state.saveState(cwd, s);
+  return res.record;
 }
 
 // Which live artifact does this defect attack? Guessing wrong is worse than
@@ -374,35 +392,37 @@ function transitionDefect(cwd, id, toStatus, meta = {}) {
 // flips to `retracted` so it stops steering cold sessions and its holes stop
 // draining confidence. This is the move the T2.3 re-scope doc needed when its
 // central premise ("no endpoint exists") was disproven by the live seam.
-function retractArtifact(cwd, id, { reason = '', supersededBy = '' } = {}) {
-  const s = state.loadState(cwd);
+function applyRetract(s, id, { reason = '', supersededBy = '' } = {}, mintId) {
   const a = findUniqueArtifact(s, id, 'retract');
-  if (!a) throw new Error(`no artifact with id "${id}"`);
+  if (!a) throw coded('ERATCHETUNKNOWNID', `no artifact with id "${id}"`);
   // A probe retraction is its lifecycle exit and must state which one: the
   // code died (disposed) or was explicitly rebuilt for keep (promoted). A
   // vague reason would let residue stop draining without either outcome.
   if (a.kind === 'probe') {
     if (!/^(disposed|promoted):/i.test(reason)) {
-      throw new Error(
+      throw coded(
+        'ERATCHETRETRACT',
         'a probe retraction must state its outcome: --reason must start with "disposed:" (code reverted, finding recorded) or "promoted:" (rebuilt for keep)'
       );
     }
     if (/^promoted:/i.test(reason)) {
       if (!supersededBy) {
-        throw new Error('a promoted probe requires --superseded-by <artifact-id> — the build-for-keep that replaced it');
+        throw coded('ERATCHETRETRACT', 'a promoted probe requires --superseded-by <artifact-id> — the build-for-keep that replaced it');
       }
       // "Promoted" is a claim that real work replaced the probe. An id nobody
       // recorded, or another probe, is the residue-keeps-shipping path wearing
       // a promotion label.
       const replacement = findUniqueArtifact(s, supersededBy, 'promote a probe into');
       if (!replacement) {
-        throw new Error(
+        throw coded(
+          'ERATCHETRETRACT',
           `--superseded-by "${supersededBy}" names no artifact in this state — a promotion must point at the ` +
             'recorded build-for-keep that replaced the probe'
         );
       }
       if (String(replacement.kind) === 'probe') {
-        throw new Error(
+        throw coded(
+          'ERATCHETRETRACT',
           `--superseded-by "${supersededBy}" is itself a probe — a promotion must point at a build-for-keep, not another probe`
         );
       }
@@ -413,13 +433,114 @@ function retractArtifact(cwd, id, { reason = '', supersededBy = '' } = {}) {
   a.retracted = { at: now, reason, supersededBy, keptForProvenance: true };
   s.dirty = true;
   s.history.push({
-    id: state.makeId('hist'),
+    id: mintId('hist', 'history'),
     at: now,
     event: 'artifact.retracted',
     note: `${id}: ${reason}${supersededBy ? ` → superseded by ${supersededBy}` : ''}`,
   });
+  return a;
+}
+
+function retractArtifact(cwd, id, opts) {
+  const s = state.loadState(cwd);
+  const a = applyRetract(s, id, opts, (prefix) => state.makeId(prefix));
   state.saveState(cwd, s);
   return a;
 }
 
-module.exports = { addArtifact, addDefect, transitionDefect, retractArtifact };
+// The closure gate's mutation, moved here from the CLI router so the MCP tool
+// runs the SAME gate. The caller owns the transaction AND the journal lock
+// (lock order: workspace → file) — the blocker check and the certificate it
+// authorizes must share one window, or a REVERT landing between them closes an
+// artifact on revoked proof. Over MCP there are no waiver arguments: opts stays
+// empty, so record-scope proof and open holes refuse here by design.
+function applyClose(cwd, s, id, opts, mintId) {
+  const owner = String(opts.owner || '').trim();
+  const reason = String(opts.reason || '').trim();
+  const waiveHoles = opts.waiveHoles === true;
+
+  const matches = (s.artifacts || []).filter((a) => a && a.id === id);
+  if (matches.length > 1) {
+    throw new Error(
+      `${matches.length} artifacts share the id "${id}" — refusing to close an ambiguous record. ` +
+        'Repair the store first: give the duplicates distinct ids in state.json, then re-run.'
+    );
+  }
+  const artifact = matches[0];
+  if (!artifact) throw coded('ERATCHETUNKNOWNID', `no artifact with id "${id}"`);
+
+  // Idempotent: a second close of an already-certified artifact is a no-op, not
+  // an error. Re-running a serialize block must never be punished.
+  if (lifecycle.isClosed(artifact)) return { artifact, fp: null, bound: null, already: true };
+
+  // FAIL CLOSED on a damaged proof record. A malformed line is a dropped event,
+  // and a dropped REVERT reads exactly like no REVERT — so a mangled log used to
+  // make this gate CERTIFY where it should refuse. Absence of evidence is not
+  // evidence of absence when the record itself is known to be short.
+  let read = { events: [], malformed: 0, file: journal.logPath(cwd) };
+  try {
+    read = journal.readEventsWithHealth(cwd);
+  } catch (_e) {
+    /* unreadable log → no events → the blockers below refuse for want of proof */
+  }
+  if (read.malformed) {
+    throw coded(
+      'ERATCHETCLOSUREBLOCKED',
+      `cannot close artifact "${id}": proof record damaged — ${read.malformed} unreadable line(s) in ${read.file}. ` +
+        'A dropped event is indistinguishable from no event, so this closure cannot be certified. ' +
+        'Repair or archive the log, then re-run.'
+    );
+  }
+  const events = read.events;
+  const blockers = lifecycle.closureBlockers(s, events, artifact, cwd, { waiveHoles, owner, reason });
+  if (blockers.length) {
+    throw coded(
+      'ERATCHETCLOSUREBLOCKED',
+      `cannot close artifact "${id}" — ${blockers.length} blocker(s):\n` + blockers.map((b) => `  - [${b.code}] ${b.message}`).join('\n')
+    );
+  }
+
+  const fp = lifecycle.fingerprint(cwd, artifact);
+  // A record-scope close certifies a claim about a RECORD, not about bytes on
+  // disk — a much weaker proof. It is allowed, but only with a named owner who
+  // says so out loud, exactly like a seam waiver.
+  if (fp.hashScope === 'record') {
+    if (!owner || !reason) {
+      throw coded(
+        'ERATCHETHUMANAUTHORITY',
+        `cannot close artifact "${id}": its proof is record-scope, not file-scope` +
+          (fp.downgradeReason ? ` (${fp.downgradeReason})` : ' (the artifact points at no file)') +
+          ' — that certifies a claim about the record, not about shipped bytes. ' +
+          'Authorize it by name: --owner "<who accepts it>" --reason "<why record-scope proof is enough here>".'
+      );
+    }
+  }
+
+  const bound = lifecycle.bindingEvent(artifact, events, fp);
+  const now = schemas.nowIso();
+  artifact.status = 'closed';
+  artifact.closedAt = now;
+  artifact.closedBy = bound.id || '';
+  artifact.closedRev = fp.rev;
+  artifact.closedHash = fp.hash;
+  if (waiveHoles && (artifact.holes || []).length) artifact.holesWaiver = { by: owner, reason };
+  s.dirty = true;
+  s.history.push({
+    id: mintId('hist', 'history'),
+    at: now,
+    event: 'artifact.closed',
+    note: `${id} closed at rev ${fp.rev} on ${bound.id || 'bound proof'}${owner ? ` (owner: ${owner})` : ''}`,
+  });
+  return { artifact, fp, bound, already: false };
+}
+
+module.exports = {
+  addArtifact,
+  addDefect,
+  transitionDefect,
+  retractArtifact,
+  assertArtifactInput,
+  applyAdd,
+  applyRetract,
+  applyClose,
+};

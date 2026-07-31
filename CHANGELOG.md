@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The artifact verbs and the read that writes — the safe core is complete.** Step 4.3
+  of the ratified write-tools design: `artifact.add`, `artifact.close`,
+  `artifact.retract` and `score.aperture` complete the ten-tool `--write` roster, each a
+  thin boundary over the same domain mutation the CLI runs — `artifact add`/`retract`
+  split into transaction-shaped cores (`src/artifacts.js`), the closure gate moved there
+  from the CLI router, and the aperture fog write moved to `src/verbs.js`, all shared by
+  both doors. The lifecycle gates the CLI earned hold unchanged on the wire
+  (**MCP-boundary enforced** where the rule is static, domain-refused where it needs the
+  record): terminal statuses and reserved lifecycle fields refuse at the boundary; an
+  identical revision is a no-op that costs no revision and invalidates no proof; a close
+  is earned only by a KEEP bound to the exact revision and hash, inside one transaction
+  that spans the journal lock, commit included; and a probe exit must state
+  `disposed:`/`promoted:` with a recorded non-probe replacement. **There are no waiver
+  arguments on this wire, permanently**: record-scope proof and holes-waived closure
+  refuse `HumanAuthorityRequired` — typed self-authorization is not a named human, so
+  those closures stay CLI acts. Four new allowlisted refusals (`ArtifactClosed`,
+  `ClosureBlocked`, `HumanAuthorityRequired`, `RetractRefused`) join the funnel; raw
+  domain messages, which may name store files, never cross. `score.aperture` names
+  `expectedStateRev`/`expectedStateGen` like every write — the fog write's
+  first-racer-wins guard legitimately re-arms when a map lands, so CAS, not an
+  idempotence claim, is what keeps a stale retry out; a score that owes no fog is
+  byte-pure and commits nothing, and `recordedFog` is truthful on both outcomes. Six new
+  falsifiers in `test/mcp-write.test.js` (contract pins, CLI-equivalence per verb,
+  byte-pure refusals, verbatim replay of a closure certificate); the refusal mapping, the
+  identical-revision no-op, and the one-fog-write guard were each seen red against a
+  deliberately broken variant.
+
+<!-- Traced by: claude-fable-5 -->
+
 - **The five MCP session verbs — the roster rides the proven envelope.** Step 4.2 of the
   ratified write-tools design: `state.append`, `open_loop.close`, `open_loop.park`,
   `assumption.close` and `compile.done` join `state.set` on a `--write` server, each a

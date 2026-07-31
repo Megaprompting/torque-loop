@@ -129,8 +129,22 @@ function clone(value) {
 // noop | committed | idConflict | capOverflow | unknownId. Every kind except
 // `committed` moves zero bytes — a refusal that leaves a fresh store or a
 // half-applied verb behind is not a refusal.
+// Coded domain throws that are outcomes, not faults. Each rides out of the
+// aborted transaction as a zero-byte refusal kind the boundary maps to its one
+// allowlisted sentence — the raw message (which may name store files) never
+// crosses the wire.
+const CODED_OUTCOMES = {
+  ERATCHETIDCONFLICT: 'idConflict',
+  ERATCHETRECEIPTCAP: 'capOverflow',
+  ERATCHETUNKNOWNID: 'unknownId',
+  ERATCHETARTIFACTCLOSED: 'artifactClosed',
+  ERATCHETCLOSUREBLOCKED: 'closureBlocked',
+  ERATCHETHUMANAUTHORITY: 'humanAuthority',
+  ERATCHETRETRACT: 'retractRefused',
+};
+
 function executeWrite(opts) {
-  const { state, root, tool, operationId, expectedStateRev, expectedStateGen, semanticArgs, apply } = opts;
+  const { state, root, tool, operationId, expectedStateRev, expectedStateGen, semanticArgs, apply, alsoLockFile } = opts;
   const argsHash = bindingHash(tool, semanticArgs, expectedStateRev, expectedStateGen);
 
   // Refusing over a store that does not exist must not CREATE it: the mutation
@@ -141,7 +155,10 @@ function executeWrite(opts) {
 
   let outcome = null;
   try {
-    state.withWorkspaceMutation(root, { action: tool }, (s) => {
+    // `alsoLockFile` extends the transaction over a second file, commit
+    // included (the closure gate reads its proof from the journal) — same
+    // contract as the CLI boundary, lock order workspace → file.
+    state.withWorkspaceMutation(root, alsoLockFile ? { action: tool, alsoLockFile } : { action: tool }, (s) => {
       // Lookup against the ring the lock re-read — pre-lock peeks could race a
       // concurrent commit of this same operationId into a duplicate-id ring.
       const ring = Array.isArray(s.operations) ? s.operations : null;
@@ -205,9 +222,8 @@ function executeWrite(opts) {
     // A throw inside the transaction aborts it — nothing was committed. The
     // coded throws become outcomes; anything else is the caller's to map
     // through its one error funnel.
-    if (error && error.code === 'ERATCHETIDCONFLICT') return { kind: 'idConflict' };
-    if (error && error.code === 'ERATCHETRECEIPTCAP') return { kind: 'capOverflow' };
-    if (error && error.code === 'ERATCHETUNKNOWNID') return { kind: 'unknownId' };
+    const kind = error && CODED_OUTCOMES[error.code];
+    if (kind) return { kind };
     throw error;
   }
   return outcome;

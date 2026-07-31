@@ -391,90 +391,21 @@ function cmdArtifactClose(cwd, argv) {
   // appended after the read but before the commit still landed on evidence this
   // gate had stopped watching, and the artifact still closed on a revoked KEEP.
   // Lock order: workspace → journal.
+  // The gate's meaning lives in src/artifacts.js (applyClose), shared with the
+  // MCP write tool; this boundary owns the flag spelling and the rendering.
   return out(
-    state.withWorkspaceMutation(cwd, { action: 'artifact close', alsoLockFile: journal.logPath(cwd) }, (s) =>
-      closeArtifact(cwd, s, id, opts)
-    ).result
+    state.withWorkspaceMutation(cwd, { action: 'artifact close', alsoLockFile: journal.logPath(cwd) }, (s) => {
+      const res = artifacts.applyClose(cwd, s, id, {
+        owner: strOpt(opts.owner),
+        reason: strOpt(opts.reason),
+        waiveHoles: opts['waive-holes'] === true,
+      }, (prefix) => state.makeId(prefix));
+      if (res.already) {
+        return `artifact ${id} is already closed (rev ${res.artifact.closedRev}, by ${res.artifact.closedBy}) — no change`;
+      }
+      return `artifact ${id} closed — rev ${res.fp.rev}, ${res.fp.hashScope} hash ${String(res.fp.hash).slice(0, 8)}, proof ${res.bound.id || '—'}`;
+    }).result
   );
-}
-
-function closeArtifact(cwd, s, id, opts) {
-  const matches = (s.artifacts || []).filter((a) => a && a.id === id);
-  if (matches.length > 1) {
-    throw new Error(
-      `${matches.length} artifacts share the id "${id}" — refusing to close an ambiguous record. ` +
-        'Repair the store first: give the duplicates distinct ids in state.json, then re-run.'
-    );
-  }
-  const artifact = matches[0];
-  if (!artifact) throw new Error(`no artifact with id "${id}"`);
-
-  // Idempotent: a second close of an already-certified artifact is a no-op, not
-  // an error. Re-running a serialize block must never be punished.
-  if (lifecycle.isClosed(artifact)) {
-    return `artifact ${id} is already closed (rev ${artifact.closedRev}, by ${artifact.closedBy}) — no change`;
-  }
-
-  const owner = strOpt(opts.owner);
-  const reason = strOpt(opts.reason);
-  const waiveHoles = opts['waive-holes'] === true;
-
-  // FAIL CLOSED on a damaged proof record. A malformed line is a dropped event,
-  // and a dropped REVERT reads exactly like no REVERT — so a mangled log used to
-  // make this gate CERTIFY where it should refuse. Absence of evidence is not
-  // evidence of absence when the record itself is known to be short.
-  let read = { events: [], malformed: 0, file: journal.logPath(cwd) };
-  try {
-    read = journal.readEventsWithHealth(cwd);
-  } catch (_e) {
-    /* unreadable log → no events → the blockers below refuse for want of proof */
-  }
-  if (read.malformed) {
-    throw new Error(
-      `cannot close artifact "${id}": proof record damaged — ${read.malformed} unreadable line(s) in ${read.file}. ` +
-        'A dropped event is indistinguishable from no event, so this closure cannot be certified. ' +
-        'Repair or archive the log, then re-run.'
-    );
-  }
-  const events = read.events;
-  const blockers = lifecycle.closureBlockers(s, events, artifact, cwd, { waiveHoles, owner, reason });
-  if (blockers.length) {
-    throw new Error(
-      `cannot close artifact "${id}" — ${blockers.length} blocker(s):\n` + blockers.map((b) => `  - [${b.code}] ${b.message}`).join('\n')
-    );
-  }
-
-  const fp = lifecycle.fingerprint(cwd, artifact);
-  // A record-scope close certifies a claim about a RECORD, not about bytes on
-  // disk — a much weaker proof. It is allowed, but only with a named owner who
-  // says so out loud, exactly like a seam waiver.
-  if (fp.hashScope === 'record') {
-    if (!owner || !reason) {
-      throw new Error(
-        `cannot close artifact "${id}": its proof is record-scope, not file-scope` +
-          (fp.downgradeReason ? ` (${fp.downgradeReason})` : ' (the artifact points at no file)') +
-          ' — that certifies a claim about the record, not about shipped bytes. ' +
-          'Authorize it by name: --owner "<who accepts it>" --reason "<why record-scope proof is enough here>".'
-      );
-    }
-  }
-
-  const bound = lifecycle.bindingEvent(artifact, events, fp);
-  const now = schemas.nowIso();
-  artifact.status = 'closed';
-  artifact.closedAt = now;
-  artifact.closedBy = bound.id || '';
-  artifact.closedRev = fp.rev;
-  artifact.closedHash = fp.hash;
-  if (waiveHoles && (artifact.holes || []).length) artifact.holesWaiver = { by: owner, reason };
-  s.dirty = true;
-  s.history.push({
-    id: state.makeId('hist'),
-    at: now,
-    event: 'artifact.closed',
-    note: `${id} closed at rev ${fp.rev} on ${bound.id || 'bound proof'}${owner ? ` (owner: ${owner})` : ''}`,
-  });
-  return `artifact ${id} closed — rev ${fp.rev}, ${fp.hashScope} hash ${String(fp.hash).slice(0, 8)}, proof ${bound.id || '—'}`;
 }
 
 function cmdLedger(cwd, sub, rest, asJson) {
@@ -607,40 +538,18 @@ function cmdRetract(cwd, argv) {
 
 // Serialize the fog the moment the dial names it (a write). Steering the state
 // never saw cannot drain confidence, warn a cold start, or survive a handoff.
-// A propose-only agent still gets the read — no footprint; an already-open fog
-// loop or a live unknown-map means the fog is already on the record. The loop
-// closes itself when the unknown-map artifact lands (artifacts.js). Returns
-// true only when a fog loop was actually written.
-function fogAlreadyOnRecord(s) {
-  const openFog = (s.openLoops || []).some(
-    (l) => l.status !== 'closed' && String(l.text || '').startsWith(schemas.FOG_LOOP_PREFIX)
-  );
-  const liveMap = (s.artifacts || []).some(
-    (a) => a.kind === 'unknown-map' && a.status !== 'retracted' && a.status !== 'superseded'
-  );
-  return openFog || liveMap;
-}
-
+// A propose-only agent still gets the read — no footprint. The write's meaning
+// lives in src/verbs.js (recordFog), shared with the MCP score.aperture tool.
 function recordApertureFog(cwd, result) {
   if (!result.mapRequired || proposeOnlyAgent()) return false;
   // Double-checked on purpose. The common case is "already on the record", and
   // taking the workspace lock for a read that will write nothing would make an
   // aperture score queue behind every unrelated writer. The check that DECIDES
-  // runs under the lock, against the state reloaded there.
-  if (fogAlreadyOnRecord(state.loadState(cwd))) return false;
+  // runs under the lock, against the state reloaded there (inside recordFog).
+  if (verbs.fogAlreadyOnRecord(state.loadState(cwd))) return false;
   let recorded = false;
   state.withWorkspaceMutation(cwd, { action: 'fog.recorded' }, (s) => {
-    if (fogAlreadyOnRecord(s)) return; // the racer that got here first recorded it
-    const now = schemas.nowIso();
-    s.openLoops.push({
-      id: state.makeId('loop'),
-      at: now,
-      text: `${schemas.FOG_LOOP_PREFIX} (aperture ${result.level}, score ${result.score}/10) — run /ratchet:map; closes when the unknown-map artifact lands`,
-      status: 'open',
-    });
-    s.dirty = true;
-    s.history.push({ id: state.makeId('hist'), at: now, event: 'fog.recorded', note: `aperture ${result.level} raised mapRequired` });
-    recorded = true;
+    recorded = verbs.recordFog(s, result, (prefix) => state.makeId(prefix));
   });
   return recorded;
 }

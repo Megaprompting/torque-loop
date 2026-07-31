@@ -122,6 +122,37 @@ function closeRecord(s, collection, id, opts, mintId) {
   return to;
 }
 
+// The fog-on-record check both aperture boundaries share. An already-open fog
+// loop or a live unknown-map means the fog is on the record; writing a second
+// loop would double the drain for one uncertainty.
+function fogAlreadyOnRecord(s) {
+  const openFog = (s.openLoops || []).some(
+    (l) => l.status !== 'closed' && String(l.text || '').startsWith(schemas.FOG_LOOP_PREFIX)
+  );
+  const liveMap = (s.artifacts || []).some(
+    (a) => a.kind === 'unknown-map' && a.status !== 'retracted' && a.status !== 'superseded'
+  );
+  return openFog || liveMap;
+}
+
+// `score aperture`'s conditional write: serialize the fog the moment the dial
+// names it. The check that DECIDES runs here, against the state the caller's
+// lock reloaded — first racer wins, the loser writes nothing. Returns true
+// only when a fog loop was actually written.
+function recordFog(s, result, mintId) {
+  if (!result.mapRequired || fogAlreadyOnRecord(s)) return false;
+  const now = schemas.nowIso();
+  s.openLoops.push({
+    id: mintId('loop', 'record'),
+    at: now,
+    text: `${schemas.FOG_LOOP_PREFIX} (aperture ${result.level}, score ${result.score}/10) — run /ratchet:map; closes when the unknown-map artifact lands`,
+    status: 'open',
+  });
+  s.dirty = true;
+  s.history.push({ id: mintId('hist', 'history'), at: now, event: 'fog.recorded', note: `aperture ${result.level} raised mapRequired` });
+  return true;
+}
+
 // `compile done`: atomically mark the session CHECKPOINTED. Unlike a scalar
 // set this CLEARS dirty and stamps lastCompileAt in one move — a checkpoint
 // says the record is current, never that the work is finished. Returns the
@@ -134,4 +165,13 @@ function compileDone(s, mintId) {
   return now;
 }
 
-module.exports = { coerceScalar, setScalar, BIRTH_STATUS, appendItem, closeRecord, compileDone };
+module.exports = {
+  coerceScalar,
+  setScalar,
+  BIRTH_STATUS,
+  appendItem,
+  closeRecord,
+  compileDone,
+  fogAlreadyOnRecord,
+  recordFog,
+};
