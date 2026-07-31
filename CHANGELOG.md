@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The defect transitions ride the slot — the mirror stops being best-effort.** Step
+  4b.2: `defect.resolve`, `defect.reopen`, `defect.supersede` join the wire (18-tool
+  `--write` roster), and every transition on BOTH doors — the CLI-only `defect waive`
+  included — commits its state change and its ledger-mirror status behind the same
+  write-ahead intent. The old best-effort mirror sync is gone: a ledger failure now
+  surfaces instead of being swallowed, and recovery completes the mirror the dying
+  process proved. **Named behavior change:** an exact-repeat transition (same target
+  status, same proof fields, mirror valid) is now a no-op — no log line, no history, no
+  revision — where it used to grow the log on every rerun; a repeat with DIFFERENT
+  proof refuses rather than silently replacing the original, and an exact repeat over a
+  missing or ambiguous mirror commits once solely to perform the D2b admission.
+  `defect.waive` remains absent from `tools/list` and the dispatcher, permanently. Five
+  new falsifiers (both-door equivalence, exact-repeat and conflicting-repeat semantics,
+  per-transition D2b admission, a real process dying between a transition and its
+  mirror, wire replay); the repeat no-op and the mirror-status propagation each seen
+  red against a deliberately broken variant.
+
+<!-- Traced by: claude-fable-5 -->
+
 - **The write-ahead intent slot — one operation, two canonical files, one crash story.**
   Step 4b.1 of the ratified WAL design
   (docs/superpowers/specs/2026-07-31-mcp-4b-wal-design.md): `defect.add` is the first

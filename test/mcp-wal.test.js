@@ -194,7 +194,7 @@ ok('U1 the version-1 parser accepts exactly the documented shape and nothing els
   const rejects = [
     validIntent({ version: 2 }),
     validIntent({ door: 'ssh' }),
-    validIntent({ tool: 'defect.resolve' }),
+    validIntent({ tool: 'ledger.update' }),
     validIntent({ operationId: '' }),
     validIntent({ argsHash: 'sha256:short' }),
     validIntent({ targetStateRev: 5 }),
@@ -464,17 +464,20 @@ const state = require(process.argv[5]);
 const artifacts = require(process.argv[6]);
 if (mode === 'recover') {
   state.withWorkspaceLock(repo, 'crash-child recovery', () => {});
+} else if (mode === 'resolve') {
+  artifacts.transitionDefect(repo, process.argv[7], 'resolved', { evidence: 'crash resolve', note: 'resolved: crash resolve' });
 } else {
   artifacts.addDefect(repo, { severity: 'high', summary: 'crash matrix finding' });
 }
 process.stdout.write('SURVIVED');
 `, 'utf8');
 
-function crashChild(repo, killPoint, mode) {
+function crashChild(repo, killPoint, mode, extra) {
   const res = childProcess.spawnSync(process.execPath, [
     CRASH_CHILD, repo, killPoint, mode || 'add',
     path.join(__dirname, '..', 'src', 'state.js'),
     path.join(__dirname, '..', 'src', 'artifacts.js'),
+    extra || '',
   ], { encoding: 'utf8', env: Object.assign({}, cleanGitEnv(), { RATCHET_LOCK_STALE_MS: '1' }), windowsHide: true });
   return res;
 }
@@ -748,6 +751,108 @@ ok('M6 pendingIntent is stated on every read, true under an occupied slot, reads
   assert.strictEqual(readOnce().pendingIntent, true, 'an occupied slot is stated, never hidden');
   assert.deepStrictEqual(storeSnapshot(repo), before, 'the read repaired nothing');
   assert.ok(!('pendingIntent' in readState(repo)), 'disk bytes never gain the flag');
+});
+
+// ---------------------------------------------------------------------------
+// 4b.2: the transitions ride the same slot.
+// ---------------------------------------------------------------------------
+
+ok('T1 a CLI resolve moves state and mirror in one op; the exact repeat is a no-op; a conflicting repeat refuses', () => {
+  const repo = fixture('t1');
+  initStore(repo);
+  const added = artifacts.addDefect(repo, { severity: 'high', summary: 'transition me' });
+  artifacts.transitionDefect(repo, added.state.id, 'resolved', { evidence: 'the fix shipped', note: 'resolved: the fix shipped' });
+  const disk = readState(repo);
+  const defect = disk.defects[0];
+  assert.strictEqual(defect.status, 'resolved');
+  const mirror = readLedger(repo).defects.find((d) => d.id === defect.ledgerId);
+  assert.strictEqual(mirror.status, 'resolved', 'the mirror followed in the same operation');
+  assert.ok(!fs.existsSync(state.intentPath(repo)));
+  const before = storeSnapshot(repo);
+  const repeat = artifacts.transitionDefect(repo, added.state.id, 'resolved', { evidence: 'the fix shipped', note: 'resolved: the fix shipped' });
+  assert.strictEqual(repeat.status, 'resolved');
+  assert.deepStrictEqual(storeSnapshot(repo), before,
+    'the exact repeat pushes no log, no history, no revision, no intent');
+  assert.throws(
+    () => artifacts.transitionDefect(repo, added.state.id, 'resolved', { evidence: 'a different story' }),
+    /different recorded proof/,
+    'a conflicting repeat never silently replaces the original proof'
+  );
+  assert.deepStrictEqual(storeSnapshot(repo), before, 'the conflicting refusal moved zero bytes');
+});
+
+ok('T2 the CLI-only waive rides the WAL too; wire and internal rosters stay distinct', () => {
+  const repo = fixture('t2');
+  initStore(repo);
+  const added = artifacts.addDefect(repo, { severity: 'medium', summary: 'waive me' });
+  artifacts.transitionDefect(repo, added.state.id, 'waived', { owner: 'danny', reason: 'ships anyway', note: 'waived by danny: ships anyway' });
+  const defect = readState(repo).defects[0];
+  assert.strictEqual(defect.status, 'waived');
+  assert.strictEqual(defect.waivedBy, 'danny');
+  const mirror = readLedger(repo).defects.find((d) => d.id === defect.ledgerId);
+  assert.strictEqual(mirror.status, 'waived', 'the internal waiver keeps the mirror truthful');
+  assert.ok(!fs.existsSync(state.intentPath(repo)));
+});
+
+ok('T3 a legacy defect is admitted by its first committed transition, mirror born in the new status', () => {
+  const repo = fixture('t3');
+  initStore(repo);
+  state.withWorkspaceMutation(repo, { action: 'seed legacy' }, (s) => {
+    s.defects.push({ id: 'def-old', at: 'old', severity: 'high', summary: 'ancient finding', status: 'open', artifact: '', attachedBy: 'none' });
+  });
+  artifacts.transitionDefect(repo, 'def-old', 'resolved', { evidence: 'finally fixed' });
+  const defect = readState(repo).defects.find((d) => d.id === 'def-old');
+  assert.ok(defect.ledgerId, 'admission minted and back-linked the mirror');
+  const mirror = readLedger(repo).defects.find((d) => d.id === defect.ledgerId);
+  assert.strictEqual(mirror.status, 'resolved');
+  assert.strictEqual(mirror.summary, 'ancient finding');
+});
+
+ok('T4 death between a transition and its mirror recovers to the exact recorded bytes', () => {
+  const repo = fixture('t4');
+  initStore(repo);
+  const added = artifacts.addDefect(repo, { severity: 'high', summary: 'crash matrix finding' });
+  const res = crashChild(repo, 'ledger', 'resolve', added.state.id);
+  assert.strictEqual(res.status, 87, res.stderr);
+  const intent = readIntent(repo);
+  assert.strictEqual(intent.tool, 'defect resolve');
+  assert.strictEqual(hashOf(state.statePath(repo)), intent.stateAfterHash, 'the transition landed');
+  triggerRecovery(repo);
+  assert.strictEqual(hashOf(state.ledgerPath(repo)), intent.ledgerAfterHash, 'the mirror converged byte-exactly');
+  const defect = readState(repo).defects[0];
+  assert.strictEqual(defect.status, 'resolved');
+  assert.strictEqual(readLedger(repo).defects.find((d) => d.id === defect.ledgerId).status, 'resolved');
+});
+
+ok('T5 the wire transitions mean the CLI meaning; replay answers the retry; supersede reason is one optional', () => {
+  const repo = initRepo('t5-repo');
+  const conn = service([repo], true).createConnection();
+  const open = openWorkspace(conn, repo);
+  const rev = () => readState(repo).rev;
+  const added = payload(callTool(conn, 'defect.add',
+    envelopeFor(open, { item: { severity: 'high', summary: 'wire lifecycle' } })));
+  const resolveEnvelope = envelopeFor({ ...open, stateRev: rev() }, { id: added.defectId, evidence: 'proven fixed' });
+  const resolved = payload(callTool(conn, 'defect.resolve', resolveEnvelope));
+  assert.deepStrictEqual(resolved, {
+    ok: true, committed: true, stateRev: resolveEnvelope.expectedStateRev + 1, replayed: false,
+    defectId: added.defectId, status: 'resolved', ledgerId: added.ledgerId,
+  });
+  assert.strictEqual(readLedger(repo).defects.find((d) => d.id === added.ledgerId).status, 'resolved');
+  const retry = payload(callTool(conn, 'defect.resolve', resolveEnvelope));
+  assert.deepStrictEqual(retry, { ...resolved, replayed: true }, 'the verbatim retry is the receipt');
+  // The exact repeat under a FRESH operation id is the no-op, not a refusal.
+  const again = payload(callTool(conn, 'defect.resolve',
+    envelopeFor({ ...open, stateRev: rev() }, { id: added.defectId, evidence: 'proven fixed' })));
+  assert.strictEqual(again.committed, false, 'an exact repeat with a new id no-ops');
+  const reopened = payload(callTool(conn, 'defect.reopen',
+    envelopeFor({ ...open, stateRev: rev() }, { id: added.defectId, reason: 'regressed on windows' })));
+  assert.strictEqual(reopened.status, 'reopened');
+  const superseded = payload(callTool(conn, 'defect.supersede',
+    envelopeFor({ ...open, stateRev: rev() }, { id: added.defectId, by: 'art-replacement' })));
+  assert.strictEqual(superseded.status, 'superseded');
+  assert.strictEqual(readState(repo).defects[0].supersededBy, 'art-replacement');
+  assert.strictEqual(readLedger(repo).defects.find((d) => d.id === added.ledgerId).status, 'superseded',
+    'every wire transition kept the mirror truthful');
 });
 
 // ---------------------------------------------------------------------------

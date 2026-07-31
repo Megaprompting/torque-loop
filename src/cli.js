@@ -481,14 +481,14 @@ function cmdDefect(cwd, argv, asJson) {
       // Proof gate, same spirit as the evolve KEEP gate: a defect cannot be
       // marked fixed without stating the proof that it is actually fixed.
       need(evidence, 'defect resolve requires --evidence "<proof it is actually fixed>" — no proof, no resolve');
-      mutate(cwd, 'defect resolve', () => artifacts.transitionDefect(cwd, id, 'resolved', { evidence, note: `resolved: ${evidence}` }));
+      artifacts.transitionDefect(cwd, id, 'resolved', { evidence, note: `resolved: ${evidence}` });
       return out(`defect ${id} → resolved`);
     }
     case 'reopen': {
       need(id, 'usage: ratchet defect reopen <id> --reason "<why>"');
       const reason = strOpt(opts.reason);
       need(reason, 'defect reopen requires --reason "<why it is not actually fixed>"');
-      mutate(cwd, 'defect reopen', () => artifacts.transitionDefect(cwd, id, 'reopened', { reason, note: `reopened: ${reason}` }));
+      artifacts.transitionDefect(cwd, id, 'reopened', { reason, note: `reopened: ${reason}` });
       return out(`defect ${id} → reopened`);
     }
     case 'waive': {
@@ -497,9 +497,7 @@ function cmdDefect(cwd, argv, asJson) {
       const reason = strOpt(opts.reason);
       need(owner, 'defect waive requires --owner "<who accepts the risk>"');
       need(reason, 'defect waive requires --reason "<why shipping anyway is acceptable>"');
-      mutate(cwd, 'defect waive', () =>
-        artifacts.transitionDefect(cwd, id, 'waived', { owner, reason, note: `waived by ${owner}: ${reason}` })
-      );
+      artifacts.transitionDefect(cwd, id, 'waived', { owner, reason, note: `waived by ${owner}: ${reason}` });
       return out(`defect ${id} → waived (owner: ${owner})`);
     }
     case 'supersede': {
@@ -507,13 +505,11 @@ function cmdDefect(cwd, argv, asJson) {
       const by = strOpt(opts.by);
       need(by, 'defect supersede requires --by <artifact-or-defect-id>');
       const reason = strOpt(opts.reason);
-      mutate(cwd, 'defect supersede', () =>
-        artifacts.transitionDefect(cwd, id, 'superseded', {
-          by,
-          reason,
-          note: `superseded by ${by}${reason ? `: ${reason}` : ''}`,
-        })
-      );
+      artifacts.transitionDefect(cwd, id, 'superseded', {
+        by,
+        reason,
+        note: `superseded by ${by}${reason ? `: ${reason}` : ''}`,
+      });
       return out(`defect ${id} → superseded (by: ${by})`);
     }
     default:

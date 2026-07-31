@@ -716,6 +716,78 @@ const DEFECT_ADD_TOOL = Object.freeze({
   annotations: WRITE_DESTRUCTIVE,
 });
 
+// The three wire transitions share one descriptor factory: same envelope, same
+// success projection (defectId, status, ledgerId — the mirror the operation
+// kept truthful), same destructive annotation. defect.waive is deliberately
+// NOT built here: waivers are human risk acceptance with no MCP spelling.
+function defectTransitionTool(name, title, description, semanticProps, required, statusConst) {
+  return Object.freeze({
+    name,
+    title,
+    description,
+    inputSchema: {
+      type: 'object',
+      properties: Object.assign({}, WRITE_ENVELOPE_PROPS, semanticProps),
+      required: [...WRITE_ENVELOPE_KEYS, ...required],
+      additionalProperties: false,
+    },
+    outputSchema: {
+      oneOf: [
+        writeSuccessBranch({
+          defectId: { type: 'string' },
+          status: { const: statusConst },
+          ledgerId: { type: ['string', 'null'] },
+        }),
+        WRITE_ERROR_BRANCH,
+      ],
+    },
+    annotations: WRITE_DESTRUCTIVE,
+  });
+}
+
+const DEFECT_RESOLVE_USAGE =
+  'defect.resolve requires exactly: workspaceHandle, expectedStateRev, expectedStateGen, operationId, id, evidence (non-empty)';
+const DEFECT_RESOLVE_TOOL = defectTransitionTool(
+  'defect.resolve',
+  'Resolve a defect with proof',
+  'Mark one defect resolved on an opened workspace — no proof, no resolve. The state transition and its ledger mirror commit behind one write-ahead intent; an exact repeat is a no-op, and a repeat with different proof refuses rather than silently replacing the original. CAS-bound like every write.',
+  {
+    id: { type: 'string', minLength: 1 },
+    evidence: { type: 'string', minLength: 1, description: 'Proof it is actually fixed.' },
+  },
+  ['id', 'evidence'],
+  'resolved'
+);
+
+const DEFECT_REOPEN_USAGE =
+  'defect.reopen requires exactly: workspaceHandle, expectedStateRev, expectedStateGen, operationId, id, reason (non-empty)';
+const DEFECT_REOPEN_TOOL = defectTransitionTool(
+  'defect.reopen',
+  'Reopen a defect that is not actually fixed',
+  'Reopen one defect on an opened workspace with the reason it is not actually fixed. Mirrored behind one write-ahead intent; exact repeats are no-ops. CAS-bound like every write.',
+  {
+    id: { type: 'string', minLength: 1 },
+    reason: { type: 'string', minLength: 1, description: 'Why it is not actually fixed.' },
+  },
+  ['id', 'reason'],
+  'reopened'
+);
+
+const DEFECT_SUPERSEDE_USAGE =
+  'defect.supersede requires exactly: workspaceHandle, expectedStateRev, expectedStateGen, operationId, id, by (non-empty), optionally reason (non-empty)';
+const DEFECT_SUPERSEDE_TOOL = defectTransitionTool(
+  'defect.supersede',
+  'Supersede a defect with its replacement',
+  'Mark one defect superseded on an opened workspace, naming the artifact or defect that replaced it. Mirrored behind one write-ahead intent; exact repeats are no-ops. CAS-bound like every write.',
+  {
+    id: { type: 'string', minLength: 1 },
+    by: { type: 'string', minLength: 1, description: 'The artifact or defect that replaced it.' },
+    reason: { type: 'string', minLength: 1, description: 'Optional context for the supersession.' },
+  },
+  ['id', 'by'],
+  'superseded'
+);
+
 // The one sentence each refusal speaks. A table, so the funnel test can assert
 // every wire sentence against this allowlist — no verb-specific catch can leak
 // a path, an errno, or a store location.
@@ -1402,6 +1474,50 @@ function createServer(options) {
       });
     }
 
+    // One handler shape for the three wire transitions: boundary gates travel
+    // as schema, the shared core owns the meaning, and the mirror rides the
+    // same intent. waive has no handler here, by rule.
+    function runDefectTransition(args, toStatus, tool, meta, semanticArgs) {
+      const record = resolveHandle(args.workspaceHandle, 'write');
+      return runMirroredWrite(record, tool, args, semanticArgs, (s, ledger, mintId) => {
+        const prep = artifacts.prepareDefectTransition(s, ledger, args.id, toStatus, meta, mintId);
+        const verbFields = {
+          defectId: String(prep.record.id),
+          status: toStatus,
+          ledgerId: prep.record.ledgerId ? String(prep.record.ledgerId) : null,
+        };
+        if (prep.kind === 'noop') return { kind: 'noop', verbFields };
+        return { kind: 'commit', ledgerOps: prep.ledgerOps, verbFields };
+      });
+    }
+
+    function defectResolve(arguments_) {
+      const args = writeArguments(arguments_, ['id', 'evidence'], DEFECT_RESOLVE_USAGE);
+      if (!nonEmpty(args.id) || !nonEmpty(args.evidence)) throw rpc.rpcError(-32602, DEFECT_RESOLVE_USAGE);
+      return runDefectTransition(args, 'resolved', 'defect.resolve',
+        { evidence: args.evidence, note: `resolved: ${args.evidence}` },
+        { id: args.id, evidence: args.evidence });
+    }
+
+    function defectReopen(arguments_) {
+      const args = writeArguments(arguments_, ['id', 'reason'], DEFECT_REOPEN_USAGE);
+      if (!nonEmpty(args.id) || !nonEmpty(args.reason)) throw rpc.rpcError(-32602, DEFECT_REOPEN_USAGE);
+      return runDefectTransition(args, 'reopened', 'defect.reopen',
+        { reason: args.reason, note: `reopened: ${args.reason}` },
+        { id: args.id, reason: args.reason });
+    }
+
+    function defectSupersede(arguments_) {
+      const args = writeArguments(arguments_, ['id', 'by'], DEFECT_SUPERSEDE_USAGE, ['reason']);
+      if (!nonEmpty(args.id) || !nonEmpty(args.by)) throw rpc.rpcError(-32602, DEFECT_SUPERSEDE_USAGE);
+      if (args.reason !== undefined && !nonEmpty(args.reason)) throw rpc.rpcError(-32602, DEFECT_SUPERSEDE_USAGE);
+      // Absent and null are one meaning in the binding, same as artifact.retract.
+      const reason = args.reason === undefined ? null : args.reason;
+      return runDefectTransition(args, 'superseded', 'defect.supersede',
+        { by: args.by, reason: reason || '', note: `superseded by ${args.by}${reason ? `: ${reason}` : ''}` },
+        { id: args.id, by: args.by, reason });
+    }
+
     function scoreAperture(arguments_) {
       const args = writeArguments(arguments_, [...APERTURE_DIMENSION_KEYS], SCORE_APERTURE_USAGE);
       const dims = {};
@@ -1442,6 +1558,9 @@ function createServer(options) {
         { descriptor: ARTIFACT_RETRACT_TOOL, run: artifactRetract },
         { descriptor: SCORE_APERTURE_TOOL, run: scoreAperture },
         { descriptor: DEFECT_ADD_TOOL, run: defectAdd },
+        { descriptor: DEFECT_RESOLVE_TOOL, run: defectResolve },
+        { descriptor: DEFECT_REOPEN_TOOL, run: defectReopen },
+        { descriptor: DEFECT_SUPERSEDE_TOOL, run: defectSupersede },
       ] : []),
     ];
 
