@@ -1069,6 +1069,34 @@ ok('V7 open_loop.park assigns an owner and a revisit trigger — attribution, no
   assert.strictEqual(readState(repo).history[0].event, 'loop.parked');
 });
 
+ok('V7b open_loop.park means the same thing on both boundaries', () => {
+  const mcpRepo = initRepo('v7b-mcp');
+  const cliRepo = initRepo('v7b-cli');
+  const conn = service([mcpRepo], true).createConnection();
+  const open = openWorkspace(conn, mcpRepo);
+  payload(callTool(conn, 'modern', 'state.append',
+    envelopeFor(open, { collection: 'openLoops', item: { id: 'loop-parkme', text: 'park me' } })));
+  payload(callTool(conn, 'modern', 'open_loop.park', envelopeFor(
+    { ...open, stateRev: open.stateRev + 1 },
+    { id: 'loop-parkme', owner: 'Danny', revisitTrigger: 'when 4.3 lands' }
+  )));
+  const cli = (args) => childProcess.execFileSync(process.execPath, [RATCHET, ...args],
+    { cwd: cliRepo, encoding: 'utf8', env: cleanGitEnv(), windowsHide: true });
+  cli(['state', 'append', 'openLoops', '{"id":"loop-parkme","text":"park me"}']);
+  cli(['state', 'close', 'openLoops', 'loop-parkme',
+    '--park', '--owner', 'Danny', '--revisit-trigger', 'when 4.3 lands']);
+  const viaMcp = readState(mcpRepo);
+  const viaCli = readState(cliRepo);
+  const strip = (r) => ({
+    id: r.id, text: r.text, status: r.status,
+    owner: r.owner, revisitTrigger: r.revisitTrigger, evidence: r.evidence,
+  });
+  assert.deepStrictEqual(strip(viaMcp.openLoops[0]), strip(viaCli.openLoops[0]));
+  const event = (h) => ({ event: h.event, note: h.note });
+  assert.deepStrictEqual(viaMcp.history.map(event), viaCli.history.map(event),
+    'one park meaning on both boundaries');
+});
+
 ok('V8 assumption.close ends an assumption proven or dead, never otherwise', () => {
   const repo = initRepo('v8-repo');
   const conn = service([repo], true).createConnection();
@@ -1093,6 +1121,31 @@ ok('V8 assumption.close ends an assumption proven or dead, never otherwise', () 
   assert.strictEqual(disk.status, 'killed');
   assert.strictEqual(disk.evidence, 'contradicted by V8');
   assert.strictEqual(readState(repo).history[0].event, 'assumption.killed');
+});
+
+ok('V8b assumption.close means the same thing on both boundaries', () => {
+  const mcpRepo = initRepo('v8b-mcp');
+  const cliRepo = initRepo('v8b-cli');
+  const conn = service([mcpRepo], true).createConnection();
+  const open = openWorkspace(conn, mcpRepo);
+  payload(callTool(conn, 'modern', 'state.append',
+    envelopeFor(open, { collection: 'assumptions', item: { id: 'asm-fixed', text: 'it holds' } })));
+  payload(callTool(conn, 'modern', 'assumption.close', envelopeFor(
+    { ...open, stateRev: open.stateRev + 1 },
+    { id: 'asm-fixed', outcome: 'killed', evidence: 'contradicted by V8b' }
+  )));
+  const cli = (args) => childProcess.execFileSync(process.execPath, [RATCHET, ...args],
+    { cwd: cliRepo, encoding: 'utf8', env: cleanGitEnv(), windowsHide: true });
+  cli(['state', 'append', 'assumptions', '{"id":"asm-fixed","text":"it holds"}']);
+  cli(['state', 'close', 'assumptions', 'asm-fixed',
+    '--outcome', 'killed', '--evidence', 'contradicted by V8b']);
+  const viaMcp = readState(mcpRepo);
+  const viaCli = readState(cliRepo);
+  const strip = (r) => ({ id: r.id, text: r.text, status: r.status, evidence: r.evidence });
+  assert.deepStrictEqual(strip(viaMcp.assumptions[0]), strip(viaCli.assumptions[0]));
+  const event = (h) => ({ event: h.event, note: h.note });
+  assert.deepStrictEqual(viaMcp.history.map(event), viaCli.history.map(event),
+    'one kill meaning on both boundaries');
 });
 
 ok('V9 a transition on a record that does not exist refuses UnknownRecordId with zero bytes', () => {
