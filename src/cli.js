@@ -15,6 +15,7 @@ const md = require('./markdown');
 const receipt = require('./receipt');
 const journal = require('./evolve/journal');
 const schemas = require('./schemas');
+const verbs = require('./verbs');
 
 const VERSION = require('../package.json').version;
 const PLUGIN_ROOT = path.resolve(__dirname, '..');
@@ -48,11 +49,9 @@ function readStdinSafe() {
   }
 }
 
-function coerceScalar(key, value) {
-  if (key === 'dirty') return value === 'true' || value === true;
-  if (key === 'confidence') return value === '' ? null : Number(value);
-  return value;
-}
+// state.set's meaning moved to src/verbs.js (shared with the MCP write tool);
+// the alias keeps every other inline caller reading as before.
+const { coerceScalar } = require('./verbs');
 
 // Minimal `--key value` parser for subcommands that carry real values (defect
 // lifecycle). The top-level router treats every `--flag` as boolean, which is
@@ -281,9 +280,7 @@ function cmdState(cwd, sub, rest, asJson, flags = new Set(), argv = []) {
       }
       const value = valueParts.join(' ');
       mutate(cwd, 'state set', (s) => {
-        s[key] = coerceScalar(key, value);
-        if (key !== 'dirty') s.dirty = true;
-        s.history.push({ id: state.makeId('hist'), at: schemas.nowIso(), event: 'state.set', note: `${key} = ${value}` });
+        verbs.setScalar(s, key, value, (prefix) => state.makeId(prefix));
       });
       return out(`${key} set`);
     }

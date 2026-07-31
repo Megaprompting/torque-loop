@@ -31,8 +31,18 @@
 // store it initialized (a record destroyed AFTER open meets the loaders'
 // designed self-repair; that fail-closed-vs-repair choice is parked, see spec).
 // Step 3b traced by: claude-opus-5
+//
+// Step 4 (safe core) adds the first write tools, registered ONLY when the
+// server was launched with the write opt-in: an unflagged server does not
+// advertise what the operator never granted. Every write names the revision
+// AND generation it decided against (refused stale, never merged) and carries
+// an operationId whose receipt — durable inside the state record itself —
+// makes a crash-boundary retry return the recorded outcome instead of applying
+// twice. See docs/superpowers/specs/2026-07-31-mcp-write-tools-design.md.
+// Step 4 traced by: claude-fable-5
 
 const handles = require('./handles');
+const ops = require('./ops');
 const prompts = require('./prompts');
 const repository = require('./repository');
 const rpc = require('./rpc');
@@ -41,8 +51,10 @@ const coldStart = require('../coldStart');
 const journal = require('../evolve/journal');
 const lifecycle = require('../lifecycle');
 const receipt = require('../receipt');
+const schemas = require('../schemas');
 const scoring = require('../scoring');
 const state = require('../state');
+const verbs = require('../verbs');
 const pkg = require('../../package.json');
 
 const LIST_TTL_MS = 300000;
@@ -86,6 +98,11 @@ const TOOL = Object.freeze({
       repositoryId: { type: 'string' },
       worktreeId: { type: 'string' },
       stateRev: { type: 'integer' },
+      // The store LINEAGE the revision counts within. A write names both: a
+      // revision number alone can recur when a store is destroyed and
+      // recreated out-of-band, and a generation the client did not observe is
+      // a world it never decided against.
+      stateGen: { type: 'string' },
       resources: {
         type: 'object',
         properties: {
@@ -97,7 +114,7 @@ const TOOL = Object.freeze({
         additionalProperties: false,
       },
     },
-    required: ['workspaceHandle', 'repositoryId', 'worktreeId', 'stateRev', 'resources'],
+    required: ['workspaceHandle', 'repositoryId', 'worktreeId', 'stateRev', 'stateGen', 'resources'],
     additionalProperties: false,
   },
   annotations: {
@@ -241,6 +258,161 @@ const FRICTION_TOOL = Object.freeze({
   annotations: READ_ONLY,
 });
 
+// The shared write envelope: every write names the workspace by handle, the
+// revision AND generation it decided against, and its own retry key. The
+// operationId's floor of 22 chars fits a UUID's entropy in base64url; syntax
+// cannot prove entropy, so the descriptor says MUST-NOT-reuse out loud.
+const OPERATION_ID = /^[A-Za-z0-9_-]{22,128}$/;
+
+const WRITE_ENVELOPE_PROPS = Object.freeze({
+  workspaceHandle: {
+    type: 'string',
+    description: 'The opaque handle workspace.open minted on this connection.',
+  },
+  expectedStateRev: {
+    type: 'integer',
+    minimum: 0,
+    description: 'The state revision this write was decided against, from workspace.open or the state resource. A mismatch refuses; nothing is merged.',
+  },
+  expectedStateGen: {
+    type: 'string',
+    description: 'The store generation the revision was observed in, from workspace.open.stateGen. Pins the lineage a recreated store cannot fake.',
+  },
+  operationId: {
+    type: 'string',
+    pattern: OPERATION_ID.source,
+    description: 'Client-generated retry key (UUIDv4 or >=128 bits of entropy). Retry the SAME operation with the same id; never reuse one for a different operation.',
+  },
+});
+const WRITE_ENVELOPE_KEYS = Object.freeze(Object.keys(WRITE_ENVELOPE_PROPS));
+
+// One error branch for every write refusal that crosses as a tool result.
+// isError does not exempt structuredContent from the declared schema, so the
+// refusals conform too.
+const WRITE_ERROR_BRANCH = Object.freeze({
+  type: 'object',
+  properties: {
+    ok: { const: false },
+    error: {
+      enum: [
+        'StateNotInitialized',
+        'StaleGeneration',
+        'StaleStateRev',
+        'OperationIdConflict',
+        'DeterministicIdConflict',
+        'WriteFailed',
+      ],
+    },
+    message: { type: 'string' },
+    expectedStateRev: { type: ['integer', 'null'] },
+    actualStateRev: { type: ['integer', 'null'] },
+    expectedStateGen: { type: ['string', 'null'] },
+    actualStateGen: { type: ['string', 'null'] },
+  },
+  required: ['ok', 'error', 'message'],
+  additionalProperties: false,
+});
+
+function writeSuccessBranch(verbProps) {
+  return {
+    type: 'object',
+    properties: Object.assign({
+      ok: { const: true },
+      committed: { type: 'boolean' },
+      stateRev: { type: 'integer' },
+      replayed: { type: 'boolean' },
+    }, verbProps),
+    required: ['ok', 'committed', 'stateRev', 'replayed', ...Object.keys(verbProps)],
+    additionalProperties: false,
+  };
+}
+
+const STATE_SET_USAGE =
+  'state.set requires exactly: workspaceHandle, expectedStateRev, expectedStateGen, operationId, key, value';
+
+const STATE_SET_TOOL = Object.freeze({
+  name: 'state.set',
+  title: 'Set one Torque session-state scalar',
+  description:
+    'Set one settable session-state scalar (title, objective, bottleneck, phase, nextAction, nextCommand, confidence) on an opened workspace. CAS-bound: refuses unless expectedStateRev and expectedStateGen match the record, and replays the recorded outcome when the same operationId retries the same operation.',
+  inputSchema: {
+    type: 'object',
+    properties: Object.assign({}, WRITE_ENVELOPE_PROPS, {
+      key: { type: 'string', enum: [...schemas.STATE_SCALARS] },
+      value: { type: 'string', description: 'The value to record; confidence coerces to a number, everything else stays text.' },
+    }),
+    required: [...WRITE_ENVELOPE_KEYS, 'key', 'value'],
+    additionalProperties: false,
+  },
+  outputSchema: {
+    oneOf: [
+      writeSuccessBranch({ key: { type: 'string', enum: [...schemas.STATE_SCALARS] } }),
+      WRITE_ERROR_BRANCH,
+    ],
+  },
+  annotations: {
+    readOnlyHint: false,
+    // Setting a scalar overwrites the previous value; provenance in history
+    // does not make an overwrite additive.
+    destructiveHint: true,
+    idempotentHint: true,
+    openWorldHint: false,
+  },
+});
+
+// The one sentence each refusal speaks. A table, so the funnel test can assert
+// every wire sentence against this allowlist — no verb-specific catch can leak
+// a path, an errno, or a store location.
+const WRITE_REFUSALS = Object.freeze({
+  StateNotInitialized: 'workspace state record does not exist — re-open the workspace once it is reinitialized',
+  StaleGeneration: 'workspace record generation changed since it was read — re-open the workspace and re-decide',
+  StaleStateRev: 'workspace record moved since it was read — re-read the state and re-decide against the current revision',
+  OperationIdConflict: 'operationId was already used for a different operation — mint a fresh operationId',
+  DeterministicIdConflict: 'derived record id already names an existing record — the operation refuses to address it',
+  WriteFailed: 'workspace write could not be completed',
+});
+
+function writeRefusal(error, fields) {
+  const structured = Object.assign({ ok: false, error, message: WRITE_REFUSALS[error] }, fields || {});
+  return {
+    content: [{ type: 'text', text: JSON.stringify(structured) }],
+    structuredContent: structured,
+    isError: true,
+  };
+}
+
+// THE funnel: every throwable a write path produces that is not already a
+// boundary refusal becomes one allowlisted sentence. The raw error carries
+// store pathnames and filesystem codes; neither belongs on this wire.
+function safeWriteError(_error) {
+  return writeRefusal('WriteFailed');
+}
+
+// Envelope shape is boundary business: exactly the envelope plus this verb's
+// semantic fields, every one present, none extra, each envelope field typed.
+// The message names the fields (that reveals no authority); the handle itself
+// is still validated by resolveHandle's one non-enumerating answer.
+function writeArguments(arguments_, semanticKeys, usage) {
+  const args = arguments_;
+  if (!args || typeof args !== 'object' || Array.isArray(args)) throw rpc.rpcError(-32602, usage);
+  const allowed = [...WRITE_ENVELOPE_KEYS, ...semanticKeys];
+  const allowedSet = new Set(allowed);
+  for (const key of Object.keys(args)) {
+    if (!allowedSet.has(key)) throw rpc.rpcError(-32602, usage);
+  }
+  for (const key of allowed) {
+    if (!Object.prototype.hasOwnProperty.call(args, key)) throw rpc.rpcError(-32602, usage);
+  }
+  if (!Number.isInteger(args.expectedStateRev) || args.expectedStateRev < 0) {
+    throw rpc.rpcError(-32602, usage);
+  }
+  if (typeof args.expectedStateGen !== 'string') throw rpc.rpcError(-32602, usage);
+  if (typeof args.operationId !== 'string' || !OPERATION_ID.test(args.operationId)) {
+    throw rpc.rpcError(-32602, usage);
+  }
+  return args;
+}
+
 const RESOURCE_TEMPLATES = Object.freeze(RESOURCE_NAMES.map((name) => Object.freeze({
   uriTemplate: `torque://workspace/{workspaceHandle}/${name}`,
   name: `torque-${name}`,
@@ -346,6 +518,10 @@ function rankFriction(arguments_) {
 
 function createServer(options) {
   const opts = options || {};
+  // Write capability is declared at spawn, never inferred: without the opt-in
+  // the write tools are not registered at all, so tools/list stays truthful
+  // instead of advertising capability the operator never granted.
+  const writeEnabled = opts.write === true;
   const roots = workspace.createRoots(opts.roots);
   const discoverer = repository.createDiscovery({ roots });
   const registry = handles.createRegistry({ roots });
@@ -423,7 +599,9 @@ function createServer(options) {
           token = authority.grant({
             path: found.root,
             kind: 'directory',
-            operations: ['read', 'list'],
+            // The grant carries what the LAUNCH granted: write authority
+            // exists on a handle only when the server was started with it.
+            operations: writeEnabled ? ['read', 'write', 'list'] : ['read', 'list'],
           });
         } catch (error) {
           return toolError(safeOpenError(error));
@@ -448,6 +626,9 @@ function createServer(options) {
         repositoryId: record.repositoryId,
         worktreeId: record.worktreeId,
         stateRev: snapshot && Number.isInteger(snapshot.rev) ? snapshot.rev : 0,
+        // The same loaded snapshot as stateRev: a revision and a generation
+        // read separately could describe two different records.
+        stateGen: snapshot ? String(snapshot.gen || '') : '',
         resources: uris,
       };
       return {
@@ -466,14 +647,14 @@ function createServer(options) {
     // who may read. Malformed, unknown, stale, revoked, closed and
     // foreign-connection handles all leave here as one refusal: a reply that
     // varied would let the registry be enumerated one guess at a time.
-    function resolveHandle(handle) {
+    function resolveHandle(handle, operation) {
       if (typeof handle !== 'string' || !HANDLE_EXACT.test(handle)) {
         throw rpc.rpcError(-32602, RESOURCE_UNAVAILABLE);
       }
       const record = byHandle.get(handle);
       if (!record) throw rpc.rpcError(-32602, RESOURCE_UNAVAILABLE);
       try {
-        const granted = authority.use(handle, 'read');
+        const granted = authority.use(handle, operation || 'read');
         if (granted.kind !== 'directory' || granted.path !== record.root) {
           throw rpc.rpcError(-32602, RESOURCE_UNAVAILABLE);
         }
@@ -534,14 +715,73 @@ function createServer(options) {
       }
     }
 
+    // The canary write verb. Envelope and semantics are refused at the
+    // boundary; everything past resolveHandle happens inside ops.executeWrite's
+    // single locked transaction, and every outcome maps to a conforming
+    // structured result. The verb's meaning lives in src/verbs.js, shared with
+    // the CLI — one implementation, two boundaries.
+    function stateSet(arguments_) {
+      const args = writeArguments(arguments_, ['key', 'value'], STATE_SET_USAGE);
+      if (typeof args.key !== 'string' || !schemas.STATE_SCALARS.has(args.key)) {
+        throw rpc.rpcError(-32602, `state.set key must be one of: ${[...schemas.STATE_SCALARS].join(', ')}`);
+      }
+      if (typeof args.value !== 'string') throw rpc.rpcError(-32602, STATE_SET_USAGE);
+      const record = resolveHandle(args.workspaceHandle, 'write');
+      let outcome;
+      try {
+        outcome = ops.executeWrite({
+          state,
+          root: record.root,
+          tool: 'state.set',
+          operationId: args.operationId,
+          expectedStateRev: args.expectedStateRev,
+          expectedStateGen: args.expectedStateGen,
+          semanticArgs: { key: args.key, value: args.value },
+          apply: (s, mintId) => {
+            verbs.setScalar(s, args.key, args.value, mintId);
+            return { key: args.key };
+          },
+        });
+      } catch (error) {
+        return safeWriteError(error);
+      }
+      switch (outcome.kind) {
+        case 'replayed':
+          return toolResult(Object.assign(outcome.result, { replayed: true }));
+        case 'committed':
+        case 'noop':
+          return toolResult(outcome.result);
+        case 'stateMissing':
+          return writeRefusal('StateNotInitialized', { actualStateRev: null, actualStateGen: null });
+        case 'staleGen':
+          return writeRefusal('StaleGeneration', {
+            expectedStateGen: args.expectedStateGen,
+            actualStateGen: outcome.actualStateGen,
+          });
+        case 'staleRev':
+          return writeRefusal('StaleStateRev', {
+            expectedStateRev: args.expectedStateRev,
+            actualStateRev: outcome.actualStateRev,
+          });
+        case 'conflict':
+          return writeRefusal('OperationIdConflict');
+        case 'idConflict':
+          return writeRefusal('DeterministicIdConflict');
+        default:
+          return writeRefusal('WriteFailed');
+      }
+    }
+
     // ONE registry. tools/list renders it and tools/call dispatches from it, so
     // a listed tool cannot silently lack an implementation and an implemented
-    // tool cannot stay undiscoverable. The order is the advertised order.
+    // tool cannot stay undiscoverable. The order is the advertised order; the
+    // write roster exists only when the launch granted writes.
     const toolRegistry = [
       { descriptor: TOOL, run: openWorkspace },
       { descriptor: SCAN_TOOL, run: scanWorkspace },
       { descriptor: CONFIDENCE_TOOL, run: confidenceForWorkspace },
       { descriptor: FRICTION_TOOL, run: rankFriction },
+      ...(writeEnabled ? [{ descriptor: STATE_SET_TOOL, run: stateSet }] : []),
     ];
 
     function parseResource(uri) {
@@ -659,4 +899,4 @@ function createServer(options) {
 // becomes wire text, and a Windows-only slug collision cannot be provoked on
 // every platform the tests run on. Exported so the refusal text is falsifiable
 // everywhere, not just where the collision exists.
-module.exports = { createServer, safeOpenError };
+module.exports = { createServer, safeOpenError, WRITE_REFUSALS };

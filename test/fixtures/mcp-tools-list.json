@@ -31,6 +31,9 @@
         "stateRev": {
           "type": "integer"
         },
+        "stateGen": {
+          "type": "string"
+        },
         "resources": {
           "type": "object",
           "properties": {
@@ -57,6 +60,7 @@
         "repositoryId",
         "worktreeId",
         "stateRev",
+        "stateGen",
         "resources"
       ],
       "additionalProperties": false

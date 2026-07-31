@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The first MCP write tool — and the machinery that makes a retried write safe to
+  retry.** `state.set` joins the registry ONLY when the server is launched with `--write`:
+  an unflagged server registers no write tools at all, so `tools/list` never advertises
+  capability the operator did not grant, and `--write` under a propose-only
+  `RATCHET_AGENT` refuses at startup instead of failing every call (**CLI-enforced**,
+  with `assertMayWrite` still the backstop underneath). Every write names
+  `expectedStateRev` AND `expectedStateGen` — the revision and store lineage it decided
+  against — and is refused stale, never merged; a recreated store that reuses a numeric
+  revision still refuses on the generation. Every write carries an `operationId` whose
+  receipt is durable **inside the state record** (`state.operations`, ring of 32,
+  committed in the same atomic rename as the revision it describes), so a verbatim retry
+  — same connection or a fresh one after a server crash, new handle and all — returns the
+  persisted result marked `replayed` instead of applying twice; the same id with a
+  different meaning refuses `OperationIdConflict`. The binding hashes tool + semantic
+  arguments + revision + generation, never the handle: transports die, decisions don't.
+  Ids minted by an MCP write derive from that binding, so a crash-boundary re-application
+  converges on the same record — and a derived id that already names a record refuses
+  `DeterministicIdConflict` rather than letting entropy impersonate an address. A no-op
+  commits nothing and records no receipt (the 0.9 property, kept on purpose; its
+  observability limit is stated in the spec). All refusals cross one funnel with an
+  allowlisted sentence each — no path, errno, or store location rides the wire — and
+  every structured result, success and refusal alike, conforms to the declared
+  `oneOf` output schema (**MCP-boundary enforced**). Five crash-boundary replay tests,
+  each seen red against a deliberately broken variant, include a real child process dying
+  at the commit rename and a real reconnect over `bin/ratchet-mcp --write`. The verb's
+  meaning moved to `src/verbs.js`, shared by the CLI and the MCP boundary — one
+  implementation, two doors. `workspace.open` now reports `stateGen` beside `stateRev`,
+  from the same snapshot. Safe core per the ratified step-4 design
+  (docs/superpowers/specs/2026-07-31-mcp-write-tools-design.md): cross-file verbs
+  (`defect.*`, `ledger.update`) wait for 4b's WAL design; waivers stay CLI acts, never
+  wire arguments.
+
+<!-- Traced by: claude-fable-5 -->
+
 - **The 16 canonical ratchet prompts are now an MCP prompt surface.** `prompts/list`
   advertises each prompt and its body-derived required arguments; `prompts/get` substitutes
   those arguments into a fresh copy of the canonical body for both supported protocol eras.

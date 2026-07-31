@@ -62,6 +62,13 @@ function newState(clock) {
     openLoops: [], // { id, at, text, status }
     touchedFiles: [], // { path, at }
     history: [], // { id, at, event, note }
+    // Operation receipts for boundary-retried writes (MCP step 4). They live
+    // INSIDE this record because a receipt is only truthful if it is durable
+    // atomically with the commit it describes — a sibling file can be lost or
+    // land without its commit, and either way the receipt lies about whether
+    // the write happened. Bounded ring: entries are { id: operationId, tool,
+    // argsHash, gen, rev, at, result }, appended only when a write commits.
+    operations: [],
   };
 }
 
