@@ -54,6 +54,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     store probes its nearest existing ancestor, so no first store appearing in the
     sample-to-probe window can be recovered by the diagnosis tool. Doctor no longer
     creates the store as a side effect; the first write does.
+  - **Round 4 of the same review added two more, fixed the same way:** the ordinary
+    loaders joined the fatal-decode rule (W10, W11) — `readJson`'s fast-path peek
+    answers null on undecodable bytes, and `readJsonResilient` routes invalid UTF-8
+    through the same loud backup-then-reinitialize path it has always used for invalid
+    JSON, with the backup now preserving the exact original bytes; previously a lawful
+    ordinary write would silently serialize a U+FFFD-normalized record and settle the
+    two canonical files in disagreement with no backup and no intent. And the doctor
+    writability probe now proves directory creation as well as file creation (W13) —
+    Windows ACLs grant the two separately, the lock is a mkdir, and a file-only probe
+    answered "writable" where the first real write then failed. W12 additionally pins
+    recovery's own fatal decode against an adversarially consistent slot whose hash
+    certifies undecodable bytes.
   - **Known limitation (parked, review round 2): the identity-checked clear is two
     syscalls.** The CLEAR step re-reads and compares before deleting, exactly as the
     spec words it — but compare and unlink cannot be one atomic operation through a

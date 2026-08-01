@@ -843,9 +843,14 @@ function cmdDoctor(cwd, asJson) {
       if (up === probeDir) break;
       probeDir = up;
     }
-    const probe = path.join(probeDir, `.doctor-probe.tmp-${process.pid.toString(36)}`);
-    fs.writeFileSync(probe, 'doctor writability probe\n');
-    fs.unlinkSync(probe);
+    // The probe proves BOTH creations a real writer needs: a directory (the
+    // lock is a mkdir; a missing store starts as one) and a file inside it —
+    // Windows ACLs grant these separately, and a file-only probe said
+    // "writable" where the first real write then failed its mkdir.
+    const scratch = path.join(probeDir, `.doctor-probe.tmp-${process.pid.toString(36)}`);
+    fs.mkdirSync(scratch);
+    fs.writeFileSync(path.join(scratch, 'probe'), 'doctor writability probe\n');
+    fs.rmSync(scratch, { recursive: true, force: true });
     stateDetail = probeDir === dir ? dir : `${dir} (not created yet — the first write creates it)`;
   } catch (e) {
     stateOk = false;

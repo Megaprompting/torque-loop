@@ -1142,6 +1142,102 @@ ok('W6 clear verifies the slot it deletes is the slot it proved', () => {
     'the substituted slot survived the refused clear');
 });
 
+ok('W10 an ordinary state writer never serializes a normalized record — bytes back up, loudly', () => {
+  const repo = fixture('w10');
+  initStore(repo);
+  settled(() => artifacts.addDefect(repo, { severity: 'high', summary: 'ordinary state sentinel' }));
+  const stateFile = state.statePath(repo);
+  const damaged = Buffer.from(bytesOf(stateFile));
+  const at = damaged.indexOf(Buffer.from('ordinary state sentinel', 'utf8'));
+  assert.ok(at > 0);
+  damaged[at + 2] = 0xff;
+  fs.writeFileSync(stateFile, damaged);
+  settled(() => state.withWorkspaceMutation(repo, { action: 'w10 ordinary write' }, (s) => {
+    s.objective = 'a lawful unrelated write';
+  }));
+  assert.ok(!bytesOf(stateFile).toString('utf8').includes('�'),
+    'no U+FFFD ever reaches a canonical file — normalization is not recovery');
+  const dir = path.dirname(stateFile);
+  const backups = fs.readdirSync(dir).filter((n) => n.startsWith('state.json.corrupt.'));
+  assert.ok(backups.length >= 1, 'the undecodable bytes were preserved before anything replaced them');
+  for (const b of backups) {
+    assert.ok(damaged.equals(bytesOf(path.join(dir, b))), 'the backup is the exact original bytes');
+  }
+});
+
+ok('W11 an ordinary ledger writer never serializes a normalized record — bytes back up, loudly', () => {
+  const repo = fixture('w11');
+  initStore(repo);
+  settled(() => artifacts.addDefect(repo, { severity: 'high', summary: 'ordinary ledger sentinel' }));
+  const ledgerFile = state.ledgerPath(repo);
+  const damaged = Buffer.from(bytesOf(ledgerFile));
+  const at = damaged.indexOf(Buffer.from('ordinary ledger sentinel', 'utf8'));
+  assert.ok(at > 0);
+  damaged[at + 2] = 0xff;
+  fs.writeFileSync(ledgerFile, damaged);
+  const loaded = state.loadLedger(repo);
+  settled(() => state.saveLedger(repo, loaded));
+  assert.ok(!bytesOf(ledgerFile).toString('utf8').includes('�'), 'no U+FFFD ever reaches a canonical file');
+  const dir = path.dirname(ledgerFile);
+  const backups = fs.readdirSync(dir).filter((n) => n.startsWith('ledger.json.corrupt.'));
+  assert.ok(backups.length >= 1, 'the undecodable bytes were preserved');
+  for (const b of backups) {
+    assert.ok(damaged.equals(bytesOf(path.join(dir, b))), 'the backup is the exact original bytes');
+  }
+});
+
+ok('W12 recovery refuses a state after-image whose bytes are not UTF-8, hash match or not', () => {
+  const repo = fixture('w12');
+  craftedSlot(repo, 'after-state');
+  const stateFile = state.statePath(repo);
+  const damaged = Buffer.from(bytesOf(stateFile));
+  const at = damaged.indexOf(Buffer.from('crafted', 'utf8'));
+  assert.ok(at > 0);
+  damaged[at + 2] = 0xff;
+  fs.writeFileSync(stateFile, damaged);
+  const slot = readIntent(repo);
+  slot.stateAfterHash = wal.hashBytes(damaged); // an adversarially consistent slot
+  fs.writeFileSync(state.intentPath(repo), wal.serializeRecord(slot));
+  const before = storeSnapshot(repo);
+  assert.throws(() => triggerRecovery(repo), (e) => Boolean(e) && e.code === 'ERATCHETMIRROR',
+    'a hash can certify damaged bytes; the parse must still refuse them');
+  assert.deepStrictEqual(storeSnapshot(repo), before, 'the refusal preserved every byte');
+});
+
+ok('W13 the doctor probe proves directory creation, not just file creation', () => {
+  const repo = initRepo('w13');
+  const cli = require('../src/cli');
+  const realMkdir = fs.mkdirSync;
+  const realWrite = process.stdout.write;
+  const realExit = process.exitCode;
+  const realCwd = process.cwd();
+  let captured = '';
+  try {
+    fs.mkdirSync = function denied(target, ...rest) {
+      if (String(target).includes('.doctor-probe')) {
+        const e = new Error(`EPERM: operation not permitted, mkdir '${target}'`);
+        e.code = 'EPERM';
+        throw e; // the ACL shape Windows grants: files allowed, directories denied
+      }
+      return realMkdir.call(fs, target, ...rest);
+    };
+    process.chdir(repo);
+    process.stdout.write = (s) => {
+      captured += String(s);
+      return true;
+    };
+    cli.run(['node', 'ratchet', 'doctor', '--json']);
+  } finally {
+    fs.mkdirSync = realMkdir;
+    process.stdout.write = realWrite;
+    process.chdir(realCwd);
+    process.exitCode = realExit;
+  }
+  const writable = JSON.parse(captured).checks.find((c) => c.name === 'state dir writable');
+  assert.strictEqual(writable.ok, false,
+    'a place where directories cannot be created is not writable for a store');
+});
+
 // ---------------------------------------------------------------------------
 
 process.stdout.write(`\n${passed} passed, ${failures.length} failed\n`);
