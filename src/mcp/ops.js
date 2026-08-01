@@ -46,7 +46,12 @@ function compareCodePoints(a, b) {
 function canonicalize(value) {
   if (Array.isArray(value)) return value.map(canonicalize);
   if (value && typeof value === 'object') {
-    const out = {};
+    // Null prototype, because JSON-parsed input can carry "__proto__" as an
+    // OWN key: on an ordinary object that assignment hits the prototype
+    // setter and the key vanishes from serialization — two different
+    // operations would then share one binding hash and a retained retry
+    // would replay the wrong one.
+    const out = Object.create(null);
     for (const key of Object.keys(value).sort(compareCodePoints)) out[key] = canonicalize(value[key]);
     return out;
   }
@@ -212,7 +217,10 @@ function executeWrite(opts) {
         at: schemas.nowIso(),
         result,
       };
-      if (JSON.stringify(entry).length > RECEIPT_ENTRY_CAP) {
+      // The cap is UTF-8 BYTES on disk, not UTF-16 code units in memory —
+      // .length undercounts astral characters 2:1 and committed receipts the
+      // strict reader's byte cap must reject.
+      if (Buffer.byteLength(JSON.stringify(entry), 'utf8') > RECEIPT_ENTRY_CAP) {
         const e = new Error(`operation receipt exceeds ${RECEIPT_ENTRY_CAP} bytes`);
         e.code = 'ERATCHETRECEIPTCAP';
         throw e;
@@ -290,7 +298,10 @@ function executeMirroredWrite(opts) {
         at: schemas.nowIso(),
         result,
       };
-      if (JSON.stringify(entry).length > RECEIPT_ENTRY_CAP) {
+      // The cap is UTF-8 BYTES on disk, not UTF-16 code units in memory —
+      // .length undercounts astral characters 2:1 and committed receipts the
+      // strict reader's byte cap must reject.
+      if (Buffer.byteLength(JSON.stringify(entry), 'utf8') > RECEIPT_ENTRY_CAP) {
         const e = new Error(`operation receipt exceeds ${RECEIPT_ENTRY_CAP} bytes`);
         e.code = 'ERATCHETRECEIPTCAP';
         throw e;

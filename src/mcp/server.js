@@ -828,9 +828,26 @@ function safeWriteError(_error) {
 // semantic fields, every one present, none extra, each envelope field typed.
 // The message names the fields (that reveals no authority); the handle itself
 // is still validated by resolveHandle's one non-enumerating answer.
+// Free-form fields (item, value) nest arbitrarily, and the recursive
+// canonicalizer downstream would blow the stack on pathological-but-valid
+// depth and surface an internal error for what is malformed input. Measured
+// iteratively for the same reason. 64 is generous: a real record is < 10.
+const ARGUMENT_DEPTH_CAP = 64;
+function argumentsTooDeep(value) {
+  let stack = [{ v: value, d: 1 }];
+  while (stack.length) {
+    const { v, d } = stack.pop();
+    if (!v || typeof v !== 'object') continue;
+    if (d > ARGUMENT_DEPTH_CAP) return true;
+    for (const key of Object.keys(v)) stack.push({ v: v[key], d: d + 1 });
+  }
+  return false;
+}
+
 function writeArguments(arguments_, semanticKeys, usage, optionalKeys) {
   const args = arguments_;
   if (!args || typeof args !== 'object' || Array.isArray(args)) throw rpc.rpcError(-32602, usage);
+  if (argumentsTooDeep(args)) throw rpc.rpcError(-32602, usage);
   const required = [...WRITE_ENVELOPE_KEYS, ...semanticKeys];
   const allowedSet = new Set([...required, ...(optionalKeys || [])]);
   for (const key of Object.keys(args)) {
@@ -839,7 +856,9 @@ function writeArguments(arguments_, semanticKeys, usage, optionalKeys) {
   for (const key of required) {
     if (!Object.prototype.hasOwnProperty.call(args, key)) throw rpc.rpcError(-32602, usage);
   }
-  if (!Number.isInteger(args.expectedStateRev) || args.expectedStateRev < 0) {
+  // Safe integer, not just integer: 2^53 passes isInteger but cannot be the
+  // revision a client honestly read, and past it `+ 1` stops moving.
+  if (!Number.isSafeInteger(args.expectedStateRev) || args.expectedStateRev < 0) {
     throw rpc.rpcError(-32602, usage);
   }
   if (typeof args.expectedStateGen !== 'string') throw rpc.rpcError(-32602, usage);
