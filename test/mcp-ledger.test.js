@@ -36,6 +36,7 @@ const ledgerMod = require('../src/ledger');
 
 const META = 'io.modelcontextprotocol/';
 const MODERN = '2026-07-28';
+const LEGACY = '2025-11-25';
 const BIN = path.join(__dirname, '..', 'bin', 'ratchet-mcp');
 
 let passed = 0;
@@ -106,6 +107,37 @@ function modern(conn, method, params) {
     method,
     params: { ...(params || {}), _meta: modernMeta() },
   });
+}
+
+function initializeLegacy(conn) {
+  return conn.handleMessage({
+    jsonrpc: '2.0',
+    id: ++requestId,
+    method: 'initialize',
+    params: {
+      protocolVersion: LEGACY,
+      capabilities: {},
+      clientInfo: { name: 'test-client', version: '0' },
+    },
+  });
+}
+
+function legacy(conn, method, params) {
+  return conn.handleMessage({
+    jsonrpc: '2.0',
+    id: ++requestId,
+    method,
+    params: params || {},
+  });
+}
+
+function callToolEra(conn, era, name, arguments_) {
+  const call = era === 'legacy' ? legacy : modern;
+  return call(conn, 'tools/call', { name, arguments: arguments_ });
+}
+
+function openWorkspaceEra(conn, repo, era) {
+  return payload(callToolEra(conn, era, 'workspace.open', { path: repo }));
 }
 
 function callTool(conn, name, arguments_) {
@@ -276,13 +308,19 @@ ok('L1 ledger.update is tool #19 under --write, absent without it, descriptor pi
   assert.ok(tool.inputSchema.properties.expectedLedgerHash, 'the admission hash is optional wire surface');
   assert.deepStrictEqual(tool.inputSchema.properties.expectedLedgerRev.type, ['integer', 'null']);
   assert.strictEqual(tool.inputSchema.properties.expectedLedgerRev.maximum, 9007199254740991);
-  assert.deepStrictEqual(tool.inputSchema.properties.collection.enum, ['features'],
-    '4c.1 ships the features canary; tests widens the enum in 4c.2');
+  assert.deepStrictEqual(
+    tool.inputSchema.properties.collection.enum,
+    [...schemas.LEDGER_FAMILY_COLLECTIONS],
+  );
   assert.strictEqual(tool.inputSchema.additionalProperties, false);
   const [success, error] = tool.outputSchema.oneOf;
   assert.deepStrictEqual(success.required,
     ['ok', 'committed', 'ledgerRev', 'replayed', 'collection', 'recordId', 'action']);
   assert.deepStrictEqual(success.properties.ledgerRev.type, ['integer', 'null']);
+  assert.deepStrictEqual(
+    success.properties.collection.enum,
+    [...schemas.LEDGER_FAMILY_COLLECTIONS],
+  );
   assert.ok(!('stateRev' in success.properties), 'stateRev never appears on this tool');
   // All NINE reachable codes, enumerated so the schema cannot undercount.
   assert.deepStrictEqual(error.properties.error.enum, [
@@ -348,6 +386,55 @@ ok('L2 a committed write moves ledgerRev exactly once with its receipt in the sa
   const stateDisk = JSON.parse(fs.readFileSync(state.statePath(repo), 'utf8'));
   assert.strictEqual(stateDisk.rev, open.stateRev, 'this tool touches no state bytes');
   assert.ok(!(stateDisk.operations || []).length, 'and writes no state receipt');
+});
+
+ok('L2b tests writes persist, replay, and no-op in both protocol eras', () => {
+  for (const era of ['modern', 'legacy']) {
+    const repo = initRepo(`l2b-${era}`);
+    const conn = service([repo], true).createConnection();
+    if (era === 'legacy') initializeLegacy(conn);
+    const open = openWorkspaceEra(conn, repo, era);
+    const item = {
+      name: `${era} wire contract`,
+      feature: 'feat-ledger-update',
+      kind: 'integration',
+      status: 'pass',
+    };
+    const envelope = ledgerEnvelope(open, { collection: 'tests', item });
+    const created = payload(callToolEra(conn, era, 'ledger.update', envelope));
+    const argsHash = ops.ledgerBindingHash('tests', item, open.ledgerRev, open.ledgerGen, null);
+
+    assert.strictEqual(
+      created.recordId,
+      ops.deriveId('test', open.ledgerGen, 'ledger.update', argsHash, 'tests'),
+    );
+    assert.ok(created.recordId.startsWith('test-'));
+    assert.strictEqual(created.collection, 'tests');
+    assert.strictEqual(created.committed, true);
+    let disk = readLedger(repo);
+    assert.strictEqual(disk.tests.length, 1);
+    assert.strictEqual(disk.tests[0].id, created.recordId);
+
+    const beforeReplay = storeSnapshot(repo);
+    const replayed = payload(callToolEra(conn, era, 'ledger.update', envelope));
+    assert.strictEqual(replayed.replayed, true);
+    assert.deepStrictEqual(storeSnapshot(repo), beforeReplay);
+
+    disk = readLedger(repo);
+    const noOpEnvelope = ledgerEnvelope({
+      ...open,
+      ledgerRev: disk.ledgerRev,
+      ledgerGen: disk.ledgerGen,
+    }, {
+      collection: 'tests',
+      item: { id: created.recordId, ...item },
+    });
+    const beforeNoOp = storeSnapshot(repo);
+    const noOp = payload(callToolEra(conn, era, 'ledger.update', noOpEnvelope));
+    assert.strictEqual(noOp.committed, false);
+    assert.strictEqual(noOp.action, 'updated');
+    assert.deepStrictEqual(storeSnapshot(repo), beforeNoOp);
+  }
 });
 
 // Crash-boundary test 1: lost response.
@@ -606,9 +693,9 @@ ok('L11 malformed ledger envelopes refuse -32602 at the boundary with zero bytes
     ledgerEnvelope(open, { expectedLedgerHash: hash, item: { name: 'x' } }),
     // A malformed hash on an admission spelling.
     ledgerEnvelope(open, { expectedLedgerRev: null, expectedLedgerGen: null, expectedLedgerHash: 'sha256:xyz', item: { name: 'x' } }),
-    // Collections outside the canary — including the permanently excluded one.
-    ledgerEnvelope(open, { collection: 'tests', item: { name: 'x' } }),
+    // tests is admitted by the family constant; defects remains permanently excluded.
     ledgerEnvelope(open, { collection: 'defects', item: { name: 'x' } }),
+    ledgerEnvelope(open, { collection: 'unknown', item: { name: 'x' } }),
     // item.id must be a non-empty string.
     ledgerEnvelope(open, { item: { id: 7, name: 'x' } }),
     ledgerEnvelope(open, { item: { id: '', name: 'x' } }),

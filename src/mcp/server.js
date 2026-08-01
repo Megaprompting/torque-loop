@@ -885,7 +885,10 @@ const LEDGER_UPDATE_TOOL = Object.freeze({
         pattern: OPERATION_ID.source,
         description: 'Client-generated retry key (UUIDv4 or >=128 bits of entropy). Retry the SAME operation with the same id; never reuse one for a different operation.',
       },
-      collection: { type: 'string', enum: ['features'] },
+      // This is more than de-duplication: defects is absent from the shared
+      // family constant, so D3's exclusion is structural in discovery and
+      // admission. Serve a copy, as with the state collection enums.
+      collection: { type: 'string', enum: [...schemas.LEDGER_FAMILY_COLLECTIONS] },
       item: {
         type: 'object',
         description: 'The record to upsert (canonical serialization at most 16 KiB). An existing string id merges over that record; item.id, when present, must be a non-empty string.',
@@ -905,7 +908,7 @@ const LEDGER_UPDATE_TOOL = Object.freeze({
           // still-version-1 ledger — no revision exists to report.
           ledgerRev: { type: ['integer', 'null'] },
           replayed: { type: 'boolean' },
-          collection: { type: 'string', enum: ['features'] },
+          collection: { type: 'string', enum: [...schemas.LEDGER_FAMILY_COLLECTIONS] },
           recordId: { type: 'string' },
           action: { type: 'string', enum: ['created', 'updated'] },
         },
@@ -1750,7 +1753,9 @@ function createServer(options) {
       if (typeof args.operationId !== 'string' || !OPERATION_ID.test(args.operationId)) {
         throw rpc.rpcError(-32602, LEDGER_UPDATE_USAGE);
       }
-      if (args.collection !== 'features') throw rpc.rpcError(-32602, LEDGER_UPDATE_USAGE);
+      if (!schemas.LEDGER_FAMILY_COLLECTIONS.includes(args.collection)) {
+        throw rpc.rpcError(-32602, LEDGER_UPDATE_USAGE);
+      }
       const item = args.item;
       if (!item || typeof item !== 'object' || Array.isArray(item)) throw rpc.rpcError(-32602, LEDGER_UPDATE_USAGE);
       if (item.id !== undefined && (typeof item.id !== 'string' || !item.id)) {

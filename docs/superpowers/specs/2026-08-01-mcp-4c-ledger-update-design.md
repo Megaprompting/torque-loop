@@ -757,7 +757,16 @@ on doctor, not a figure of speech).
   the EXISTING name-array roster assertions to nineteen, since registering the tool
   changes them the moment it lands; deferring that would fail 4c.1's own suite),
   the 19-tool whole-object write-roster fixture in both protocol eras, and any
-  remaining projection/receipt surfaces the canary did not exercise.
+  remaining projection/receipt surfaces the canary did not exercise. AS BUILT, one
+  refinement: "in both protocol eras" is served by ONE canonical fixture that each era
+  must deep-equal independently, not by two era-specific snapshots — two snapshots of
+  one contract hide the divergence they exist to catch (an edit applied to one and not
+  the other passes both assertions while the eras genuinely disagree). The era-specific
+  response envelope (`ttlMs`/`cacheScope` on modern only) is asserted separately, and
+  the enum is sourced from `schemas.LEDGER_FAMILY_COLLECTIONS` on all three sites
+  (input schema, success branch, runtime admission), which makes D3's exclusion
+  structural: widening that constant to re-admit `defects` turns both the fixture test
+  and the boundary-refusal test red.
 - **4c.3 — Adversarial pass.** Family-vs-WAL interleavings under the lock, admission
   races, damaged-ledger matrix, eviction and different-gen-recreation lineage cases, refusal
   byte-purity, error-text allowlist, both protocol eras, both OS families.

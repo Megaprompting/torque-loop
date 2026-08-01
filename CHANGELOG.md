@@ -21,8 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     bytes, canonical fixed-width 24-byte UTC stamps). New ledgers are born version 2;
     `templates/ledger.json` is regenerated to match.
   - **The `ledger.update` wire tool** (tool #19; the write roster is nineteen under
-    `--write`, still four read tools without it), on the `features` collection as canary
-    (`tests` widens the enum in 4c.2). CAS-bound to `expectedLedgerRev`/`expectedLedgerGen`;
+    `--write`, still four read tools without it), on the `features` and `tests`
+    collections. Both protocol eras are pinned to one canonical 19-descriptor write
+    roster. CAS-bound to `expectedLedgerRev`/`expectedLedgerGen`;
     replay/conflict by `operationId` against the ledger's own ring (the state ring is
     never consulted, and vice versa); deterministic created-record ids; state revisions
     never move and no state receipt is written.

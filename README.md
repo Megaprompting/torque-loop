@@ -311,7 +311,7 @@ assumption / artifact / defect verbs, `compile.done`, `score.aperture`) and, sin
 
 | Tool | What it writes |
 | --- | --- |
-| `ledger.update` | One QA-ledger upsert (`features` today; `tests` lands with the roster completion) against the ledger's **own** revision line — CAS-bound to `expectedLedgerRev`/`expectedLedgerGen` (or the null pair plus `expectedLedgerHash` for a version-1 ledger, which the first committed write admits to version 2), replayed by `operationId` from the ledger's own receipt ring. `defects` is not addressable on any door: the mirror belongs to the defect verbs. |
+| `ledger.update` | One QA-ledger upsert (`features` or `tests`) against the ledger's **own** revision line — CAS-bound to `expectedLedgerRev`/`expectedLedgerGen` (or the null pair plus `expectedLedgerHash` for a version-1 ledger, which the first committed write admits to version 2), replayed by `operationId` from the ledger's own receipt ring. `defects` is not addressable on any door: the mirror belongs to the defect verbs. |
 
 | Guarantee | What it means |
 | --- | --- |

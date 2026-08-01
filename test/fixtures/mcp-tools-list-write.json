@@ -1,0 +1,2754 @@
+[
+  {
+    "name": "workspace.open",
+    "title": "Open Torque workspace",
+    "description": "Open an allowed Git worktree and return an opaque workspace handle plus read-only Torque resource links.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "Fully qualified path to a directory inside a configured workspace root."
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "additionalProperties": false
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "workspaceHandle": {
+          "type": "string"
+        },
+        "repositoryId": {
+          "type": "string"
+        },
+        "worktreeId": {
+          "type": "string"
+        },
+        "stateRev": {
+          "type": "integer"
+        },
+        "stateGen": {
+          "type": "string"
+        },
+        "ledgerRev": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "ledgerGen": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ledgerBytesHash": {
+          "type": "string"
+        },
+        "pendingIntent": {
+          "type": "boolean"
+        },
+        "resources": {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string"
+            },
+            "ledger": {
+              "type": "string"
+            },
+            "receipt": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "ledger",
+            "receipt"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "workspaceHandle",
+        "repositoryId",
+        "worktreeId",
+        "stateRev",
+        "stateGen",
+        "ledgerRev",
+        "ledgerGen",
+        "pendingIntent",
+        "resources"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "workspace.scan",
+    "title": "Scan an opened workspace for cold-start poison",
+    "description": "Run the Torque cold-start poison scan over an opened workspace: does the recorded state, or an opt-in project surface, steer the next session into the wrong world?",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workspaceHandle": {
+          "type": "string",
+          "description": "The opaque handle workspace.open minted on this connection."
+        }
+      },
+      "required": [
+        "workspaceHandle"
+      ],
+      "additionalProperties": false
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "configured": {
+          "type": "boolean"
+        },
+        "checks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "level": {
+                "type": "string",
+                "enum": [
+                  "ok",
+                  "warn",
+                  "fail"
+                ]
+              },
+              "detail": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "name",
+              "level",
+              "detail"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": [
+        "ok",
+        "configured",
+        "checks"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "score.confidence",
+    "title": "Score confidence for an opened workspace",
+    "description": "Derive the three independently scoped confidence layers (artifact, session, ledger) and the workflow closure verdict for an opened workspace, with the state revision and journal health they were computed from.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workspaceHandle": {
+          "type": "string",
+          "description": "The opaque handle workspace.open minted on this connection."
+        }
+      },
+      "required": [
+        "workspaceHandle"
+      ],
+      "additionalProperties": false
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "artifact": {
+          "type": "object"
+        },
+        "session": {
+          "type": "object"
+        },
+        "ledger": {
+          "type": "object"
+        },
+        "closure": {
+          "type": "object"
+        },
+        "stateRev": {
+          "type": "integer"
+        },
+        "journal": {
+          "type": "object",
+          "properties": {
+            "counted": {
+              "type": "integer"
+            },
+            "malformed": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "counted",
+            "malformed"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "artifact",
+        "session",
+        "ledger",
+        "closure",
+        "stateRev",
+        "journal"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "score.friction",
+    "title": "Rank obstacles by friction priority",
+    "description": "Rank a supplied set of obstacles by Leverage x Certainty x Speed-to-unblock x Risk-of-ignoring and name the winner. Operates only on its payload: no workspace, no handle, no ambient read.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "obstacles": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "obstacle": {
+                "type": "string",
+                "description": "Alias for name."
+              },
+              "leverage": {
+                "type": "number"
+              },
+              "certainty": {
+                "type": "number"
+              },
+              "speed": {
+                "type": "number"
+              },
+              "timeToUnblock": {
+                "type": "number",
+                "description": "Alias for speed."
+              },
+              "risk": {
+                "type": "number"
+              },
+              "riskOfIgnoring": {
+                "type": "number",
+                "description": "Alias for risk."
+              },
+              "note": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": [
+        "obstacles"
+      ],
+      "additionalProperties": false
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "obstacles": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "winner": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "runnerUp": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "margin": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "scope": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "obstacles",
+        "winner",
+        "runnerUp",
+        "margin",
+        "scope"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "state.set",
+    "title": "Set one Torque session-state scalar",
+    "description": "Set one settable session-state scalar (title, objective, bottleneck, phase, nextAction, nextCommand, confidence) on an opened workspace. CAS-bound: refuses unless expectedStateRev and expectedStateGen match the record, and replays the recorded outcome when the same operationId retries the same operation.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workspaceHandle": {
+          "type": "string",
+          "description": "The opaque handle workspace.open minted on this connection."
+        },
+        "expectedStateRev": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The state revision this write was decided against, from workspace.open or the state resource. A mismatch refuses; nothing is merged."
+        },
+        "expectedStateGen": {
+          "type": "string",
+          "description": "The store generation the revision was observed in, from workspace.open.stateGen. Pins the lineage a recreated store cannot fake."
+        },
+        "operationId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{22,128}$",
+          "description": "Client-generated retry key (UUIDv4 or >=128 bits of entropy). Retry the SAME operation with the same id; never reuse one for a different operation."
+        },
+        "key": {
+          "type": "string",
+          "enum": [
+            "title",
+            "objective",
+            "bottleneck",
+            "phase",
+            "nextAction",
+            "nextCommand",
+            "confidence"
+          ]
+        },
+        "value": {
+          "type": "string",
+          "description": "The value to record; confidence coerces to a number, everything else stays text."
+        }
+      },
+      "required": [
+        "workspaceHandle",
+        "expectedStateRev",
+        "expectedStateGen",
+        "operationId",
+        "key",
+        "value"
+      ],
+      "additionalProperties": false
+    },
+    "outputSchema": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "ok": {
+              "const": true
+            },
+            "committed": {
+              "type": "boolean"
+            },
+            "stateRev": {
+              "type": "integer"
+            },
+            "replayed": {
+              "type": "boolean"
+            },
+            "key": {
+              "type": "string",
+              "enum": [
+                "title",
+                "objective",
+                "bottleneck",
+                "phase",
+                "nextAction",
+                "nextCommand",
+                "confidence"
+              ]
+            }
+          },
+          "required": [
+            "ok",
+            "committed",
+            "stateRev",
+            "replayed",
+            "key"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ok": {
+              "const": false
+            },
+            "error": {
+              "enum": [
+                "StateNotInitialized",
+                "StaleGeneration",
+                "StaleStateRev",
+                "OperationIdConflict",
+                "DeterministicIdConflict",
+                "UnknownRecordId",
+                "ArtifactClosed",
+                "ClosureBlocked",
+                "HumanAuthorityRequired",
+                "RetractRefused",
+                "AttachmentAmbiguous",
+                "MirrorUnrecoverable",
+                "WriteFailed"
+              ]
+            },
+            "message": {
+              "type": "string"
+            },
+            "expectedStateRev": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "actualStateRev": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "expectedStateGen": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "actualStateGen": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "ok",
+            "error",
+            "message"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "state.append",
+    "title": "Append one record to a Torque session collection",
+    "description": "Append one record to a session-state collection (decisions, assumptions, openLoops, touchedFiles, history) on an opened workspace. Assumptions and open loops are born in their birth status — never closed, tested, or killed — and dedup by text against the live record. Artifacts and defects are not appendable: their constructors are gated (artifact.add, the CLI defect verbs). CAS-bound like every write.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workspaceHandle": {
+          "type": "string",
+          "description": "The opaque handle workspace.open minted on this connection."
+        },
+        "expectedStateRev": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The state revision this write was decided against, from workspace.open or the state resource. A mismatch refuses; nothing is merged."
+        },
+        "expectedStateGen": {
+          "type": "string",
+          "description": "The store generation the revision was observed in, from workspace.open.stateGen. Pins the lineage a recreated store cannot fake."
+        },
+        "operationId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{22,128}$",
+          "description": "Client-generated retry key (UUIDv4 or >=128 bits of entropy). Retry the SAME operation with the same id; never reuse one for a different operation."
+        },
+        "collection": {
+          "type": "string",
+          "enum": [
+            "decisions",
+            "assumptions",
+            "openLoops",
+            "touchedFiles",
+            "history"
+          ]
+        },
+        "item": {
+          "type": "object",
+          "description": "The record to append. A status field on assumptions/openLoops may only claim the birth status; ids are minted deterministically when absent."
+        }
+      },
+      "required": [
+        "workspaceHandle",
+        "expectedStateRev",
+        "expectedStateGen",
+        "operationId",
+        "collection",
+        "item"
+      ],
+      "additionalProperties": false
+    },
+    "outputSchema": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "ok": {
+              "const": true
+            },
+            "committed": {
+              "type": "boolean"
+            },
+            "stateRev": {
+              "type": "integer"
+            },
+            "replayed": {
+              "type": "boolean"
+            },
+            "collection": {
+              "type": "string",
+              "enum": [
+                "decisions",
+                "assumptions",
+                "openLoops",
+                "touchedFiles",
+                "history"
+              ]
+            },
+            "recordId": {
+              "type": "string"
+            },
+            "deduped": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "ok",
+            "committed",
+            "stateRev",
+            "replayed",
+            "collection",
+            "recordId",
+            "deduped"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ok": {
+              "const": false
+            },
+            "error": {
+              "enum": [
+                "StateNotInitialized",
+                "StaleGeneration",
+                "StaleStateRev",
+                "OperationIdConflict",
+                "DeterministicIdConflict",
+                "UnknownRecordId",
+                "ArtifactClosed",
+                "ClosureBlocked",
+                "HumanAuthorityRequired",
+                "RetractRefused",
+                "AttachmentAmbiguous",
+                "MirrorUnrecoverable",
+                "WriteFailed"
+              ]
+            },
+            "message": {
+              "type": "string"
+            },
+            "expectedStateRev": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "actualStateRev": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "expectedStateGen": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "actualStateGen": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "ok",
+            "error",
+            "message"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "open_loop.close",
+    "title": "Close an open loop with evidence",
+    "description": "Close one open loop on an opened workspace with the evidence that actually closed it — no proof, no close. CAS-bound like every write.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workspaceHandle": {
+          "type": "string",
+          "description": "The opaque handle workspace.open minted on this connection."
+        },
+        "expectedStateRev": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The state revision this write was decided against, from workspace.open or the state resource. A mismatch refuses; nothing is merged."
+        },
+        "expectedStateGen": {
+          "type": "string",
+          "description": "The store generation the revision was observed in, from workspace.open.stateGen. Pins the lineage a recreated store cannot fake."
+        },
+        "operationId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{22,128}$",
+          "description": "Client-generated retry key (UUIDv4 or >=128 bits of entropy). Retry the SAME operation with the same id; never reuse one for a different operation."
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "evidence": {
+          "type": "string",
+          "minLength": 1,
+          "description": "What actually closed the loop."
+        }
+      },
+      "required": [
+        "workspaceHandle",
+        "expectedStateRev",
+        "expectedStateGen",
+        "operationId",
+        "id",
+        "evidence"
+      ],
+      "additionalProperties": false
+    },
+    "outputSchema": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "ok": {
+              "const": true
+            },
+            "committed": {
+              "type": "boolean"
+            },
+            "stateRev": {
+              "type": "integer"
+            },
+            "replayed": {
+              "type": "boolean"
+            },
+            "openLoopId": {
+              "type": "string"
+            },
+            "status": {
+              "const": "closed"
+            }
+          },
+          "required": [
+            "ok",
+            "committed",
+            "stateRev",
+            "replayed",
+            "openLoopId",
+            "status"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ok": {
+              "const": false
+            },
+            "error": {
+              "enum": [
+                "StateNotInitialized",
+                "StaleGeneration",
+                "StaleStateRev",
+                "OperationIdConflict",
+                "DeterministicIdConflict",
+                "UnknownRecordId",
+                "ArtifactClosed",
+                "ClosureBlocked",
+                "HumanAuthorityRequired",
+                "RetractRefused",
+                "AttachmentAmbiguous",
+                "MirrorUnrecoverable",
+                "WriteFailed"
+              ]
+            },
+            "message": {
+              "type": "string"
+            },
+            "expectedStateRev": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "actualStateRev": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "expectedStateGen": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "actualStateGen": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "ok",
+            "error",
+            "message"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "open_loop.park",
+    "title": "Park an open loop with an owner and a revisit trigger",
+    "description": "Park one open loop on an opened workspace. Parking stops the nagging but the loop still drains confidence: the owner is attribution for an unanswered question, never a waiver or an approval token. CAS-bound like every write.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workspaceHandle": {
+          "type": "string",
+          "description": "The opaque handle workspace.open minted on this connection."
+        },
+        "expectedStateRev": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The state revision this write was decided against, from workspace.open or the state resource. A mismatch refuses; nothing is merged."
+        },
+        "expectedStateGen": {
+          "type": "string",
+          "description": "The store generation the revision was observed in, from workspace.open.stateGen. Pins the lineage a recreated store cannot fake."
+        },
+        "operationId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{22,128}$",
+          "description": "Client-generated retry key (UUIDv4 or >=128 bits of entropy). Retry the SAME operation with the same id; never reuse one for a different operation."
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "owner": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Who carries the parked loop. Attribution, not authorization."
+        },
+        "revisitTrigger": {
+          "type": "string",
+          "minLength": 1,
+          "description": "What brings the loop back — a park with no trigger is a drop."
+        }
+      },
+      "required": [
+        "workspaceHandle",
+        "expectedStateRev",
+        "expectedStateGen",
+        "operationId",
+        "id",
+        "owner",
+        "revisitTrigger"
+      ],
+      "additionalProperties": false
+    },
+    "outputSchema": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "ok": {
+              "const": true
+            },
+            "committed": {
+              "type": "boolean"
+            },
+            "stateRev": {
+              "type": "integer"
+            },
+            "replayed": {
+              "type": "boolean"
+            },
+            "openLoopId": {
+              "type": "string"
+            },
+            "status": {
+              "const": "parked"
+            }
+          },
+          "required": [
+            "ok",
+            "committed",
+            "stateRev",
+            "replayed",
+            "openLoopId",
+            "status"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ok": {
+              "const": false
+            },
+            "error": {
+              "enum": [
+                "StateNotInitialized",
+                "StaleGeneration",
+                "StaleStateRev",
+                "OperationIdConflict",
+                "DeterministicIdConflict",
+                "UnknownRecordId",
+                "ArtifactClosed",
+                "ClosureBlocked",
+                "HumanAuthorityRequired",
+                "RetractRefused",
+                "AttachmentAmbiguous",
+                "MirrorUnrecoverable",
+                "WriteFailed"
+              ]
+            },
+            "message": {
+              "type": "string"
+            },
+            "expectedStateRev": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "actualStateRev": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "expectedStateGen": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "actualStateGen": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "ok",
+            "error",
+            "message"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "assumption.close",
+    "title": "Close an assumption as tested or killed",
+    "description": "Close one assumption on an opened workspace with the result that settled it — an assumption ends proven or dead, never merely dropped. CAS-bound like every write.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workspaceHandle": {
+          "type": "string",
+          "description": "The opaque handle workspace.open minted on this connection."
+        },
+        "expectedStateRev": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The state revision this write was decided against, from workspace.open or the state resource. A mismatch refuses; nothing is merged."
+        },
+        "expectedStateGen": {
+          "type": "string",
+          "description": "The store generation the revision was observed in, from workspace.open.stateGen. Pins the lineage a recreated store cannot fake."
+        },
+        "operationId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{22,128}$",
+          "description": "Client-generated retry key (UUIDv4 or >=128 bits of entropy). Retry the SAME operation with the same id; never reuse one for a different operation."
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "outcome": {
+          "type": "string",
+          "enum": [
+            "tested",
+            "killed"
+          ]
+        },
+        "evidence": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The result that settled it."
+        }
+      },
+      "required": [
+        "workspaceHandle",
+        "expectedStateRev",
+        "expectedStateGen",
+        "operationId",
+        "id",
+        "outcome",
+        "evidence"
+      ],
+      "additionalProperties": false
+    },
+    "outputSchema": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "ok": {
+              "const": true
+            },
+            "committed": {
+              "type": "boolean"
+            },
+            "stateRev": {
+              "type": "integer"
+            },
+            "replayed": {
+              "type": "boolean"
+            },
+            "assumptionId": {
+              "type": "string"
+            },
+            "status": {
+              "enum": [
+                "tested",
+                "killed"
+              ]
+            }
+          },
+          "required": [
+            "ok",
+            "committed",
+            "stateRev",
+            "replayed",
+            "assumptionId",
+            "status"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ok": {
+              "const": false
+            },
+            "error": {
+              "enum": [
+                "StateNotInitialized",
+                "StaleGeneration",
+                "StaleStateRev",
+                "OperationIdConflict",
+                "DeterministicIdConflict",
+                "UnknownRecordId",
+                "ArtifactClosed",
+                "ClosureBlocked",
+                "HumanAuthorityRequired",
+                "RetractRefused",
+                "AttachmentAmbiguous",
+                "MirrorUnrecoverable",
+                "WriteFailed"
+              ]
+            },
+            "message": {
+              "type": "string"
+            },
+            "expectedStateRev": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "actualStateRev": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "expectedStateGen": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "actualStateGen": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "ok",
+            "error",
+            "message"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "compile.done",
+    "title": "Checkpoint the Torque session state",
+    "description": "Mark the session state CHECKPOINTED on an opened workspace: clear dirty and stamp lastCompileAt in one move. A checkpoint says the record is current, never that the work is finished. CAS-bound like every write.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workspaceHandle": {
+          "type": "string",
+          "description": "The opaque handle workspace.open minted on this connection."
+        },
+        "expectedStateRev": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The state revision this write was decided against, from workspace.open or the state resource. A mismatch refuses; nothing is merged."
+        },
+        "expectedStateGen": {
+          "type": "string",
+          "description": "The store generation the revision was observed in, from workspace.open.stateGen. Pins the lineage a recreated store cannot fake."
+        },
+        "operationId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{22,128}$",
+          "description": "Client-generated retry key (UUIDv4 or >=128 bits of entropy). Retry the SAME operation with the same id; never reuse one for a different operation."
+        }
+      },
+      "required": [
+        "workspaceHandle",
+        "expectedStateRev",
+        "expectedStateGen",
+        "operationId"
+      ],
+      "additionalProperties": false
+    },
+    "outputSchema": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "ok": {
+              "const": true
+            },
+            "committed": {
+              "type": "boolean"
+            },
+            "stateRev": {
+              "type": "integer"
+            },
+            "replayed": {
+              "type": "boolean"
+            },
+            "checkpointed": {
+              "const": true
+            },
+            "lastCompileAt": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "ok",
+            "committed",
+            "stateRev",
+            "replayed",
+            "checkpointed",
+            "lastCompileAt"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ok": {
+              "const": false
+            },
+            "error": {
+              "enum": [
+                "StateNotInitialized",
+                "StaleGeneration",
+                "StaleStateRev",
+                "OperationIdConflict",
+                "DeterministicIdConflict",
+                "UnknownRecordId",
+                "ArtifactClosed",
+                "ClosureBlocked",
+                "HumanAuthorityRequired",
+                "RetractRefused",
+                "AttachmentAmbiguous",
+                "MirrorUnrecoverable",
+                "WriteFailed"
+              ]
+            },
+            "message": {
+              "type": "string"
+            },
+            "expectedStateRev": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "actualStateRev": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "expectedStateGen": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "actualStateGen": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "ok",
+            "error",
+            "message"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "artifact.add",
+    "title": "Record or revise a Torque artifact",
+    "description": "Record an artifact ({title, kind, path, holes, revises}) on an opened workspace, or revise the one an existing id names. Terminal statuses and lifecycle fields are never accepted as input — they are earned by gated verbs (artifact.close, artifact.retract). An identical revision is a no-op: no revision bump, no proof invalidated. CAS-bound like every write.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workspaceHandle": {
+          "type": "string",
+          "description": "The opaque handle workspace.open minted on this connection."
+        },
+        "expectedStateRev": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The state revision this write was decided against, from workspace.open or the state resource. A mismatch refuses; nothing is merged."
+        },
+        "expectedStateGen": {
+          "type": "string",
+          "description": "The store generation the revision was observed in, from workspace.open.stateGen. Pins the lineage a recreated store cannot fake."
+        },
+        "operationId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{22,128}$",
+          "description": "Client-generated retry key (UUIDv4 or >=128 bits of entropy). Retry the SAME operation with the same id; never reuse one for a different operation."
+        },
+        "item": {
+          "type": "object",
+          "description": "The artifact payload. An existing id revises that artifact; kind is immutable; a probe is born with its disposal hole."
+        }
+      },
+      "required": [
+        "workspaceHandle",
+        "expectedStateRev",
+        "expectedStateGen",
+        "operationId",
+        "item"
+      ],
+      "additionalProperties": false
+    },
+    "outputSchema": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "ok": {
+              "const": true
+            },
+            "committed": {
+              "type": "boolean"
+            },
+            "stateRev": {
+              "type": "integer"
+            },
+            "replayed": {
+              "type": "boolean"
+            },
+            "artifactId": {
+              "type": "string"
+            },
+            "artifactRev": {
+              "type": "integer"
+            },
+            "action": {
+              "type": "string",
+              "enum": [
+                "created",
+                "revised",
+                "unchanged"
+              ]
+            }
+          },
+          "required": [
+            "ok",
+            "committed",
+            "stateRev",
+            "replayed",
+            "artifactId",
+            "artifactRev",
+            "action"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ok": {
+              "const": false
+            },
+            "error": {
+              "enum": [
+                "StateNotInitialized",
+                "StaleGeneration",
+                "StaleStateRev",
+                "OperationIdConflict",
+                "DeterministicIdConflict",
+                "UnknownRecordId",
+                "ArtifactClosed",
+                "ClosureBlocked",
+                "HumanAuthorityRequired",
+                "RetractRefused",
+                "AttachmentAmbiguous",
+                "MirrorUnrecoverable",
+                "WriteFailed"
+              ]
+            },
+            "message": {
+              "type": "string"
+            },
+            "expectedStateRev": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "actualStateRev": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "expectedStateGen": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "actualStateGen": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "ok",
+            "error",
+            "message"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "artifact.close",
+    "title": "Close an artifact against its bound proof",
+    "description": "Close one artifact on an opened workspace — only when a KEEP proof is bound to this exact revision and hash, no open defects are attached, and no holes remain. There are no waiver arguments on this wire: record-scope proof and holes-waived closure require named human authorization and stay CLI acts. A second close of a certified artifact is a no-op. CAS-bound like every write.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workspaceHandle": {
+          "type": "string",
+          "description": "The opaque handle workspace.open minted on this connection."
+        },
+        "expectedStateRev": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The state revision this write was decided against, from workspace.open or the state resource. A mismatch refuses; nothing is merged."
+        },
+        "expectedStateGen": {
+          "type": "string",
+          "description": "The store generation the revision was observed in, from workspace.open.stateGen. Pins the lineage a recreated store cannot fake."
+        },
+        "operationId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{22,128}$",
+          "description": "Client-generated retry key (UUIDv4 or >=128 bits of entropy). Retry the SAME operation with the same id; never reuse one for a different operation."
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "workspaceHandle",
+        "expectedStateRev",
+        "expectedStateGen",
+        "operationId",
+        "id"
+      ],
+      "additionalProperties": false
+    },
+    "outputSchema": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "ok": {
+              "const": true
+            },
+            "committed": {
+              "type": "boolean"
+            },
+            "stateRev": {
+              "type": "integer"
+            },
+            "replayed": {
+              "type": "boolean"
+            },
+            "artifactId": {
+              "type": "string"
+            },
+            "artifactRev": {
+              "type": "integer"
+            },
+            "status": {
+              "const": "closed"
+            }
+          },
+          "required": [
+            "ok",
+            "committed",
+            "stateRev",
+            "replayed",
+            "artifactId",
+            "artifactRev",
+            "status"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ok": {
+              "const": false
+            },
+            "error": {
+              "enum": [
+                "StateNotInitialized",
+                "StaleGeneration",
+                "StaleStateRev",
+                "OperationIdConflict",
+                "DeterministicIdConflict",
+                "UnknownRecordId",
+                "ArtifactClosed",
+                "ClosureBlocked",
+                "HumanAuthorityRequired",
+                "RetractRefused",
+                "AttachmentAmbiguous",
+                "MirrorUnrecoverable",
+                "WriteFailed"
+              ]
+            },
+            "message": {
+              "type": "string"
+            },
+            "expectedStateRev": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "actualStateRev": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "expectedStateGen": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "actualStateGen": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "ok",
+            "error",
+            "message"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "artifact.retract",
+    "title": "Retract an artifact whose claim is false or obsolete",
+    "description": "Retract one artifact on an opened workspace, keeping the record for provenance. Never silent: a reason is required, and a probe exit must state its outcome — reason starts \"disposed:\" (code reverted, finding recorded) or \"promoted:\" with supersededBy naming the recorded build-for-keep that replaced it. CAS-bound like every write.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workspaceHandle": {
+          "type": "string",
+          "description": "The opaque handle workspace.open minted on this connection."
+        },
+        "expectedStateRev": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The state revision this write was decided against, from workspace.open or the state resource. A mismatch refuses; nothing is merged."
+        },
+        "expectedStateGen": {
+          "type": "string",
+          "description": "The store generation the revision was observed in, from workspace.open.stateGen. Pins the lineage a recreated store cannot fake."
+        },
+        "operationId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{22,128}$",
+          "description": "Client-generated retry key (UUIDv4 or >=128 bits of entropy). Retry the SAME operation with the same id; never reuse one for a different operation."
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Why the claim is false or obsolete. Probe exits start with \"disposed:\" or \"promoted:\"."
+        },
+        "supersededBy": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The artifact that replaced this one. Required when a probe is promoted."
+        }
+      },
+      "required": [
+        "workspaceHandle",
+        "expectedStateRev",
+        "expectedStateGen",
+        "operationId",
+        "id",
+        "reason"
+      ],
+      "additionalProperties": false
+    },
+    "outputSchema": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "ok": {
+              "const": true
+            },
+            "committed": {
+              "type": "boolean"
+            },
+            "stateRev": {
+              "type": "integer"
+            },
+            "replayed": {
+              "type": "boolean"
+            },
+            "artifactId": {
+              "type": "string"
+            },
+            "status": {
+              "const": "retracted"
+            },
+            "supersededBy": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "ok",
+            "committed",
+            "stateRev",
+            "replayed",
+            "artifactId",
+            "status",
+            "supersededBy"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ok": {
+              "const": false
+            },
+            "error": {
+              "enum": [
+                "StateNotInitialized",
+                "StaleGeneration",
+                "StaleStateRev",
+                "OperationIdConflict",
+                "DeterministicIdConflict",
+                "UnknownRecordId",
+                "ArtifactClosed",
+                "ClosureBlocked",
+                "HumanAuthorityRequired",
+                "RetractRefused",
+                "AttachmentAmbiguous",
+                "MirrorUnrecoverable",
+                "WriteFailed"
+              ]
+            },
+            "message": {
+              "type": "string"
+            },
+            "expectedStateRev": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "actualStateRev": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "expectedStateGen": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "actualStateGen": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "ok",
+            "error",
+            "message"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "score.aperture",
+    "title": "Meter loop depth from uncertainty",
+    "description": "Score the five uncertainty dimensions (each 0-2) into an aperture level A0-A4 with the ratchet sequence to run at that depth. The read that writes: when mapRequired fires and no fog is on the record yet, the fog is serialized as an open loop in the same transaction — so this names the revision and generation it decided against like every write. A stale refusal means the world moved; re-read and re-score.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workspaceHandle": {
+          "type": "string",
+          "description": "The opaque handle workspace.open minted on this connection."
+        },
+        "expectedStateRev": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The state revision this write was decided against, from workspace.open or the state resource. A mismatch refuses; nothing is merged."
+        },
+        "expectedStateGen": {
+          "type": "string",
+          "description": "The store generation the revision was observed in, from workspace.open.stateGen. Pins the lineage a recreated store cannot fake."
+        },
+        "operationId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{22,128}$",
+          "description": "Client-generated retry key (UUIDv4 or >=128 bits of entropy). Retry the SAME operation with the same id; never reuse one for a different operation."
+        },
+        "ambiguity": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2
+        },
+        "terrain": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2
+        },
+        "taste": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2
+        },
+        "blastRadius": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2
+        },
+        "reversibility": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2
+        }
+      },
+      "required": [
+        "workspaceHandle",
+        "expectedStateRev",
+        "expectedStateGen",
+        "operationId",
+        "ambiguity",
+        "terrain",
+        "taste",
+        "blastRadius",
+        "reversibility"
+      ],
+      "additionalProperties": false
+    },
+    "outputSchema": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "ok": {
+              "const": true
+            },
+            "committed": {
+              "type": "boolean"
+            },
+            "stateRev": {
+              "type": "integer"
+            },
+            "replayed": {
+              "type": "boolean"
+            },
+            "score": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 10
+            },
+            "level": {
+              "type": "string",
+              "enum": [
+                "A0",
+                "A1",
+                "A2",
+                "A3",
+                "A4"
+              ]
+            },
+            "name": {
+              "type": "string"
+            },
+            "implement": {
+              "type": "boolean"
+            },
+            "sequence": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "mapRequired": {
+              "type": "boolean"
+            },
+            "dimensions": {
+              "type": "object",
+              "properties": {
+                "ambiguity": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 2
+                },
+                "terrain": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 2
+                },
+                "taste": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 2
+                },
+                "blastRadius": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 2
+                },
+                "reversibility": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 2
+                }
+              },
+              "required": [
+                "ambiguity",
+                "terrain",
+                "taste",
+                "blastRadius",
+                "reversibility"
+              ],
+              "additionalProperties": false
+            },
+            "scope": {
+              "type": "string"
+            },
+            "recordedFog": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "ok",
+            "committed",
+            "stateRev",
+            "replayed",
+            "score",
+            "level",
+            "name",
+            "implement",
+            "sequence",
+            "mapRequired",
+            "dimensions",
+            "scope",
+            "recordedFog"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ok": {
+              "const": false
+            },
+            "error": {
+              "enum": [
+                "StateNotInitialized",
+                "StaleGeneration",
+                "StaleStateRev",
+                "OperationIdConflict",
+                "DeterministicIdConflict",
+                "UnknownRecordId",
+                "ArtifactClosed",
+                "ClosureBlocked",
+                "HumanAuthorityRequired",
+                "RetractRefused",
+                "AttachmentAmbiguous",
+                "MirrorUnrecoverable",
+                "WriteFailed"
+              ]
+            },
+            "message": {
+              "type": "string"
+            },
+            "expectedStateRev": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "actualStateRev": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "expectedStateGen": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "actualStateGen": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "ok",
+            "error",
+            "message"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "defect.add",
+    "title": "Record a defect with its ledger mirror",
+    "description": "Record one defect on an opened workspace — the first cross-file verb: the state record and its QA-ledger mirror commit behind one write-ahead intent, so a server death between the two files is a recoverable lag, never a permanent disagreement. A repeat of an open finding dedups as a no-op; a worse repeat escalates the severity in place. Terminal birth statuses refuse at the boundary; waivers stay CLI acts. With several live artifacts, item.artifact must name the one this defect attacks. CAS-bound like every write.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workspaceHandle": {
+          "type": "string",
+          "description": "The opaque handle workspace.open minted on this connection."
+        },
+        "expectedStateRev": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The state revision this write was decided against, from workspace.open or the state resource. A mismatch refuses; nothing is merged."
+        },
+        "expectedStateGen": {
+          "type": "string",
+          "description": "The store generation the revision was observed in, from workspace.open.stateGen. Pins the lineage a recreated store cannot fake."
+        },
+        "operationId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{22,128}$",
+          "description": "Client-generated retry key (UUIDv4 or >=128 bits of entropy). Retry the SAME operation with the same id; never reuse one for a different operation."
+        },
+        "item": {
+          "type": "object",
+          "description": "The defect payload ({severity, summary, artifact, feature}). Severity defaults to medium; unknown severities coerce to medium."
+        }
+      },
+      "required": [
+        "workspaceHandle",
+        "expectedStateRev",
+        "expectedStateGen",
+        "operationId",
+        "item"
+      ],
+      "additionalProperties": false
+    },
+    "outputSchema": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "ok": {
+              "const": true
+            },
+            "committed": {
+              "type": "boolean"
+            },
+            "stateRev": {
+              "type": "integer"
+            },
+            "replayed": {
+              "type": "boolean"
+            },
+            "defectId": {
+              "type": "string"
+            },
+            "severity": {
+              "type": "string",
+              "enum": [
+                "critical",
+                "high",
+                "medium",
+                "low",
+                "info"
+              ]
+            },
+            "action": {
+              "type": "string",
+              "enum": [
+                "created",
+                "escalated",
+                "deduped"
+              ]
+            },
+            "artifact": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "attachedBy": {
+              "type": "string"
+            },
+            "ledgerId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "ok",
+            "committed",
+            "stateRev",
+            "replayed",
+            "defectId",
+            "severity",
+            "action",
+            "artifact",
+            "attachedBy",
+            "ledgerId"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ok": {
+              "const": false
+            },
+            "error": {
+              "enum": [
+                "StateNotInitialized",
+                "StaleGeneration",
+                "StaleStateRev",
+                "OperationIdConflict",
+                "DeterministicIdConflict",
+                "UnknownRecordId",
+                "ArtifactClosed",
+                "ClosureBlocked",
+                "HumanAuthorityRequired",
+                "RetractRefused",
+                "AttachmentAmbiguous",
+                "MirrorUnrecoverable",
+                "WriteFailed"
+              ]
+            },
+            "message": {
+              "type": "string"
+            },
+            "expectedStateRev": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "actualStateRev": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "expectedStateGen": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "actualStateGen": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "ok",
+            "error",
+            "message"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "defect.resolve",
+    "title": "Resolve a defect with proof",
+    "description": "Mark one defect resolved on an opened workspace — no proof, no resolve. The state transition and its ledger mirror commit behind one write-ahead intent; an exact repeat is a no-op, and a repeat with different proof refuses rather than silently replacing the original. CAS-bound like every write.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workspaceHandle": {
+          "type": "string",
+          "description": "The opaque handle workspace.open minted on this connection."
+        },
+        "expectedStateRev": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The state revision this write was decided against, from workspace.open or the state resource. A mismatch refuses; nothing is merged."
+        },
+        "expectedStateGen": {
+          "type": "string",
+          "description": "The store generation the revision was observed in, from workspace.open.stateGen. Pins the lineage a recreated store cannot fake."
+        },
+        "operationId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{22,128}$",
+          "description": "Client-generated retry key (UUIDv4 or >=128 bits of entropy). Retry the SAME operation with the same id; never reuse one for a different operation."
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "evidence": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Proof it is actually fixed."
+        }
+      },
+      "required": [
+        "workspaceHandle",
+        "expectedStateRev",
+        "expectedStateGen",
+        "operationId",
+        "id",
+        "evidence"
+      ],
+      "additionalProperties": false
+    },
+    "outputSchema": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "ok": {
+              "const": true
+            },
+            "committed": {
+              "type": "boolean"
+            },
+            "stateRev": {
+              "type": "integer"
+            },
+            "replayed": {
+              "type": "boolean"
+            },
+            "defectId": {
+              "type": "string"
+            },
+            "status": {
+              "const": "resolved"
+            },
+            "ledgerId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "ok",
+            "committed",
+            "stateRev",
+            "replayed",
+            "defectId",
+            "status",
+            "ledgerId"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ok": {
+              "const": false
+            },
+            "error": {
+              "enum": [
+                "StateNotInitialized",
+                "StaleGeneration",
+                "StaleStateRev",
+                "OperationIdConflict",
+                "DeterministicIdConflict",
+                "UnknownRecordId",
+                "ArtifactClosed",
+                "ClosureBlocked",
+                "HumanAuthorityRequired",
+                "RetractRefused",
+                "AttachmentAmbiguous",
+                "MirrorUnrecoverable",
+                "WriteFailed"
+              ]
+            },
+            "message": {
+              "type": "string"
+            },
+            "expectedStateRev": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "actualStateRev": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "expectedStateGen": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "actualStateGen": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "ok",
+            "error",
+            "message"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "defect.reopen",
+    "title": "Reopen a defect that is not actually fixed",
+    "description": "Reopen one defect on an opened workspace with the reason it is not actually fixed. Mirrored behind one write-ahead intent; exact repeats are no-ops. CAS-bound like every write.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workspaceHandle": {
+          "type": "string",
+          "description": "The opaque handle workspace.open minted on this connection."
+        },
+        "expectedStateRev": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The state revision this write was decided against, from workspace.open or the state resource. A mismatch refuses; nothing is merged."
+        },
+        "expectedStateGen": {
+          "type": "string",
+          "description": "The store generation the revision was observed in, from workspace.open.stateGen. Pins the lineage a recreated store cannot fake."
+        },
+        "operationId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{22,128}$",
+          "description": "Client-generated retry key (UUIDv4 or >=128 bits of entropy). Retry the SAME operation with the same id; never reuse one for a different operation."
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Why it is not actually fixed."
+        }
+      },
+      "required": [
+        "workspaceHandle",
+        "expectedStateRev",
+        "expectedStateGen",
+        "operationId",
+        "id",
+        "reason"
+      ],
+      "additionalProperties": false
+    },
+    "outputSchema": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "ok": {
+              "const": true
+            },
+            "committed": {
+              "type": "boolean"
+            },
+            "stateRev": {
+              "type": "integer"
+            },
+            "replayed": {
+              "type": "boolean"
+            },
+            "defectId": {
+              "type": "string"
+            },
+            "status": {
+              "const": "reopened"
+            },
+            "ledgerId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "ok",
+            "committed",
+            "stateRev",
+            "replayed",
+            "defectId",
+            "status",
+            "ledgerId"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ok": {
+              "const": false
+            },
+            "error": {
+              "enum": [
+                "StateNotInitialized",
+                "StaleGeneration",
+                "StaleStateRev",
+                "OperationIdConflict",
+                "DeterministicIdConflict",
+                "UnknownRecordId",
+                "ArtifactClosed",
+                "ClosureBlocked",
+                "HumanAuthorityRequired",
+                "RetractRefused",
+                "AttachmentAmbiguous",
+                "MirrorUnrecoverable",
+                "WriteFailed"
+              ]
+            },
+            "message": {
+              "type": "string"
+            },
+            "expectedStateRev": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "actualStateRev": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "expectedStateGen": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "actualStateGen": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "ok",
+            "error",
+            "message"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "defect.supersede",
+    "title": "Supersede a defect with its replacement",
+    "description": "Mark one defect superseded on an opened workspace, naming the artifact or defect that replaced it. Mirrored behind one write-ahead intent; exact repeats are no-ops. CAS-bound like every write.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workspaceHandle": {
+          "type": "string",
+          "description": "The opaque handle workspace.open minted on this connection."
+        },
+        "expectedStateRev": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The state revision this write was decided against, from workspace.open or the state resource. A mismatch refuses; nothing is merged."
+        },
+        "expectedStateGen": {
+          "type": "string",
+          "description": "The store generation the revision was observed in, from workspace.open.stateGen. Pins the lineage a recreated store cannot fake."
+        },
+        "operationId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{22,128}$",
+          "description": "Client-generated retry key (UUIDv4 or >=128 bits of entropy). Retry the SAME operation with the same id; never reuse one for a different operation."
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "by": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The artifact or defect that replaced it."
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Optional context for the supersession."
+        }
+      },
+      "required": [
+        "workspaceHandle",
+        "expectedStateRev",
+        "expectedStateGen",
+        "operationId",
+        "id",
+        "by"
+      ],
+      "additionalProperties": false
+    },
+    "outputSchema": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "ok": {
+              "const": true
+            },
+            "committed": {
+              "type": "boolean"
+            },
+            "stateRev": {
+              "type": "integer"
+            },
+            "replayed": {
+              "type": "boolean"
+            },
+            "defectId": {
+              "type": "string"
+            },
+            "status": {
+              "const": "superseded"
+            },
+            "ledgerId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "ok",
+            "committed",
+            "stateRev",
+            "replayed",
+            "defectId",
+            "status",
+            "ledgerId"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ok": {
+              "const": false
+            },
+            "error": {
+              "enum": [
+                "StateNotInitialized",
+                "StaleGeneration",
+                "StaleStateRev",
+                "OperationIdConflict",
+                "DeterministicIdConflict",
+                "UnknownRecordId",
+                "ArtifactClosed",
+                "ClosureBlocked",
+                "HumanAuthorityRequired",
+                "RetractRefused",
+                "AttachmentAmbiguous",
+                "MirrorUnrecoverable",
+                "WriteFailed"
+              ]
+            },
+            "message": {
+              "type": "string"
+            },
+            "expectedStateRev": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "actualStateRev": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "expectedStateGen": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "actualStateGen": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "ok",
+            "error",
+            "message"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "ledger.update",
+    "title": "Upsert one QA-ledger record",
+    "description": "Upsert one record into the QA ledger of an opened workspace, against the ledger's OWN revision line (state revisions never move). CAS-bound: refuses unless expectedLedgerRev and expectedLedgerGen match the record — or, for a pre-envelope (version-1) ledger, unless the null pair plus expectedLedgerHash names the exact observed bytes, in which case the first committed write admits the ledger to version 2. Replays the recorded outcome when the same operationId retries the same operation. The defects collection is not addressable here on any door: defect records enter and change only through the defect verbs.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workspaceHandle": {
+          "type": "string",
+          "description": "The opaque handle workspace.open minted on this connection."
+        },
+        "expectedLedgerRev": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The ledgerRev this write was decided against, from workspace.open or the ledger resource — or null, with expectedLedgerGen, for a version-1 ledger."
+        },
+        "expectedLedgerGen": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The ledger generation the revision was observed in — or null, with expectedLedgerRev, for a version-1 ledger."
+        },
+        "expectedLedgerHash": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "description": "Required exactly when the expected pair is null: the ledgerBytesHash workspace.open served for the version-1 bytes this write decided against."
+        },
+        "operationId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{22,128}$",
+          "description": "Client-generated retry key (UUIDv4 or >=128 bits of entropy). Retry the SAME operation with the same id; never reuse one for a different operation."
+        },
+        "collection": {
+          "type": "string",
+          "enum": [
+            "features",
+            "tests"
+          ]
+        },
+        "item": {
+          "type": "object",
+          "description": "The record to upsert (canonical serialization at most 16 KiB). An existing string id merges over that record; item.id, when present, must be a non-empty string."
+        }
+      },
+      "required": [
+        "workspaceHandle",
+        "expectedLedgerRev",
+        "expectedLedgerGen",
+        "operationId",
+        "collection",
+        "item"
+      ],
+      "additionalProperties": false
+    },
+    "outputSchema": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "ok": {
+              "const": true
+            },
+            "committed": {
+              "type": "boolean"
+            },
+            "ledgerRev": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "replayed": {
+              "type": "boolean"
+            },
+            "collection": {
+              "type": "string",
+              "enum": [
+                "features",
+                "tests"
+              ]
+            },
+            "recordId": {
+              "type": "string"
+            },
+            "action": {
+              "type": "string",
+              "enum": [
+                "created",
+                "updated"
+              ]
+            }
+          },
+          "required": [
+            "ok",
+            "committed",
+            "ledgerRev",
+            "replayed",
+            "collection",
+            "recordId",
+            "action"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ok": {
+              "const": false
+            },
+            "error": {
+              "enum": [
+                "StaleLedgerRev",
+                "StaleLedgerGen",
+                "LedgerDamaged",
+                "LedgerRevisionExhausted",
+                "ReceiptTooLarge",
+                "OperationIdConflict",
+                "DeterministicIdConflict",
+                "MirrorUnrecoverable",
+                "WriteFailed"
+              ]
+            },
+            "message": {
+              "type": "string"
+            },
+            "expectedLedgerRev": {
+              "type": "integer"
+            },
+            "actualLedgerRev": {
+              "type": "integer"
+            },
+            "expectedLedgerGen": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "actualLedgerGen": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "actualLedgerHash": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "ok",
+            "error",
+            "message"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  }
+]
