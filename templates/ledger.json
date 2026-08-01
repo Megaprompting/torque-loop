@@ -1,8 +1,11 @@
 {
-  "version": 1,
+  "version": 2,
+  "ledgerRev": 0,
+  "ledgerGen": "lgen-0000000000-0000000000000000",
   "createdAt": "1970-01-01T00:00:00.000Z",
   "updatedAt": "1970-01-01T00:00:00.000Z",
   "features": [],
   "tests": [],
-  "defects": []
+  "defects": [],
+  "operations": []
 }

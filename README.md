@@ -283,22 +283,35 @@ TARGET · DELTA · PROOF · VERDICT · RISK · AUTHORITY · STATE · NEXT
 Claude Code plugin registers it automatically; Codex and other clients register it explicitly.
 
 **A read is authority you already hold, never a path you asked for.** The surface is
-deliberately small: today it is **four tools and three read-only resources**. `workspace.open`
+deliberately small: **four read tools and three read-only resources**, plus a write roster
+of fifteen tools that exists only when the server was launched with the write opt-in (an
+unflagged server does not advertise what the operator never granted). `workspace.open`
 is the only call that accepts a pathname — it takes a path inside a configured root,
 initializes both canonical records, and returns an opaque workspace handle, the repository
-and worktree identities, the current `stateRev`, and read-only resource links. Every later
-read names that handle in a URI (`torque://workspace/{handle}/{state|ledger|receipt}`) rather
-than re-supplying a path, so the server never re-interprets client input:
+and worktree identities, the current `stateRev`/`stateGen` and `ledgerRev`/`ledgerGen`
+(the ledger pair is `null` for a pre-envelope version-1 ledger, and `ledgerBytesHash` then
+names the exact bytes an admission write must echo back), and read-only resource links.
+Every later read names that handle in a URI
+(`torque://workspace/{handle}/{state|ledger|receipt}`) rather than re-supplying a path, so
+the server never re-interprets client input:
 
 | Tool | What it returns |
 | --- | --- |
-| `workspace.open` | The handle, the identities, `stateRev`, and the three resource links. The only call that takes a path. |
+| `workspace.open` | The handle, the identities, `stateRev`/`stateGen`, `ledgerRev`/`ledgerGen` (with `ledgerBytesHash` on a version-1 ledger), and the three resource links. The only call that takes a path. |
 | `workspace.scan` | The cold-start poison scan for an opened workspace — the same answer as `ratchet doctor cold-start --json`. |
 | `score.confidence` | The three scoped confidence layers plus workflow closure, with the `stateRev` they were computed from and the journal health (`counted` / `malformed`) behind every count. |
 | `score.friction` | A ranking of the obstacles you supply. No handle, no workspace, no ambient read. |
 
 The three derived tools are marked `readOnlyHint` and prove it: after `workspace.open`, no
 read — resource or tool — moves a byte or a revision.
+
+The `--write` roster carries the state verbs (`state.set`, `state.append`, the open-loop /
+assumption / artifact / defect verbs, `compile.done`, `score.aperture`) and, since 4c,
+`ledger.update` — the second single-file safe core:
+
+| Tool | What it writes |
+| --- | --- |
+| `ledger.update` | One QA-ledger upsert (`features` or `tests`) against the ledger's **own** revision line — CAS-bound to `expectedLedgerRev`/`expectedLedgerGen` (or the null pair plus `expectedLedgerHash` for a version-1 ledger, which the first committed write admits to version 2), replayed by `operationId` from the ledger's own receipt ring. `defects` is not addressable on any door: the mirror belongs to the defect verbs. |
 
 | Guarantee | What it means |
 | --- | --- |

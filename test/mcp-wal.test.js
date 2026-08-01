@@ -29,6 +29,7 @@ process.env.RATCHET_EVOLVE_LOG = path.join(tmp, 'evolve-log.jsonl');
 const wal = require('../src/wal');
 const state = require('../src/state');
 const artifacts = require('../src/artifacts');
+const ledgerMod = require('../src/ledger');
 const mcp = require('../src/mcp/server');
 
 const META = 'io.modelcontextprotocol/';
@@ -385,7 +386,7 @@ ok('R5 the choke point covers the supported writers, not just the mirrored one',
   // Each supported door, given a discardable slot, resolves it before working.
   const doors = [
     ['withWorkspaceMutation', (repo) => state.withWorkspaceMutation(repo, { action: 'probe' }, () => {})],
-    ['saveLedger', (repo) => state.saveLedger(repo, state.loadLedger(repo))],
+    ['ledger family door', (repo) => ledgerMod.upsert(repo, 'features', { name: 'recovery probe' })],
     ['initProject', (repo) => state.initProject(repo)],
   ];
   for (const [name, act] of doors) {
@@ -1165,7 +1166,11 @@ ok('W10 an ordinary state writer never serializes a normalized record — bytes 
   }
 });
 
-ok('W11 an ordinary ledger writer never serializes a normalized record — bytes back up, loudly', () => {
+ok('W11 undecodable ledger bytes refuse the strict update door and back up only on the read path', () => {
+  // 4c reshaped this seam: there is no lax ledger writer left to normalize
+  // bytes through. The UPDATE door loads strictly — refusal, zero bytes, no
+  // rebirth, no backup of its own — while the CLI READ path keeps the
+  // backup-then-reinitialize convenience, loudly and byte-exact.
   const repo = fixture('w11');
   initStore(repo);
   settled(() => artifacts.addDefect(repo, { severity: 'high', summary: 'ordinary ledger sentinel' }));
@@ -1175,12 +1180,15 @@ ok('W11 an ordinary ledger writer never serializes a normalized record — bytes
   assert.ok(at > 0);
   damaged[at + 2] = 0xff;
   fs.writeFileSync(ledgerFile, damaged);
-  const loaded = state.loadLedger(repo);
-  settled(() => state.saveLedger(repo, loaded));
-  assert.ok(!bytesOf(ledgerFile).toString('utf8').includes('�'), 'no U+FFFD ever reaches a canonical file');
+  assert.throws(() => ledgerMod.upsert(repo, 'features', { name: 'after damage' }),
+    (e) => e.code === 'ERATCHETLEDGERDAMAGED', 'the strict door refuses; it never resiliently rebirths mid-upsert');
+  assert.ok(damaged.equals(bytesOf(ledgerFile)), 'the refused write moved zero bytes — no U+FFFD ever serialized');
   const dir = path.dirname(ledgerFile);
+  assert.strictEqual(fs.readdirSync(dir).filter((n) => n.startsWith('ledger.json.corrupt.')).length, 0,
+    'the update door makes no backup of its own');
+  state.loadLedger(repo); // the read path preserves, then reinitializes in memory
   const backups = fs.readdirSync(dir).filter((n) => n.startsWith('ledger.json.corrupt.'));
-  assert.ok(backups.length >= 1, 'the undecodable bytes were preserved');
+  assert.ok(backups.length >= 1, 'the undecodable bytes were preserved by the read path');
   for (const b of backups) {
     assert.ok(damaged.equals(bytesOf(path.join(dir, b))), 'the backup is the exact original bytes');
   }

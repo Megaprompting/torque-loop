@@ -267,6 +267,8 @@ const APERTURE_DIMS = ['ambiguity', 'terrain', 'taste', 'blastRadius', 'reversib
 const WRITE_ROSTER = [
   'workspace.open', 'workspace.scan', 'score.confidence', 'score.friction',
   'state.set', ...SESSION_VERBS, ...ARTIFACT_VERBS, ...MIRROR_VERBS,
+  // 4c: the second single-file safe core, appended in advertised order.
+  'ledger.update',
 ];
 
 ok('W1 a flagless server registers no write tools and cannot dispatch one', () => {
@@ -301,6 +303,34 @@ ok('W2 a --write server advertises state.set with the pinned descriptor, both er
   initialize(legacyConn);
   const legacyTools = legacy(legacyConn, 'tools/list', {}).result.tools.map((t) => t.name);
   assert.ok(legacyTools.includes('state.set'), 'the write roster exists on the legacy era too');
+});
+
+ok('W2b both protocol eras deep-equal one canonical 19-descriptor write fixture', () => {
+  const expected = JSON.parse(fs.readFileSync(
+    path.join(__dirname, 'fixtures', 'mcp-tools-list-write.json'),
+    'utf8',
+  ));
+  const repo = initRepo('w2b-repo');
+  const server = service([repo], true);
+
+  const modernConn = server.createConnection();
+  const modernResult = modern(modernConn, 'tools/list', {}).result;
+  assert.strictEqual(modernResult.ttlMs, 300000);
+  assert.strictEqual(modernResult.cacheScope, 'public');
+  assert.deepStrictEqual(modernResult.tools, expected);
+
+  const legacyConn = server.createConnection();
+  initialize(legacyConn);
+  const legacyResult = legacy(legacyConn, 'tools/list', {}).result;
+  assert.strictEqual(Object.hasOwn(legacyResult, 'ttlMs'), false);
+  assert.strictEqual(Object.hasOwn(legacyResult, 'cacheScope'), false);
+  assert.deepStrictEqual(legacyResult.tools, expected);
+
+  // Red-check the oracle: one descriptor's drift must fail each era independently.
+  const divergent = JSON.parse(JSON.stringify(expected));
+  divergent[divergent.length - 1].title += ' (drift)';
+  assert.throws(() => assert.deepStrictEqual(modernResult.tools, divergent));
+  assert.throws(() => assert.deepStrictEqual(legacyResult.tools, divergent));
 });
 
 ok('W3 workspace.open reports stateGen from the same snapshot as stateRev', () => {

@@ -45,6 +45,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 
 const handles = require('./handles');
+const ledgerMod = require('../ledger');
 const ops = require('./ops');
 const prompts = require('./prompts');
 const repository = require('./repository');
@@ -107,6 +108,14 @@ const TOOL = Object.freeze({
       // recreated out-of-band, and a generation the client did not observe is
       // a world it never decided against.
       stateGen: { type: 'string' },
+      // The ledger's own lineage (4c) — persisted canonical bytes, both null
+      // for a version-1 (pre-envelope) ledger: emptiness stated, not omitted.
+      ledgerRev: { type: ['integer', 'null'] },
+      ledgerGen: { type: ['string', 'null'] },
+      // Present exactly when ledgerGen is null: the SHA-256 of the version-1
+      // bytes just served, which an admission write echoes back as
+      // expectedLedgerHash. Omitted (never null) on version-2 stores.
+      ledgerBytesHash: { type: 'string' },
       // Derived, never persisted: whether a 4b write-ahead intent occupies the
       // slot. Open recovers under its lock first, so this is normally false.
       pendingIntent: { type: 'boolean' },
@@ -121,7 +130,7 @@ const TOOL = Object.freeze({
         additionalProperties: false,
       },
     },
-    required: ['workspaceHandle', 'repositoryId', 'worktreeId', 'stateRev', 'stateGen', 'pendingIntent', 'resources'],
+    required: ['workspaceHandle', 'repositoryId', 'worktreeId', 'stateRev', 'stateGen', 'ledgerRev', 'ledgerGen', 'pendingIntent', 'resources'],
     additionalProperties: false,
   },
   annotations: {
@@ -791,6 +800,132 @@ const DEFECT_SUPERSEDE_TOOL = defectTransitionTool(
   'superseded'
 );
 
+// ---------------------------------------------------------------------------
+// 4c: ledger.update — the second single-file safe core. Its envelope names
+// the LEDGER lineage (state's expectedStateRev/Gen do not appear: this tool
+// touches no state bytes, moves no state revision, writes no state receipt),
+// and its receipts live in the ledger's own ring.
+// ---------------------------------------------------------------------------
+
+const LEDGER_ITEM_CAP_BYTES = 16384;
+
+const LEDGER_UPDATE_USAGE =
+  'ledger.update requires exactly: workspaceHandle, expectedLedgerRev (integer or null), ' +
+  'expectedLedgerGen (string or null), operationId, collection, item — either both expectations ' +
+  'non-null with no expectedLedgerHash, or both null with expectedLedgerHash naming the observed version-1 bytes';
+
+// One error branch for every ledger.update refusal. StaleLedgerRev's fields
+// are INTEGER-ONLY (a null expectation never reaches the revision check with
+// a mismatch); actualLedgerGen is null exactly when the store is version 1,
+// and actualLedgerHash then names what is actually on disk so the client can
+// re-read and re-decide. LedgerRevisionExhausted and ReceiptTooLarge are
+// NON-RETRYABLE by declaration: an identical retry fails identically.
+const LEDGER_ERROR_BRANCH = Object.freeze({
+  type: 'object',
+  properties: {
+    ok: { const: false },
+    error: {
+      enum: [
+        'StaleLedgerRev',
+        'StaleLedgerGen',
+        'LedgerDamaged',
+        'LedgerRevisionExhausted',
+        'ReceiptTooLarge',
+        'OperationIdConflict',
+        'DeterministicIdConflict',
+        'MirrorUnrecoverable',
+        'WriteFailed',
+      ],
+    },
+    message: { type: 'string' },
+    expectedLedgerRev: { type: 'integer' },
+    actualLedgerRev: { type: 'integer' },
+    expectedLedgerGen: { type: ['string', 'null'] },
+    actualLedgerGen: { type: ['string', 'null'] },
+    actualLedgerHash: { type: 'string' },
+  },
+  required: ['ok', 'error', 'message'],
+  additionalProperties: false,
+});
+
+const LEDGER_UPDATE_TOOL = Object.freeze({
+  name: 'ledger.update',
+  title: 'Upsert one QA-ledger record',
+  description:
+    'Upsert one record into the QA ledger of an opened workspace, against the ledger\'s OWN revision line ' +
+    '(state revisions never move). CAS-bound: refuses unless expectedLedgerRev and expectedLedgerGen match the ' +
+    'record — or, for a pre-envelope (version-1) ledger, unless the null pair plus expectedLedgerHash names the ' +
+    'exact observed bytes, in which case the first committed write admits the ledger to version 2. Replays the ' +
+    'recorded outcome when the same operationId retries the same operation. The defects collection is not ' +
+    'addressable here on any door: defect records enter and change only through the defect verbs.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      workspaceHandle: {
+        type: 'string',
+        description: 'The opaque handle workspace.open minted on this connection.',
+      },
+      expectedLedgerRev: {
+        type: ['integer', 'null'],
+        minimum: 0,
+        maximum: 9007199254740991,
+        description: 'The ledgerRev this write was decided against, from workspace.open or the ledger resource — or null, with expectedLedgerGen, for a version-1 ledger.',
+      },
+      expectedLedgerGen: {
+        type: ['string', 'null'],
+        description: 'The ledger generation the revision was observed in — or null, with expectedLedgerRev, for a version-1 ledger.',
+      },
+      expectedLedgerHash: {
+        type: 'string',
+        pattern: '^sha256:[0-9a-f]{64}$',
+        description: 'Required exactly when the expected pair is null: the ledgerBytesHash workspace.open served for the version-1 bytes this write decided against.',
+      },
+      operationId: {
+        type: 'string',
+        pattern: OPERATION_ID.source,
+        description: 'Client-generated retry key (UUIDv4 or >=128 bits of entropy). Retry the SAME operation with the same id; never reuse one for a different operation.',
+      },
+      // This is more than de-duplication: defects is absent from the shared
+      // family constant, so D3's exclusion is structural in discovery and
+      // admission. Serve a copy, as with the state collection enums.
+      collection: { type: 'string', enum: [...schemas.LEDGER_FAMILY_COLLECTIONS] },
+      item: {
+        type: 'object',
+        description: 'The record to upsert (canonical serialization at most 16 KiB). An existing string id merges over that record; item.id, when present, must be a non-empty string.',
+      },
+    },
+    required: ['workspaceHandle', 'expectedLedgerRev', 'expectedLedgerGen', 'operationId', 'collection', 'item'],
+    additionalProperties: false,
+  },
+  outputSchema: {
+    oneOf: [
+      {
+        type: 'object',
+        properties: {
+          ok: { const: true },
+          committed: { type: 'boolean' },
+          // null in exactly one case: an uncommitted no-op against a
+          // still-version-1 ledger — no revision exists to report.
+          ledgerRev: { type: ['integer', 'null'] },
+          replayed: { type: 'boolean' },
+          collection: { type: 'string', enum: [...schemas.LEDGER_FAMILY_COLLECTIONS] },
+          recordId: { type: 'string' },
+          action: { type: 'string', enum: ['created', 'updated'] },
+        },
+        required: ['ok', 'committed', 'ledgerRev', 'replayed', 'collection', 'recordId', 'action'],
+        additionalProperties: false,
+      },
+      LEDGER_ERROR_BRANCH,
+    ],
+  },
+  annotations: {
+    readOnlyHint: false,
+    destructiveHint: true, // merge overwrites fields
+    idempotentHint: true,
+    openWorldHint: false,
+  },
+});
+
 // The one sentence each refusal speaks. A table, so the funnel test can assert
 // every wire sentence against this allowlist — no verb-specific catch can leak
 // a path, an errno, or a store location.
@@ -809,6 +944,13 @@ const WRITE_REFUSALS = Object.freeze({
   AttachmentAmbiguous: 'Several live artifacts could own this defect; provide item.artifact explicitly.',
   MirrorUnrecoverable: 'The defect mirror cannot be read or recovered safely; run ratchet doctor and repair the reported condition before retrying.',
   WriteFailed: 'workspace write could not be completed',
+  // The 4c ledger-line refusals. The first two mirror their state spellings;
+  // the last three are pinned by the ratified spec, word for word.
+  StaleLedgerRev: 'ledger record moved since it was read — re-read the ledger and re-decide against the current revision',
+  StaleLedgerGen: 'ledger lineage changed since it was read — re-open the workspace and re-decide',
+  LedgerDamaged: 'The ledger record cannot be read safely; run ratchet doctor and repair the reported condition before retrying.',
+  LedgerRevisionExhausted: 'The ledger revision line cannot advance further; run ratchet doctor and archive or reset the ledger before writing.',
+  ReceiptTooLarge: "The operation's receipt exceeds the persisted cap; this request cannot succeed as sent — see ratchet doctor if the store's own fields are oversized.",
 });
 
 function writeRefusal(error, fields) {
@@ -1026,6 +1168,12 @@ function safeOpenError(error) {
     // write tools' allowlisted sentence.
     return 'The defect mirror cannot be read or recovered safely; run ratchet doctor and repair the reported condition before retrying.';
   }
+  if (error && error.code === 'ERATCHETLEDGERDAMAGED') {
+    // 4c D5: existing unhealthy ledger bytes refuse the open — no handle, no
+    // backup, no fresh ledger. The local diagnosis stays local; the wire gets
+    // the one allowlisted sentence.
+    return WRITE_REFUSALS.LedgerDamaged;
+  }
   if (error && error.code && String(error.code).startsWith('ERATCHETHANDLE')) {
     return 'workspace authority could not be issued';
   }
@@ -1159,22 +1307,30 @@ function createServer(options) {
 
       let found;
       let snapshot;
+      let ledgerInfo;
       try {
         found = discoverer.discover(args.path);
         // Opening is the explicit initialization boundary. The revision only
-        // means something once the canonical state record it counts exists —
-        // and the LEDGER is initialized in the same breath, because loadLedger
-        // creates it when it is missing: without this, the first ledger
-        // resource read of a fresh workspace wrote bytes, and "every read is
-        // pure" was false on the one path a client hits first.
+        // means something once the canonical state record it counts exists.
         //
         // 4b: the snapshot is taken INSIDE the workspace lock, because the
         // lock's post-acquire path is where pending-intent recovery lives — a
         // healthy store used to be read lock-free here, which would have
         // issued a handle over a mirror still owed its recovery.
+        //
+        // 4c: the open boundary stopped repairing the ledger (D5). The
+        // prescribed order inside the lock: recover (the lock did) →
+        // strict-PROBE the ledger and refuse NOW if existing bytes are
+        // unprovable, before anything initializes → initialize/load state →
+        // create the ledger create-exclusive iff the probe found genuine
+        // absence (proving the winner's bytes if the create loses that race)
+        // → snapshot both. A LedgerDamaged refusal issues no handle, makes no
+        // backup, invents no fresh ledger, and moves zero canonical bytes
+        // measured from the post-recovery baseline.
         state.withWorkspaceLock(found.root, 'workspace open', () => {
+          const probe = state.readLedgerStrict(found.root);
           snapshot = state.loadState(found.root);
-          state.loadLedger(found.root);
+          ledgerInfo = probe.absent ? state.createLedgerStrict(found.root) : probe;
         });
       } catch (error) {
         // Either record failing means no handle: authority over a workspace
@@ -1222,7 +1378,11 @@ function createServer(options) {
         ledger: resourceUri(record.handle, 'ledger'),
         receipt: resourceUri(record.handle, 'receipt'),
       };
-      const result = {
+      // The ledger lineage from the same locked read as everything else. For
+      // a version-1 ledger both fields are null and ledgerBytesHash names the
+      // exact bytes an admission write must echo back.
+      const lineage = state.ledgerLineage(ledgerInfo.ledger, ledgerInfo.bytes);
+      const result = Object.assign({
         workspaceHandle: record.handle,
         repositoryId: record.repositoryId,
         worktreeId: record.worktreeId,
@@ -1230,11 +1390,12 @@ function createServer(options) {
         // The same loaded snapshot as stateRev: a revision and a generation
         // read separately could describe two different records.
         stateGen: snapshot ? String(snapshot.gen || '') : '',
+      }, lineage, {
         // Sampled after the locked recovery above — normally 'absent'; a later
         // writer's slot is the state CAS contract's problem, not this field's.
         pendingIntent: intentToken(record.root) !== 'absent',
         resources: uris,
-      };
+      });
       return {
         // Structured content is the machine contract. The text block keeps
         // compatibility with clients that only surface unstructured tool text.
@@ -1559,6 +1720,106 @@ function createServer(options) {
       });
     }
 
+    // 4c: the ledger envelope. Not writeArguments — this tool names the
+    // LEDGER lineage, whose contract is exhaustive at the boundary: EITHER a
+    // non-null pair with NO expectedLedgerHash, OR the null pair WITH it. Any
+    // other combination refuses -32602 before the store is touched.
+    function ledgerUpdate(arguments_) {
+      const args = arguments_;
+      if (!args || typeof args !== 'object' || Array.isArray(args)) throw rpc.rpcError(-32602, LEDGER_UPDATE_USAGE);
+      if (argumentsTooDeep(args)) throw rpc.rpcError(-32602, LEDGER_UPDATE_USAGE);
+      const required = ['workspaceHandle', 'expectedLedgerRev', 'expectedLedgerGen', 'operationId', 'collection', 'item'];
+      const allowed = new Set([...required, 'expectedLedgerHash']);
+      for (const key of Object.keys(args)) {
+        if (!allowed.has(key)) throw rpc.rpcError(-32602, LEDGER_UPDATE_USAGE);
+      }
+      for (const key of required) {
+        if (!Object.prototype.hasOwnProperty.call(args, key)) throw rpc.rpcError(-32602, LEDGER_UPDATE_USAGE);
+      }
+      const rev = args.expectedLedgerRev;
+      const gen = args.expectedLedgerGen;
+      if (rev !== null && (!Number.isSafeInteger(rev) || rev < 0)) throw rpc.rpcError(-32602, LEDGER_UPDATE_USAGE);
+      if (gen !== null && typeof gen !== 'string') throw rpc.rpcError(-32602, LEDGER_UPDATE_USAGE);
+      // Mixed pairs, a null pair without the hash, and a non-null pair
+      // carrying one are all refused: the envelope rule is exhaustive.
+      if ((rev === null) !== (gen === null)) throw rpc.rpcError(-32602, LEDGER_UPDATE_USAGE);
+      if (rev === null) {
+        if (typeof args.expectedLedgerHash !== 'string' || !/^sha256:[0-9a-f]{64}$/.test(args.expectedLedgerHash)) {
+          throw rpc.rpcError(-32602, LEDGER_UPDATE_USAGE);
+        }
+      } else if (args.expectedLedgerHash !== undefined) {
+        throw rpc.rpcError(-32602, LEDGER_UPDATE_USAGE);
+      }
+      if (typeof args.operationId !== 'string' || !OPERATION_ID.test(args.operationId)) {
+        throw rpc.rpcError(-32602, LEDGER_UPDATE_USAGE);
+      }
+      if (!schemas.LEDGER_FAMILY_COLLECTIONS.includes(args.collection)) {
+        throw rpc.rpcError(-32602, LEDGER_UPDATE_USAGE);
+      }
+      const item = args.item;
+      if (!item || typeof item !== 'object' || Array.isArray(item)) throw rpc.rpcError(-32602, LEDGER_UPDATE_USAGE);
+      if (item.id !== undefined && (typeof item.id !== 'string' || !item.id)) {
+        throw rpc.rpcError(-32602, LEDGER_UPDATE_USAGE);
+      }
+      // The item cap keeps the ledger a ledger rather than a blob store:
+      // canonical serialization, measured in UTF-8 bytes, refused before any
+      // load touches the store.
+      if (Buffer.byteLength(ops.canonicalStringify(item), 'utf8') > LEDGER_ITEM_CAP_BYTES) {
+        throw rpc.rpcError(-32602, LEDGER_UPDATE_USAGE);
+      }
+      const record = resolveHandle(args.workspaceHandle, 'write');
+      let outcome;
+      try {
+        outcome = ops.executeLedgerWrite({
+          state,
+          ledger: ledgerMod,
+          root: record.root,
+          operationId: args.operationId,
+          expectedLedgerRev: rev,
+          expectedLedgerGen: gen,
+          expectedLedgerHash: rev === null ? args.expectedLedgerHash : null,
+          collection: args.collection,
+          item,
+        });
+      } catch (error) {
+        return safeWriteError(error);
+      }
+      switch (outcome.kind) {
+        case 'replayed':
+          return toolResult(Object.assign(outcome.result, { replayed: true }));
+        case 'committed':
+        case 'noop':
+          return toolResult(outcome.result);
+        case 'staleLedgerGen':
+          return writeRefusal('StaleLedgerGen', Object.assign({
+            expectedLedgerGen: gen,
+            actualLedgerGen: outcome.actualLedgerGen,
+          }, outcome.actualLedgerHash ? { actualLedgerHash: outcome.actualLedgerHash } : {}));
+        case 'staleLedgerRev':
+          return writeRefusal('StaleLedgerRev', {
+            expectedLedgerRev: rev,
+            actualLedgerRev: outcome.actualLedgerRev,
+          });
+        case 'conflict':
+          return writeRefusal('OperationIdConflict');
+        case 'idConflict':
+          return writeRefusal('DeterministicIdConflict');
+        case 'ledgerDamaged':
+          return writeRefusal('LedgerDamaged');
+        case 'ledgerExhausted':
+          return writeRefusal('LedgerRevisionExhausted');
+        case 'capOverflow':
+          // For ledger.update the capOverflow outcome maps to the
+          // NON-RETRYABLE ReceiptTooLarge, never to retryable WriteFailed —
+          // the verdict is deterministic in the request's own composition.
+          return writeRefusal('ReceiptTooLarge');
+        case 'mirror':
+          return writeRefusal('MirrorUnrecoverable');
+        default:
+          return writeRefusal('WriteFailed');
+      }
+    }
+
     // ONE registry. tools/list renders it and tools/call dispatches from it, so
     // a listed tool cannot silently lack an implementation and an implemented
     // tool cannot stay undiscoverable. The order is the advertised order; the
@@ -1583,6 +1844,7 @@ function createServer(options) {
         { descriptor: DEFECT_RESOLVE_TOOL, run: defectResolve },
         { descriptor: DEFECT_REOPEN_TOOL, run: defectReopen },
         { descriptor: DEFECT_SUPERSEDE_TOOL, run: defectSupersede },
+        { descriptor: LEDGER_UPDATE_TOOL, run: ledgerUpdate },
       ] : []),
     ];
 
@@ -1609,7 +1871,15 @@ function createServer(options) {
       try {
         sampled = samplePendingIntent(available.record.root, () => {
           if (available.parsed.name === 'state') return state.peekState(available.record.root);
-          if (available.parsed.name === 'ledger') return state.peekLedger(available.record.root);
+          if (available.parsed.name === 'ledger') {
+            // 4c lineage projection: a version-2 ledger already carries its
+            // lineage in the served bytes; a version-1 record gains explicit
+            // nulls plus the hash of the exact bytes just read — injected
+            // into the projection only, the disk bytes never gain it.
+            const raw = state.peekLedgerRaw(available.record.root);
+            const lineage = state.ledgerLineage(raw.parsed, raw.bytes);
+            return lineage.ledgerBytesHash ? Object.assign({}, raw.parsed, lineage) : raw.parsed;
+          }
           return receipt.assemble(available.record.root, { peek: true });
         });
       } catch (e) {

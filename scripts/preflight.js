@@ -192,7 +192,9 @@ const changedPaths = uniq(pathsFromNameStatus(nameStatusText).concat(pathsFromSt
 const shortStat = gitText(['diff', '--shortstat', `${base}...HEAD`]).trim() || '0 committed file changes';
 
 function checkGreenWorld() {
-  const test = run('npm', ['test'], { timeout: 120000, shell: true });
+  // 300s: the 4c ledger suite added real child-process crash tests and the
+  // full run crossed the old 120s budget on a loaded machine.
+  const test = run('npm', ['test'], { timeout: 300000, shell: true });
   const doctor = run('node', ['bin/ratchet', 'doctor'], { timeout: 60000 });
   const pass = test.status === 0 && doctor.status === 0;
   const counts = (test.stdout + '\n' + test.stderr).match(/\d+\s+passed/g) || [];

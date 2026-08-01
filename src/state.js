@@ -1558,7 +1558,13 @@ function runMirrored(cwd, o, action, prepare) {
   const s = rememberBase(cwd, stateRead.parsed);
   const baseRev = revOf(s);
   _scope.state = s;
-  const prep = prepare(s, ledgerRead.parsed);
+  // `prepare` gets a CLONE of the ledger. Its only channel to the mirror is
+  // the ledgerOps it declares — the intent's whole contract is that the
+  // after-image equals before-bytes + those ops — so a view it can edit is a
+  // second, undeclared channel. Handing out the live object and then
+  // materializing from it let a caller move records the ops never named (a
+  // family feature, the lineage, the receipt ring) rev-silently.
+  const prep = prepare(s, clone(ledgerRead.parsed));
   _scope.state = null;
   if (!prep || prep.kind === 'skip') return { committed: false, rev: baseRev, state: s, result: prep && prep.result };
   if (prep.kind === 'noop') return { committed: false, rev: baseRev, state: s, result: prep.result };
@@ -1573,7 +1579,12 @@ function runMirrored(cwd, o, action, prepare) {
   s.updatedAt = now;
   s.rev = targetRev;
   const stateAfterBytes = wal.serializeRecord(s);
-  const ledgerAfter = wal.applyLedgerOps(ledgerRead.parsed, prep.ledgerOps, now);
+  // Materialize from a PRISTINE parse of the recorded bytes, never from any
+  // object that crossed the prepare boundary: the hashes below certify
+  // before-bytes + declared ops, and that is exactly what recovery will
+  // reconstruct if this process dies.
+  const ledgerBase = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(ledgerRead.bytes));
+  const ledgerAfter = wal.applyLedgerOps(ledgerBase, prep.ledgerOps, now);
   const ledgerAfterBytes = wal.serializeRecord(ledgerAfter);
   const intent = {
     version: 1,
@@ -1658,6 +1669,29 @@ function peekLedger(cwd) {
   return peekCanonical(ledgerPath(cwd), 'ledger record');
 }
 
+// Byte-pure ledger peek that also returns the exact bytes it parsed (4c): the
+// version-1 lineage projection hashes what was actually served, and a second
+// read for the hash could describe different bytes than the parse.
+function peekLedgerRaw(cwd) {
+  let raw;
+  try {
+    raw = fs.readFileSync(ledgerPath(cwd));
+  } catch (e) {
+    const err = new Error(`ledger record is ${e && e.code === 'ENOENT' ? 'absent' : 'unreadable'} on a read path — run ratchet doctor`);
+    err.code = 'ERATCHETMIRROR';
+    throw err;
+  }
+  try {
+    const parsed = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(raw));
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not a record');
+    return { parsed, bytes: raw };
+  } catch (_e) {
+    const err = new Error('ledger record is present but not a readable record — run ratchet doctor');
+    err.code = 'ERATCHETMIRROR';
+    throw err;
+  }
+}
+
 function loadLedger(cwd) {
   const existing = readJsonResilient(ledgerPath(cwd));
   if (existing) return existing;
@@ -1675,19 +1709,241 @@ function loadLedger(cwd) {
   });
 }
 
-// The ledger is a second canonical file in the same store, so it answers to the
-// same lock. It used to write directly: two processes holding stale ledger
-// snapshots simply lost one of the two saves, with nothing to detect it. (The
-// ledger has no revision counter, so this serializes writes rather than rebasing
-// them — the last writer under the lock still wins. Named in the CHANGELOG.)
-function saveLedger(cwd, ledger) {
-  assertMayWrite('saveLedger'); // the ledger is canonical too — one door standard
-  return withWorkspaceLock(cwd, 'saveLedger', () => {
+// ---------------------------------------------------------------------------
+// 4c: the ledger becomes a first-class record. The supported publisher set is
+// CLOSED: commitLedgerFamily (the only rev-advancing door), the private WAL
+// mirror publisher inside recovery/runMirrored (defects + updatedAt only,
+// rev/gen/ring-silent), and the creation/wipe paths — nothing else. The old
+// exported saveLedger was the hole in that enumeration (a library caller could
+// move revision-covered records while ledgerRev stayed put), so it is gone.
+// ---------------------------------------------------------------------------
+
+function ledgerDamaged(reason) {
+  const e = new Error(`ledger record cannot be read safely: ${reason} — run ratchet doctor`);
+  e.code = 'ERATCHETLEDGERDAMAGED';
+  return e;
+}
+
+// Strict single read for every 4c door: exact bytes plus the validation
+// matrix. ABSENT is a named status — the wire answers it as damage behind a
+// live handle, the CLI and open answer it by creating — and every other
+// failure refuses with a local diagnosis. Never a backup, never a repair,
+// never a fresh ledger.
+function readLedgerStrict(cwd) {
+  let bytes;
+  try {
+    bytes = fs.readFileSync(ledgerPath(cwd));
+  } catch (e) {
+    if (e && e.code === 'ENOENT') return { absent: true };
+    throw ledgerDamaged(`it exists but cannot be read (${e && e.code ? e.code : 'unknown'})`);
+  }
+  let parsed;
+  try {
+    // Fatal decode, same rule as every strict reader: a lossy parse would
+    // validate a record nobody wrote.
+    parsed = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+  } catch (_e) {
+    throw ledgerDamaged('it is not a valid UTF-8 JSON record');
+  }
+  const verdict = schemas.validateLedgerRecord(parsed);
+  if (!verdict.ok) throw ledgerDamaged(`strict matrix row "${verdict.row}" — ${verdict.detail}`);
+  return { absent: false, ledger: parsed, bytes, version: verdict.version };
+}
+
+// Create a fresh version-2 ledger create-exclusive, then strictly prove
+// whatever occupies the slot — ours or a race winner's (absence observed once
+// is not absence still). Callers hold the workspace lock.
+function createLedgerStrict(cwd) {
+  createJsonExclusive(ledgerPath(cwd), schemas.newLedger());
+  const loaded = readLedgerStrict(cwd);
+  if (loaded.absent) throw ledgerDamaged('it vanished between creation and its proving read');
+  return loaded;
+}
+
+// The checked successor for the ledger's revision line — the state nextRev
+// rule, one file over, with its own non-retryable refusal: at the ceiling,
+// reads, replay, CAS and no-ops still work, and only a genuinely mutating
+// commit refuses.
+function nextLedgerRev(baseRev) {
+  const next = baseRev + 1;
+  if (!Number.isSafeInteger(next)) {
+    const e = new Error(`ledger revision ${baseRev} cannot advance safely — archive or reset the ledger before writing`);
+    e.code = 'ERATCHETLEDGEREXHAUSTED';
+    throw e;
+  }
+  return next;
+}
+
+// The ONLY rev-advancing ledger publisher. Takes the strict-loaded base and
+// the mutated after-object (domain change applied, lineage untouched) and
+// performs the mechanics no caller may reimplement: D4 admission on a
+// version-1 base (the one rename carries version 2, a minted gen, rev 1, and
+// the ring), the checked successor on version 2, the optional MCP receipt
+// (built by the caller once the target lineage is known), the ring cap, the
+// updatedAt stamp, and the fenced publish.
+//
+// It PROVES its arguments rather than trusting them. This door is exported, so
+// "the publisher set is closed" is only true if the door itself enforces the
+// closure — the review that found this had published a rev-0 snapshot over a
+// committed rev-1 write, emitting different bytes that still claimed revision
+// 1, and had inserted a defect record with no WAL behind it. A caller's good
+// behavior is not an invariant (convention 7).
+//
+// The trusted input from `loaded` is EXACTLY its `bytes`. The parsed copy
+// beside them is convenience for the caller, never evidence here: a second
+// review round paired genuine bytes with a forged `loaded.version` /
+// `loaded.ledger.ledgerRev` and got the same class of defect back. Everything
+// below derives from `current` — the record re-read under this lock.
+function commitLedgerFamily(cwd, action, loaded, after, opts = {}) {
+  assertMayWrite(action);
+  return withWorkspaceLock(cwd, action, () => {
     assertStillOwner(cwd, 'the ledger');
-    ledger.updatedAt = schemas.nowIso();
-    writeJson(ledgerPath(cwd), ledger);
-    return ledger;
+    if (!loaded || !Buffer.isBuffer(loaded.bytes)) {
+      throw new Error('the ledger family publisher needs the exact base bytes it decided against (state.readLedgerStrict)');
+    }
+    // The base has to still BE the record. Re-read under the held lock and
+    // compare bytes: anything else lets a snapshot from before somebody else's
+    // commit overwrite it, and the successor computed from that stale base
+    // re-uses a revision number that already named different bytes.
+    const current = readLedgerStrict(cwd);
+    if (current.absent || !current.bytes.equals(loaded.bytes)) {
+      throw new Error(
+        'refusing a ledger family publish: the base moved since it was loaded — re-read the ledger and re-apply the change'
+      );
+    }
+    const base = current.ledger;
+    // Only features and tests may differ. Everything else the family cannot
+    // reach must arrive exactly as the base had it, or this door becomes the
+    // side entrance the whole partition exists to deny.
+    if (!isDeepStrictEqual(after.defects, base.defects)) {
+      throw new Error('refusing a ledger family publish: the defect mirror belongs to the defect verbs and the WAL, not to this door');
+    }
+    if (after.createdAt !== base.createdAt) {
+      throw new Error('refusing a ledger family publish: createdAt is not the family\'s to rewrite');
+    }
+    if (current.version === 2) {
+      if (after.ledgerGen !== base.ledgerGen) {
+        throw new Error('refusing a ledger family publish: the generation names the lineage and only a wipe mints a new one');
+      }
+      if (!isDeepStrictEqual(after.operations, base.operations)) {
+        throw new Error('refusing a ledger family publish: the receipt ring is appended by this door alone — retained receipts are replay evidence');
+      }
+    }
+    // From here nothing reads the caller's parsed copy. The ONE thing this
+    // door trusts from `loaded` is its BYTES, proven identical above; version,
+    // revision, generation and the admission verdict all come from `current`,
+    // the record just re-read under this lock. The first cut of this guard
+    // proved the bytes and then still consulted `loaded.version` and
+    // `loaded.ledger.ledgerRev`, so genuine bytes paired with one forged
+    // sibling field moved the ledger while the revision stood still, and
+    // re-minted a live generation while reporting a false admission. A parsed
+    // copy travelling beside the bytes is not evidence about the record.
+    let gen;
+    let rev;
+    if (current.version === 1) {
+      gen = schemas.newLedgerGeneration();
+      rev = 1;
+      after.version = schemas.LEDGER_VERSION;
+      after.ledgerRev = rev;
+      after.ledgerGen = gen;
+      after.operations = [];
+    } else {
+      gen = base.ledgerGen;
+      rev = nextLedgerRev(base.ledgerRev);
+      after.ledgerRev = rev;
+    }
+    if (opts.receipt) {
+      // The factory sees the target lineage and enforces the shared byte cap
+      // itself — a cap failure throws here, before anything publishes.
+      after.operations.push(opts.receipt(gen, rev));
+      while (after.operations.length > schemas.LEDGER_OPERATIONS_CAP) after.operations.shift();
+    }
+    after.updatedAt = schemas.nowIso();
+    // Last gate before the rename: the record this door is about to publish
+    // must be one the strict loader will accept. Publishing bytes the matrix
+    // would refuse hands the next reader a store nobody can open.
+    const verdict = schemas.validateLedgerRecord(after);
+    if (!verdict.ok || verdict.version !== 2) {
+      throw new Error(
+        `refusing a ledger family publish: the after-image fails the strict matrix row "${verdict.row || 'version'}" — ${verdict.detail || 'not a version-2 record'}`
+      );
+    }
+    writeJson(ledgerPath(cwd), after);
+    return { ledgerRev: rev, ledgerGen: gen, admitted: current.version === 1 };
   });
+}
+
+// The lineage projection every read surface serves (open, the ledger
+// resource, the receipt): persisted fields for version 2; explicit nulls plus
+// the bytes hash for version 1 — the hash is what an admission write echoes
+// back as expectedLedgerHash, derived from the exact bytes just read, never
+// persisted.
+function ledgerLineage(parsed, bytes) {
+  if (parsed && Number.isSafeInteger(parsed.ledgerRev) && typeof parsed.ledgerGen === 'string' && parsed.ledgerGen) {
+    return { ledgerRev: parsed.ledgerRev, ledgerGen: parsed.ledgerGen };
+  }
+  return { ledgerRev: null, ledgerGen: null, ledgerBytesHash: wal.hashBytes(bytes) };
+}
+
+// Lineage read off the disk for surfaces that already loaded the ledger
+// through a lenient path (the CLI receipt): one raw read serves both the
+// parse and the hash it certifies. Unreadable or absent answers the explicit
+// empty lineage — emptiness stated, never omitted.
+function ledgerLineageAt(cwd) {
+  let raw;
+  try {
+    raw = fs.readFileSync(ledgerPath(cwd));
+  } catch (_e) {
+    return { ledgerRev: null, ledgerGen: null };
+  }
+  try {
+    return ledgerLineage(JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(raw)), raw);
+  } catch (_e) {
+    return { ledgerRev: null, ledgerGen: null };
+  }
+}
+
+// Read-only 4c ledger diagnosis for doctor: the strict matrix verdict plus
+// the two operator conditions the wire sentences route here, each with its
+// stated repair. Never publishes, never backs up, repairs nothing.
+function diagnoseLedger(cwd) {
+  const rows = [];
+  let loaded;
+  try {
+    loaded = readLedgerStrict(cwd);
+  } catch (e) {
+    const genRow = /ledgerGen/.test(e.message || '');
+    rows.push({
+      name: 'ledger strict shape',
+      ok: false,
+      detail: `${e.message} ${genRow
+        ? 'Repair: restore a valid backup or archive/reset the ledger — NEVER truncate the generation.'
+        : 'Repair: restore a valid backup or archive/reset the ledger.'}`,
+    });
+    return rows;
+  }
+  if (loaded.absent) {
+    rows.push({ name: 'ledger strict shape', ok: true, detail: 'absent — created by the first write or workspace.open' });
+    return rows;
+  }
+  rows.push({
+    name: 'ledger strict shape',
+    ok: true,
+    detail: loaded.version === 1
+      ? 'version 1 (pre-envelope) — admits on its first committed family write'
+      : `version 2, ledgerRev ${loaded.ledger.ledgerRev}, ${loaded.ledger.operations.length} receipt(s)`,
+  });
+  if (loaded.version === 2) {
+    const atCeiling = loaded.ledger.ledgerRev === Number.MAX_SAFE_INTEGER;
+    rows.push({
+      name: 'ledger revision headroom',
+      ok: !atCeiling,
+      detail: atCeiling
+        ? 'ledgerRev is AT MAX_SAFE_INTEGER — reads and replay still work; mutating commits refuse. Repair: archive or reset the ledger before further mutation.'
+        : 'the revision line can advance',
+    });
+  }
+  return rows;
 }
 
 // Short, sortable, collision-resistant id: <prefix>-<time36>-<rand>. The time
@@ -1723,7 +1979,13 @@ module.exports = {
   loadLedger,
   peekState,
   peekLedger,
-  saveLedger,
+  peekLedgerRaw,
+  readLedgerStrict,
+  createLedgerStrict,
+  commitLedgerFamily,
+  ledgerLineage,
+  ledgerLineageAt,
+  diagnoseLedger,
   makeId,
   proposeOnlyAgent,
   assertMayWrite,

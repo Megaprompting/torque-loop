@@ -7,6 +7,125 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **MCP step 4c.1 — `ledger.update`, the second single-file safe core (all CLI-enforced;
+  spec: `docs/superpowers/specs/2026-08-01-mcp-4c-ledger-update-design.md`, rev 12).**
+  The ledger becomes a first-class record and the proven 4.1 envelope points at it — no
+  intent, no recovery table, one rename is the entire commit:
+  - **Ledger schema version 2** with its own lineage: `ledgerRev` (non-negative SAFE
+    integer, bounded `0 ≤ rev ≤ Number.MAX_SAFE_INTEGER` in the strict matrix),
+    `ledgerGen` (fresh `lgen-` generation minted on every creation and wipe, format- and
+    64-byte-bounded at load so a stored gen can never overflow receipts), and
+    `operations` — the ledger's own receipt ring (cap 32, ≤ 4 KiB per entry in UTF-8
+    bytes, canonical fixed-width 24-byte UTC stamps). New ledgers are born version 2;
+    `templates/ledger.json` is regenerated to match.
+  - **The `ledger.update` wire tool** (tool #19; the write roster is nineteen under
+    `--write`, still four read tools without it), on the `features` and `tests`
+    collections. Both protocol eras are pinned to one canonical 19-descriptor write
+    roster. CAS-bound to `expectedLedgerRev`/`expectedLedgerGen`;
+    replay/conflict by `operationId` against the ledger's own ring (the state ring is
+    never consulted, and vice versa); deterministic created-record ids; state revisions
+    never move and no state receipt is written.
+  - **Hash-bound admission (D4, Option A):** a version-1 ledger admits on its first
+    committed family write. The null expectation pair matches only version 1 and then
+    REQUIRES `expectedLedgerHash` naming the exact observed bytes (`workspace.open`, the
+    ledger resource, and the receipt expose `ledgerBytesHash` for version-1 stores; a
+    mismatch refuses `StaleLedgerGen` carrying `actualLedgerHash`). The admitting rename
+    carries version 2, the minted gen, rev 1, the ring, and the domain change together.
+    The honest residual is on the record in the spec: a byte-identical v1 restore is
+    indistinguishable, by construction.
+  - **The open boundary stopped repairing the ledger (D5):** `workspace.open` now
+    strict-probes existing ledger bytes and REFUSES the open (`LedgerDamaged` sentence,
+    no handle, no backup, no fresh ledger, zero bytes from the post-recovery baseline)
+    where it used to back up and silently reinitialize; genuine absence creates fresh
+    version-2 bytes create-exclusive. Its descriptor gains `ledgerRev`, `ledgerGen`, and
+    conditional `ledgerBytesHash`; the ledger resource and the receipt serve the same
+    lineage projection.
+  - **Publisher closure, enforced at the door itself:** `saveLedger` is PRIVATIZED
+    (removed from the exports). The supported ledger publisher set is closed to
+    `commitLedgerFamily` (the only rev-advancing door), the private WAL mirror
+    publisher (defects + top-level `updatedAt` only — rev-, gen-, and ring-silent),
+    and the creation/wipe paths. `commitLedgerFamily` PROVES its arguments rather
+    than trusting its callers: it re-reads the ledger strictly under the held lock
+    and refuses unless the base is still byte-identical to what the caller decided
+    against; it refuses an after-image that touches the defect mirror, `createdAt`,
+    the generation, or retained receipts (only `features`/`tests` may differ); and it
+    validates the complete after-image against the strict matrix before the rename.
+    The ONLY input trusted from the caller's base is its BYTES — version, revision,
+    generation and the admission verdict are all derived from the record re-read
+    under the lock, so a parsed copy travelling beside the bytes can never decide the
+    successor or re-mint a live lineage. Features/tests cannot change through a supported door without
+    `ledgerRev` advancing under the same gen. Raw exported primitives (`writeJson`,
+    `writeFileAtomic`) remain out-of-band corruption tooling by the 4b doctrine,
+    stated, not covered.
+  - **The mirror publisher materializes from the recorded bytes, not from a view a
+    caller can edit.** The write-ahead intent's contract is that the ledger
+    after-image equals before-bytes plus the ops the transaction declared, so the
+    parsed ledger handed to a `prepare` callback was a second, undeclared channel:
+    editing it moved records the ops never named — a family feature, the lineage, the
+    receipt ring — revision-silently, inside a transaction whose intent said "defects
+    only". `prepare` now receives a clone, and the after-image is materialized from a
+    pristine parse of the recorded bytes, which is exactly what recovery reconstructs.
+  - **The ledger generation is fixed-width.** It is minted DURING an admission write
+    and lands in that write's receipt before the byte cap is measured, so its
+    variable-width base-36 clock component (which gains a digit in 2059) could flip an
+    identical request between accept and `ReceiptTooLarge` — the environment-dependent
+    verdict the fixed-width receipt stamp already exists to prevent. The state
+    generation is not in this class: it is minted at creation and at a wipe, never
+    inside a receipt-bearing commit.
+  - **The receipt reads the ledger once.** The CLI cold read took the ledger's
+    contents from one read and its lineage from a second, so a family commit landing
+    between them reported revision N beside health computed from N−1 — a record that
+    never existed. Contents and lineage now come from one post-initialization
+    snapshot.
+  - **Revision ceiling semantics:** a record may REACH `Number.MAX_SAFE_INTEGER`; at the
+    ceiling reads, replay, CAS and no-ops still work, and a genuinely mutating commit
+    refuses non-retryable `LedgerRevisionExhausted` with zero bytes.
+  - **The complete error surface — all NINE reachable codes** on `ledger.update`:
+    `StaleLedgerRev` (integer-only fields), `StaleLedgerGen` (nullable gen +
+    `actualLedgerHash` when the store is version 1), `LedgerDamaged`,
+    `LedgerRevisionExhausted` and `ReceiptTooLarge` (both declared NON-RETRYABLE — for
+    this tool the receipt-cap outcome maps to `ReceiptTooLarge`, never retryable
+    `WriteFailed`; the fourteen state-side writers keep their inherited `WriteFailed`
+    mislabel for the identical condition, recorded durably as open loop
+    `loop-msajcsie-660c97a22e6f`, owner: Danny), plus inherited `OperationIdConflict`,
+    `DeterministicIdConflict`, `WriteFailed`, and `MirrorUnrecoverable` (via central
+    recovery).
+  - **Doctor learns the version-2 shape, read-only:** plain `ratchet doctor` names the
+    exact failing strict-matrix row locally and carries the two operator rows the wire
+    sentences route to it — a generation exceeding its bound (repair: restore a valid
+    backup or archive/reset, NEVER truncate the gen) and a revision at the ceiling
+    (repair: archive/reset before further mutation). `doctor cold-start` is unchanged.
+
+### Changed
+
+- **CLI `ledger update defects` refuses outright (D3, behavior change).** The 4b mirror
+  projection owns the mirror's `status`, `severity`, AND `summary`; the old status-only
+  gate blocked one of the three owned fields and remains as the backstop beneath the new
+  collection refusal. Defect records enter and change only through the defect verbs, on
+  both doors. The qa-ledger skill and its canonical prompt are rewritten onto the real
+  routes (`defect add` / `resolve` / `reopen` / `supersede`), guarded both directions by
+  plugin-shape.
+- **CLI `ledger update` adopts the strict family loader for bytes that EXIST (behavior
+  change):** a damaged ledger refuses with the doctor route instead of being resiliently
+  reborn mid-upsert (backup-then-reinit survives only as a CLI read-path convenience).
+  An ABSENT ledger keeps the locked auto-create: the CLI invocation is its own
+  initialization boundary, while the wire's is `workspace.open`, so absence behind a
+  live handle refuses `LedgerDamaged`.
+- **Every committed CLI family write advances `ledgerRev`** (and admits a version-1
+  ledger on first touch — gen minted, rev 1, empty ring; the CLI records no receipts).
+  No CAS flags: a single CLI invocation's read-modify-write is already atomic under its
+  one lock hold, and the CLI names no expectation.
+- **The identical-merge no-op applies on both doors (behavior change):** no revision, no
+  receipt, no `updatedAt` restamp, zero bytes — and the success envelope's `ledgerRev`
+  is `null` in exactly one case, an uncommitted no-op against a still-version-1 ledger
+  (a no-op admits nothing; emptiness stated, not omitted).
+- **`item.id` must be a non-empty string when present, on both doors (behavior
+  change):** the CLI used to accept any truthy id and compare with strict equality, so a
+  numeric or object id created a record no later string lookup could address.
+  `recordId` in the success envelope is always a string.
+
 ### Fixed
 
 - **Safe-core hardening (three live defects found by the 4c design review rounds 2–3,

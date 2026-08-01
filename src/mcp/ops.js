@@ -318,13 +318,197 @@ function executeMirroredWrite(opts) {
   return outcome;
 }
 
+// ---------------------------------------------------------------------------
+// 4c: the ledger write executor — the 4.1 mechanism pointed at the second
+// file. One canonical file, one rename, its own revision line, its own
+// receipt ring; no intent, no recovery table. Ordered semantics under the one
+// workspace lock: strict load → replay → lineage (D4 hash-bound admission) →
+// revision → domain → commit through the one family publisher.
+// ---------------------------------------------------------------------------
+
+// The ledger binding: tool, collection, item, and the lineage the client
+// decided against — with expectedLedgerHash normalized to null on version-2
+// writes (the supersededBy precedent), so a verbatim retry hashes identically
+// whether or not the field was spelled. Handle and operationId excluded, for
+// the reconnect reason 4.1 proved the hard way.
+function ledgerBindingHash(collection, item, expectedLedgerRev, expectedLedgerGen, expectedLedgerHash) {
+  const encoded = canonicalStringify({
+    tool: 'ledger.update',
+    collection,
+    item,
+    expectedLedgerRev,
+    expectedLedgerGen,
+    expectedLedgerHash,
+  });
+  return `sha256:${crypto.createHash('sha256').update(encoded, 'utf8').digest('hex')}`;
+}
+
+function sha256Of(bytes) {
+  return `sha256:${crypto.createHash('sha256').update(bytes).digest('hex')}`;
+}
+
+// Coded throws that are ledger outcomes, not faults. capOverflow maps to the
+// non-retryable ReceiptTooLarge on THIS tool (the state-side writers keep
+// their inherited WriteFailed mapping for the identical condition — open loop
+// loop-msajcsie-660c97a22e6f, owner: Danny).
+const LEDGER_CODED_OUTCOMES = {
+  ERATCHETLEDGERDAMAGED: 'ledgerDamaged',
+  ERATCHETLEDGEREXHAUSTED: 'ledgerExhausted',
+  ERATCHETRECEIPTCAP: 'capOverflow',
+  ERATCHETIDCONFLICT: 'idConflict',
+  ERATCHETMIRROR: 'mirror',
+};
+
+function executeLedgerWrite(opts) {
+  const { state, ledger: ledgerMod, root, operationId, collection, item } = opts;
+  const expectedLedgerRev = opts.expectedLedgerRev;
+  const expectedLedgerGen = opts.expectedLedgerGen;
+  // Normalized at the executor so every caller means the same null.
+  const expectedLedgerHash = opts.expectedLedgerHash === undefined ? null : opts.expectedLedgerHash;
+  const tool = 'ledger.update';
+  const argsHash = ledgerBindingHash(collection, item, expectedLedgerRev, expectedLedgerGen, expectedLedgerHash);
+
+  let outcome = null;
+  try {
+    // The lock's post-acquire path runs 4b recovery, so this write begins
+    // against a recovered store by construction.
+    state.withWorkspaceLock(root, tool, () => {
+      // STRICT load first, by necessity: the receipt ring lives inside these
+      // bytes, and a ring cannot be inspected before the record holding it
+      // has been proven. ABSENT refuses too, on the wire only: workspace.open
+      // already initialized this store, so a missing file behind a live
+      // handle is out-of-band destruction, not a fresh repo.
+      const loaded = state.readLedgerStrict(root);
+      if (loaded.absent) {
+        outcome = { kind: 'ledgerDamaged' };
+        return;
+      }
+      // Replay precedes CAS (the 4.1 order, for the 4.1 reason). A version-1
+      // ledger has no ring and needs none: its original attempt either
+      // committed the admission (making the store version 2 with the receipt
+      // inside) or left it version 1 and the retry applies fresh.
+      if (loaded.version === 2) {
+        const hit = loaded.ledger.operations.find((entry) => entry && entry.id === operationId);
+        if (hit) {
+          outcome = hit.argsHash === argsHash
+            ? { kind: 'replayed', result: clone(hit.result) }
+            : { kind: 'conflict' };
+          return;
+        }
+      }
+      // Lineage: the null pair matches only a version-1 ledger, and then the
+      // admission binds the exact observed bytes (D4 as re-ruled) — the gen
+      // wins before the revision comparison on every path.
+      if (expectedLedgerGen === null) {
+        if (loaded.version !== 1) {
+          outcome = { kind: 'staleLedgerGen', actualLedgerGen: loaded.ledger.ledgerGen };
+          return;
+        }
+        const actualHash = sha256Of(loaded.bytes);
+        if (expectedLedgerHash !== actualHash) {
+          outcome = { kind: 'staleLedgerGen', actualLedgerGen: null, actualLedgerHash: actualHash };
+          return;
+        }
+      } else if (loaded.version === 1) {
+        outcome = { kind: 'staleLedgerGen', actualLedgerGen: null, actualLedgerHash: sha256Of(loaded.bytes) };
+        return;
+      } else if (loaded.ledger.ledgerGen !== expectedLedgerGen) {
+        outcome = { kind: 'staleLedgerGen', actualLedgerGen: loaded.ledger.ledgerGen };
+        return;
+      }
+      if (expectedLedgerRev !== null && loaded.ledger.ledgerRev !== expectedLedgerRev) {
+        outcome = { kind: 'staleLedgerRev', actualLedgerRev: loaded.ledger.ledgerRev };
+        return;
+      }
+      // Domain: the one shared merge. Created-record ids derive from the
+      // operation's meaning, with the observed-bytes hash standing in for the
+      // absent gen on an admission write — the observed bytes ARE the lineage
+      // there, so an admission retry converges on the same id. Collision is
+      // checked against the TARGET collection before any bytes change.
+      const lineageKey = expectedLedgerGen === null ? expectedLedgerHash : expectedLedgerGen;
+      const mintId = (prefix) => {
+        const id = deriveId(prefix, lineageKey, tool, argsHash, collection);
+        if (loaded.ledger[collection].some((x) => x && String(x.id) === id)) {
+          const e = new Error(`derived id ${id} already names a record`);
+          e.code = 'ERATCHETIDCONFLICT';
+          throw e;
+        }
+        return id;
+      };
+      const now = schemas.nowIso();
+      const up = ledgerMod.applyUpsert(loaded.ledger, collection, item, { now, mintId });
+      if (up.noop) {
+        outcome = {
+          kind: 'noop',
+          result: {
+            ok: true,
+            committed: false,
+            // null in exactly one case: a no-op against a still-version-1
+            // ledger — a no-op admits nothing, so there is no revision to
+            // report. Emptiness stated, not omitted.
+            ledgerRev: loaded.version === 2 ? loaded.ledger.ledgerRev : null,
+            replayed: false,
+            collection,
+            recordId: String(up.record.id),
+            action: up.action,
+          },
+        };
+        return;
+      }
+      // The receipt stamp must be the canonical fixed-width form. A
+      // non-canonical override (RATCHET_NOW is environment-dodgeable) refuses
+      // locally with honest RETRYABLE semantics — fix the environment and the
+      // identical request proceeds — so it rides the WriteFailed funnel, not
+      // a coded outcome.
+      if (!schemas.LEDGER_STAMP_PATTERN.test(now)) {
+        throw new Error('receipt stamp override is not the canonical 24-byte UTC form — fix RATCHET_NOW and retry');
+      }
+      const committed = state.commitLedgerFamily(root, tool, loaded, up.after, {
+        receipt: (gen, rev) => {
+          const result = {
+            ok: true,
+            committed: true,
+            replayed: false,
+            ledgerRev: rev,
+            collection,
+            recordId: String(up.record.id),
+            action: up.action,
+          };
+          const entry = { id: operationId, tool, argsHash, gen, rev, at: now, result };
+          assertReceiptCap(entry);
+          return entry;
+        },
+      });
+      outcome = {
+        kind: 'committed',
+        result: {
+          ok: true,
+          committed: true,
+          ledgerRev: committed.ledgerRev,
+          replayed: false,
+          collection,
+          recordId: String(up.record.id),
+          action: up.action,
+        },
+      };
+    });
+  } catch (error) {
+    const kind = error && LEDGER_CODED_OUTCOMES[error.code];
+    if (kind) return { kind };
+    throw error;
+  }
+  return outcome;
+}
+
 module.exports = {
   OPERATIONS_CAP,
   RECEIPT_ENTRY_CAP,
   canonicalStringify,
   bindingHash,
+  ledgerBindingHash,
   deriveId,
   recordIdExists,
   executeWrite,
   executeMirroredWrite,
+  executeLedgerWrite,
 };

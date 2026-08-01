@@ -33,14 +33,25 @@ ratchet ledger get
    ratchet ledger update tests '{"feature":"<feature id>","name":"pay-with-expired-card","kind":"e2e","status":"missing"}'
    ```
 
-3. **Defects** — every known failure, tied to a feature, with severity and status.
+3. **Defects** — every known failure enters through the defect verbs, never through a
+   generic ledger edit: the state defect family owns the mirror's status, severity, and
+   summary end-to-end, so `ratchet defect add` is the only birth door (it lands in the
+   ledger automatically).
 
    ```
-   ratchet ledger update defects '{"feature":"<feature id>","severity":"high","summary":"...","status":"open"}'
+   ratchet defect add '{"feature":"<feature id>","severity":"high","summary":"..."}'
    ```
 
-4. **Reconcile.** Update statuses for anything that changed since last session. A test that
-   now passes, a defect now resolved, a feature now covered — the ledger reflects reality.
+4. **Reconcile.** Update statuses for anything that changed since last session — through
+   the verbs that own each record. A test that now passes or a feature now covered
+   reconciles with `ratchet ledger update tests|features ...`; a defect reconciles only
+   through its lifecycle:
+
+   ```
+   ratchet defect resolve <id> --evidence "<proof it is actually fixed>"
+   ratchet defect reopen <id> --reason "<why it is not actually fixed>"
+   ratchet defect supersede <id> --by <newId>
+   ```
 
 ## Rules
 

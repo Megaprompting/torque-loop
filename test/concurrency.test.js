@@ -25,6 +25,7 @@ fs.rmSync(tmp, { recursive: true, force: true });
 
 const state = require('../src/state');
 const schemas = require('../src/schemas');
+const ledger = require('../src/ledger');
 
 const SRC = path.join(__dirname, '..', 'src');
 const BIN = path.join(__dirname, '..', 'bin', 'ratchet');
@@ -1031,20 +1032,27 @@ ok('H10 a CAS refusal on an absent store leaves the store absent', () => {
 
 // --- M12: saveState and saveLedger are the same door -------------------------
 
-ok('M12 a propose-only agent cannot write through saveState or saveLedger', () => {
+ok('M12 a propose-only agent cannot write through saveState or the ledger family door', () => {
+  // 4c: saveLedger is privatized — the family door (ledger.upsert →
+  // commitLedgerFamily) is the ledger's one public write, and it refuses the
+  // same roles the state door does.
   const proj = freshProject('m12');
   const s = state.loadState(proj);
-  const l = state.loadLedger(proj);
+  state.loadLedger(proj);
   const before = stateBytes(proj);
+  const ledgerBefore = fs.readFileSync(state.ledgerPath(proj));
   process.env.RATCHET_AGENT = 'ratchet-builder';
   try {
     s.objective = 'written by a propose-only agent';
     assert.throws(() => state.saveState(proj, s), /propose-only/, 'saveState must not be the softer second door');
-    assert.throws(() => state.saveLedger(proj, l), /propose-only/, 'and neither must saveLedger');
+    assert.throws(() => ledger.upsert(proj, 'features', { name: 'proposed' }), /propose-only/,
+      'and neither must the ledger family door');
+    assert.strictEqual(state.saveLedger, undefined, 'the raw exported saveLedger door is gone');
   } finally {
     delete process.env.RATCHET_AGENT;
   }
   assert.ok(stateBytes(proj).equals(before), 'the refused writes must move zero bytes');
+  assert.ok(fs.readFileSync(state.ledgerPath(proj)).equals(ledgerBefore), 'the ledger too');
 });
 
 // --- M11: proof is validated under the lock that protects the append ---------
@@ -1323,16 +1331,15 @@ ok('M11 a bound append holds the workspace lock while it validates', () => {
 
 // --- M12 residual: the ledger is canonical too -------------------------------
 
-ok('M12 saveLedger takes the workspace lock like every other write', () => {
+ok('M12 the ledger family door takes the workspace lock like every other write', () => {
   const proj = freshProject('m12-ledger');
-  const ledger = state.loadLedger(proj);
+  state.loadLedger(proj);
   const lockDir = plantLock(workspaceLockDir(proj), { ageMs: 0, token: 'ledgerholder', action: 'holding the store' });
   const prevTimeout = process.env.RATCHET_LOCK_TIMEOUT_MS;
   process.env.RATCHET_LOCK_TIMEOUT_MS = '400';
   let refusal = null;
   try {
-    ledger.features.push({ id: 'f1', name: 'written past the lock' });
-    state.saveLedger(proj, ledger);
+    ledger.upsert(proj, 'features', { id: 'f1', name: 'written past the lock' });
   } catch (e) {
     refusal = e;
   } finally {
@@ -1853,14 +1860,15 @@ ok('R3 reset and ledger publishes are fenced too, not just the state commit', ()
   // remove somebody else's holding. Clear it so the next phase can take the lock.
   fs.rmSync(lockDir, { recursive: true, force: true });
 
-  const ledger = state.loadLedger(proj);
+  state.loadLedger(proj);
   const ledgerBytes = fs.readFileSync(state.ledgerPath(proj));
   let ledgerRefusal = null;
   state.withWorkspaceLock(proj, 'holder', () => {
     steal();
     try {
-      ledger.features.push({ id: 'f-stolen', name: 'published past a lost lock' });
-      state.saveLedger(proj, ledger);
+      // The family door joins the open scope; its publish re-verifies the
+      // holding at the last instant, exactly like the state commit.
+      ledger.upsert(proj, 'features', { id: 'f-stolen', name: 'published past a lost lock' });
     } catch (e) {
       ledgerRefusal = e;
     }
