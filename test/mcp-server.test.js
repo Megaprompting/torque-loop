@@ -663,18 +663,28 @@ ok('S20 score.confidence loads state exactly once — stateRev comes from the sc
   const repo = initRepo('s20-repo');
   const conn = service([repo]).createConnection();
   const opened = payload(openWorkspace(conn, repo));
+  // 4b.3: the read path peeks (byte-pure), so the counted loader is peekState —
+  // and the resilient, store-creating loadState must not be touched at all.
+  const realPeek = state.peekState;
   const realLoad = state.loadState;
+  let peeks = 0;
   let loads = 0;
   try {
+    state.peekState = function counted(cwd) {
+      peeks++;
+      return realPeek.call(state, cwd);
+    };
     state.loadState = function counted(cwd) {
       loads++;
       return realLoad.call(state, cwd);
     };
     payload(callTool(conn, 'score.confidence', { workspaceHandle: opened.workspaceHandle }));
   } finally {
+    state.peekState = realPeek;
     state.loadState = realLoad;
   }
-  assert.strictEqual(loads, 1, `score.confidence read state ${loads} times; the contract is one snapshot`);
+  assert.strictEqual(peeks, 1, `score.confidence read state ${peeks} times; the contract is one snapshot`);
+  assert.strictEqual(loads, 0, 'a derived read never touches the creating loader');
 });
 
 ok('S21 journal damage is on the wire, not on stderr where no client reads', () => {

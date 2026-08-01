@@ -892,6 +892,132 @@ ok('T5 the wire transitions mean the CLI meaning; replay answers the retry; supe
 });
 
 // ---------------------------------------------------------------------------
+// 4b.3: falsifiers from the independent review round (Codex, 2026-08-01).
+// Each one was seen RED against main @ b029c81 before its fix landed.
+// ---------------------------------------------------------------------------
+
+ok('W1 a slot whose bytes are not UTF-8 refuses instead of parsing a lossy normalization', () => {
+  const repo = fixture('w1');
+  craftedSlot(repo);
+  const slotFile = state.intentPath(repo);
+  const bytes = Buffer.from(bytesOf(slotFile));
+  const at = bytes.indexOf(Buffer.from('wal-crafted-operation', 'utf8'));
+  assert.ok(at > 0, 'the crafted operationId is in the slot');
+  bytes[at + 4] = 0xff; // one invalid byte inside a JSON string
+  fs.writeFileSync(slotFile, bytes);
+  const before = storeSnapshot(repo);
+  assert.throws(() => triggerRecovery(repo), (e) => Boolean(e) && e.code === 'ERATCHETMIRROR',
+    'invalid bytes are ambiguous — a U+FFFD substitute is a different operationId, not this one');
+  assert.deepStrictEqual(storeSnapshot(repo), before, 'the refusal preserved every byte');
+});
+
+ok('W2 recovery refuses a post-state slot whose tool contradicts the receipt it names', () => {
+  const repo = initRepo('w2');
+  const conn = service([repo], true).createConnection();
+  const open = openWorkspace(conn, repo);
+  const origRename = fs.renameSync;
+  fs.renameSync = (a, b) => {
+    if (path.basename(String(b)) === 'ledger.json') {
+      const e = new Error('injected mirror failure');
+      e.code = 'EIO';
+      throw e;
+    }
+    return origRename(a, b);
+  };
+  let failed;
+  try {
+    failed = refusal(callTool(conn, 'defect.add', envelopeFor(open, { item: { severity: 'high', summary: 'tool binding' } })));
+  } finally {
+    fs.renameSync = origRename;
+  }
+  assert.strictEqual(failed.error, 'WriteFailed');
+  const slot = readIntent(repo);
+  assert.strictEqual(slot.tool, 'defect.add');
+  slot.tool = 'defect.resolve'; // a known tool — just not the one this receipt earned
+  fs.writeFileSync(state.intentPath(repo), wal.serializeRecord(slot));
+  const before = storeSnapshot(repo);
+  assert.throws(() => triggerRecovery(repo), (e) => Boolean(e) && e.code === 'ERATCHETMIRROR',
+    'an after-image receipt must carry the tool the intent names');
+  assert.deepStrictEqual(storeSnapshot(repo), before, 'nothing moved under the contradiction');
+});
+
+ok('W3 an exact repeat over a stale mirror commits once and trues status, severity, and summary', () => {
+  const repo = fixture('w3');
+  initStore(repo);
+  const added = settled(() => artifacts.addDefect(repo, { severity: 'high', summary: 'truth drifts' }));
+  settled(() => artifacts.transitionDefect(repo, added.state.id, 'resolved', { evidence: 'fixed', note: 'resolved: fixed' }));
+  const ledgerId = readState(repo).defects[0].ledgerId;
+  const ledger = readLedger(repo);
+  const row = ledger.defects.find((d) => d.id === ledgerId);
+  row.status = 'open';
+  row.severity = 'low';
+  row.summary = 'STALE SUMMARY';
+  fs.writeFileSync(state.ledgerPath(repo), wal.serializeRecord(ledger));
+  const repeat = settled(() => artifacts.transitionDefect(repo, added.state.id, 'resolved', { evidence: 'fixed', note: 'resolved: fixed' }));
+  assert.strictEqual(repeat.status, 'resolved');
+  const trued = readLedger(repo).defects.find((d) => d.id === ledgerId);
+  assert.deepStrictEqual(
+    { status: trued.status, severity: trued.severity, summary: trued.summary },
+    { status: 'resolved', severity: 'high', summary: 'truth drifts' },
+    'the one committed repeat trues every axis the spec projection names');
+  const settledBytes = storeSnapshot(repo);
+  settled(() => artifacts.transitionDefect(repo, added.state.id, 'resolved', { evidence: 'fixed', note: 'resolved: fixed' }));
+  assert.deepStrictEqual(storeSnapshot(repo), settledBytes, 'once truthful, the repeat is a no-op again');
+});
+
+ok('W4 doctor observes a pending slot without recovering it', () => {
+  const repo = fixture('w4');
+  craftedSlot(repo, 'after-state'); // recoverable: the mirror is owed
+  const before = storeSnapshot(repo);
+  const run = childProcess.spawnSync(process.execPath, [path.join(__dirname, '..', 'bin', 'ratchet'), 'doctor'],
+    { cwd: repo, encoding: 'utf8', env: cleanGitEnv(), windowsHide: true });
+  assert.match(String(run.stdout), /pending/i, 'doctor names the slot it sees');
+  assert.deepStrictEqual(storeSnapshot(repo), before, 'diagnosis moved zero bytes — doctor never recovers');
+});
+
+ok('W5 a resource read over an unreadable ledger refuses conservatively and writes nothing', () => {
+  const repo = initRepo('w5');
+  const conn = service([repo], true).createConnection();
+  const open = openWorkspace(conn, repo);
+  craftedSlot(repo); // occupy the slot so the store is mid-story
+  fs.writeFileSync(state.ledgerPath(repo), '{ this is not a record');
+  const files = () => fs.readdirSync(state.projectDir(repo)).filter((n) => n !== '.lock' && !n.includes('.tmp-')).sort();
+  const filesBefore = files();
+  const ledgerBytes = bytesOf(state.ledgerPath(repo));
+  const res = modern(conn, 'resources/read', { uri: open.resources.ledger });
+  assert.ok(res.error, 'an unprovable ledger is a refusal, not a fresh projection');
+  assert.strictEqual(res.error.message, mcp.WRITE_REFUSALS.MirrorUnrecoverable,
+    'the refusal speaks the allowlisted sentence, never a store path');
+  assert.deepStrictEqual(files(), filesBefore, 'the read created no backup, no fresh record, no residue');
+  assert.ok(ledgerBytes.equals(bytesOf(state.ledgerPath(repo))), 'the unreadable bytes are untouched');
+});
+
+ok('W6 clear verifies the slot it deletes is the slot it proved', () => {
+  const repo = fixture('w6');
+  craftedSlot(repo); // before/before: recovery would discard, then clear
+  const slotFile = state.intentPath(repo);
+  const substitute = Object.assign(readIntent(repo), { operationId: 'wal-substituted-operation' });
+  const origRead = fs.readFileSync;
+  let swapped = false;
+  fs.readFileSync = function (file, ...rest) {
+    const out = origRead.call(fs, file, ...rest);
+    if (!swapped && String(file) === slotFile) {
+      swapped = true; // swap AFTER recovery has read and proven the original
+      fs.writeFileSync(slotFile, wal.serializeRecord(substitute));
+    }
+    return out;
+  };
+  try {
+    assert.throws(() => triggerRecovery(repo), (e) => Boolean(e) && e.code === 'ERATCHETMIRROR',
+      'deleting bytes that no longer match the proven slot is ambiguous, not a clear');
+  } finally {
+    fs.readFileSync = origRead;
+  }
+  assert.strictEqual(readIntent(repo).operationId, 'wal-substituted-operation',
+    'the substituted slot survived the refused clear');
+});
+
+// ---------------------------------------------------------------------------
 
 process.stdout.write(`\n${passed} passed, ${failures.length} failed\n`);
 if (failures.length) {

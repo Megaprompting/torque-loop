@@ -804,22 +804,16 @@ function cmdDoctor(cwd, asJson) {
   }
   add('every skills/*/SKILL.md has frontmatter + description', skillProblems.length === 0, skillProblems.join('; '));
 
-  let stateDetail = '';
-  let stateOk = true;
-  try {
-    state.initProject(cwd);
-    stateDetail = state.projectDir(cwd);
-  } catch (e) {
-    stateOk = false;
-    stateDetail = e.message;
-  }
-  add('state dir writable', stateOk, stateDetail);
-
-  // 4b WAL slot — read-only diagnosis, never a repair. A recoverable slot is
-  // informational (any supported write recovers it on its way in); a slot
-  // strict recovery cannot prove legal is the operator's, by name.
+  // 4b WAL slot — read-only diagnosis, never a repair, and it goes FIRST:
+  // initProject below acquires the workspace lock, whose choke point RUNS
+  // recovery — doctor observing a slot through that door would consume the
+  // very thing it reports. A recoverable slot is informational (any supported
+  // write recovers it on its way in); a slot strict recovery cannot prove
+  // legal is the operator's, by name.
+  let slotPending = false;
   try {
     const slot = state.diagnoseIntent(cwd);
+    slotPending = Boolean(slot.pending);
     if (!slot.pending) add('WAL intent slot', true, 'no pending intent');
     else if (slot.verdict === 'ambiguous') {
       add('WAL intent slot', false,
@@ -833,8 +827,27 @@ function cmdDoctor(cwd, asJson) {
       add('WAL intent slot', true, `pending intent, ${meaning[slot.verdict] || slot.verdict}`);
     }
   } catch (e) {
+    slotPending = true; // an undiagnosable slot is still a slot — do not recover it
     add('WAL intent slot', false, e.message);
   }
+
+  // The writability probe runs initProject, and the lock it takes would
+  // recover a pending slot on its way in — so under a pending slot the probe
+  // defers instead of quietly consuming the evidence doctor just reported.
+  let stateDetail = '';
+  let stateOk = true;
+  if (slotPending) {
+    stateDetail = 'deferred — a pending WAL intent is reported above, and this probe would recover it';
+  } else {
+    try {
+      state.initProject(cwd);
+      stateDetail = state.projectDir(cwd);
+    } catch (e) {
+      stateOk = false;
+      stateDetail = e.message;
+    }
+  }
+  add('state dir writable', stateOk, stateDetail);
 
   let snapOk = true;
   let snapDetail = '';

@@ -239,9 +239,10 @@ function mirrorOpFor(ledger, defect, now, mintId) {
   const linked = String(defect.ledgerId || '');
   const matches = linked ? (ledger.defects || []).filter((x) => x && x.id === linked) : [];
   if (matches.length === 1) {
-    // The mirror follows the record on both axes the transitions own; carrying
-    // an unchanged value is a no-op inside the same replace.
-    const after = { ...matches[0], severity: defect.severity, status: defect.status || 'open', updatedAt: now };
+    // The mirror follows the record on every axis the spec projection names —
+    // status, severity, summary; carrying an unchanged value is a no-op inside
+    // the same replace.
+    const after = { ...matches[0], severity: defect.severity, summary: defect.summary, status: defect.status || 'open', updatedAt: now };
     return { collection: 'defects', id: linked, mode: 'replace', after };
   }
   const mirror = {
@@ -427,8 +428,13 @@ function prepareDefectTransition(s, ledger, id, toStatus, meta, mintId) {
   if (from === toStatus) {
     const [recorded, offered] = transitionProof(d, toStatus, meta_);
     const linked = String(d.ledgerId || '');
+    // Valid means TRUTHFUL, not merely linked: one mirror row that agrees on
+    // every axis the projection names. A stale-but-unique row would otherwise
+    // pass as valid forever, and the no-op below would refuse to repair it.
+    const rows = ledger ? (ledger.defects || []).filter((x) => x && x.id === linked) : [];
     const mirrorValid = ledger
-      ? linked && (ledger.defects || []).filter((x) => x && x.id === linked).length === 1
+      ? Boolean(linked) && rows.length === 1 &&
+        rows[0].status === (d.status || 'open') && rows[0].severity === d.severity && rows[0].summary === d.summary
       : true;
     if (recorded === offered && mirrorValid) {
       // The exact repeat, mirror already truthful: no log line, no history, no
@@ -442,8 +448,8 @@ function prepareDefectTransition(s, ledger, id, toStatus, meta, mintId) {
           'replace the original. Reopen it first if the recorded proof is wrong.'
       );
     }
-    // Exact repeat but the mirror is missing or ambiguous: commit once solely
-    // to perform the D2b admission below.
+    // Exact repeat but the mirror is missing, ambiguous, or stale: commit once
+    // solely to perform the D2b admission (or the in-place truing) below.
   }
 
   d.status = toStatus;

@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **4b.3 review round (independent Codex verification, verdict "NO" on six contract
+  gaps — all six accepted, fixed red-first; three claim-wording findings ruled
+  not-defects).** All CLI-enforced, each with a falsifier (W1–W6) seen red against
+  `main @ b029c81` before its fix:
+  - **Strict slots decode strictly (W1):** `parseIntent` now uses a fatal UTF-8 decode;
+    a slot with invalid bytes refuses as unrecoverable instead of being lossily
+    normalized into an operationId nobody published — and then cleared.
+  - **The receipt must carry the intent's tool (W2):** `validateMirrorReceipt` compares
+    `receipt.tool` to `intent.tool`; a post-state slot whose tool contradicts the
+    receipt it names is ambiguous, never completed.
+  - **Mirror validity means agreement, not linkage (W3):** the spec projection carries
+    status, severity, AND summary. The transition mirror op now writes all three
+    (summary was dropped), and the exact-repeat validity check compares all three
+    instead of counting linked rows — a stale-but-unique mirror is now trued by one
+    committed repeat, then repeats no-op again.
+  - **Doctor observes without recovering (W4):** the WAL diagnosis now runs BEFORE the
+    writability probe, and under a pending slot the probe defers — previously doctor's
+    own `initProject` lock acquisition ran recovery, consumed the slot, and reported
+    "no pending intent" about the store it had just changed.
+  - **Resource reads are byte-pure, enforced (W5):** the MCP read paths (state/ledger
+    resources, the receipt resource, `score.confidence`) now use pure peeks that never
+    create, back up, or reinitialize a record; an unprovable record answers the one
+    allowlisted MirrorUnrecoverable sentence. Previously a resource read over a
+    malformed ledger wrote a `.corrupt` backup file — a write on a read path.
+  - **CLEAR re-checks identity (W6):** the slot delete (spec CLEAR step) re-reads the
+    slot and refuses if the bytes are not the bytes this pass proved — on both the
+    transaction's own clear and recovery's fenced clear.
+  - Ruled NOT defects, on the record: pre-commit `.tmp-` residue (documented inert by
+    design in 4b.1), CLI/MCP byte-equality (ids and receipts differ by ratified
+    design), and the MCP retry wording (the spec deliberately gives MCP the generic
+    `WriteFailed`; the CLI carries the "re-run" sentence). S20's loader count was
+    updated to the new peek — the one-snapshot contract it pins is unchanged and it
+    now additionally pins that reads never touch the creating loader.
+
+<!-- Traced by: claude-fable-5 -->
+
 ### Added
 
 - **Known limitation (parked, owner: Danny): a host-environment hold can stall the
