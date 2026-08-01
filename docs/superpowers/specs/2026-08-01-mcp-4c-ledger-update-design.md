@@ -1,6 +1,6 @@
 # MCP Step 4c: `ledger.update` — the second single-file safe core
 
-Date: 2026-08-01 (rev 11)
+Date: 2026-08-01 (rev 12)
 Base: `main` at `284c265` (step 4b + the hardening trilogy #38/#39/#40 merged; #40
 carries the discrimination tests the verification boxes lean on)
 Branch: `feat/mcp-4c-ledger-update`
@@ -20,8 +20,8 @@ complete receipt-row typing, the open zero-byte claim scoped to the post-recover
 baseline, the packaged-surface checklist gaps (CLI help, qa-ledger skill, README,
 fixture truth), `ledgerRev: integer | null` typing for the v1 no-op, and
 integer-only `StaleLedgerRev` → five-voice round 3 on rev 5: DO-NOT-RATIFY, nine
-findings, all accepted, all patched in this rev — headline: THREE ARE LIVE IN THE
-SHIPPED SAFE CORE (prototype-unsafe canonicalizer permitting false replay; UTF-16
+findings, all accepted, all patched in this rev — headline: THREE WERE THEN LIVE
+IN THE SHIPPED SAFE CORE (since repaired by #38/#39) (prototype-unsafe canonicalizer permitting false replay; UTF-16
 receipt-cap predicate; unsafe-integer state revisions), recorded in the defects
 section below with routing owed to Danny. Spec-side: prototype-safe + iterative
 canonicalization mandated, byte-measured caps on both rings, enumerated persisted
@@ -102,7 +102,21 @@ must be re-read whole); plain `ratchet doctor` (`cmdDoctor`) is named as the rou
 carrying the new operator rows via a shared strict helper, with `doctor
 cold-start` explicitly unchanged; and 4c.1's roster mechanics are stated (existing
 name-array assertions go to nineteen in 4c.1; the enum widens and the whole-object
-fixture lands in 4c.2). Gate remaining: five-voice round 9 on this rev, then 4c.1.
+fixture lands in 4c.2). → five-voice round 9 on rev 11: DO-NOT-RATIFY with one medium and two lows, zero
+structural — the doctor routing and the 4c.1/4c.2 staging (the final structural
+claims) both graded HOLDS; the residue (a fixture-sweep sentence omitting two
+contributors its own inventory named, two summary phrases still in present tense,
+one four-line citation drift) is absorbed in this rev.
+
+REVIEW LOOP CLOSED AT THE GATE (ruling, on the record): nine rounds, 54 findings,
+every one accepted or rejected with tree evidence; no round produced a RATIFY, and
+the ruling is that none will — the last three rounds' findings were sentence
+precision against a mechanism whose every structural claim has now graded HOLDS on
+independent review. The marginal round costs more than it finds. 4c.1 proceeds on
+this rev; its red-first falsifiers and crash matrix are the next reviewers, and a
+round 10 remains one dispatch away if Danny wants the prose swept again. Scope of
+this ruling: it closes the PRE-CODE design gate only — the 4c.3 adversarial pass
+on the BUILT code remains a named, non-negotiable step.
 
 ## Objective
 
@@ -150,7 +164,8 @@ analogue here: the ledger is either the before-bytes or the after-bytes.
   missing canonical bytes can come back as a fresh ledger. 4b banned that repairing
   path from recovery; the same ban must cover a wire write's decision basis.
 - `workspace.open` itself calls that repairing `loadLedger` inside its lock hold
-  (`server.js:1153-1156`), and `readJsonResilient`'s malformed branch is
+  (the `openWorkspace` handler's locked snapshot, `server.js:1175-1178` in the
+  reviewed base — cite the handler, the line drifts), and `readJsonResilient`'s malformed branch is
   backup-then-reinitialize (`state.js` `backupCorrupt`). So today the WIRE's own
   initialization boundary can silently replace damaged ledger bytes with a fresh
   record and then issue a handle over it — the rev 1 review's D5 finding, and the hole
@@ -580,9 +595,12 @@ identical retry must fail identically):
   record whose stored id leaves NO valid composition under the cap is not
   receiptable over the wire (the CLI, which persists no receipt, remains its
   route). "Non-retryable" means: unchanged envelope, unchanged verdict. Near-cap
-  fixtures sweep operationId, generation, and revision widths as well as accepted
-  clocks, proving the verdict moves only with the composition, never with the
-  environment. The
+  fixtures sweep EVERY variable contributor the inventory names — operationId,
+  generation, and revision widths, BOTH collection enum values (three bytes apart),
+  and serialized `recordId` width including JSON escape expansion — as well as
+  accepted clocks, proving the verdict moves only with the composition, never with
+  the environment (round-9 completion: the sweep sentence had omitted two
+  contributors its own inventory listed). The
   outcome mapping is explicit: for `ledger.update`, the `capOverflow` outcome maps
   to `ReceiptTooLarge`, never to retryable `WriteFailed`. The state-side writers
   keep today's `WriteFailed` mapping for the identical condition — a known
@@ -940,8 +958,8 @@ admission fix graded HOLDS; seven findings, all accepted at the gate, none touch
 ratified decision point.
 Rev 5 patches (all seven) traced by: claude-fable-5
 Five-voice round 3 on rev 5: openai-codex (gpt-5.6-sol), 2026-08-01 — DO-NOT-RATIFY;
-nine findings, all accepted; three are live shipped-core defects (canonicalizer
-verified against ops.js:46 before this rev).
+nine findings, all accepted; three were live shipped-core defects at the time
+(canonicalizer verified against ops.js:46 before this rev; all since repaired).
 Rev 6 patches (all nine) traced by: claude-fable-5
 Shipped-core routing: Danny ruled hardening-first; PR #38 landed, round 4 proved it
 incomplete, PR #39 completed it (both merged, CI 6/6, falsifiers red-first).
@@ -963,4 +981,9 @@ Five-voice round 8 on rev 10: openai-codex (gpt-5.6-sol), 2026-08-01 —
 DO-NOT-RATIFY; no critical, no high; staging and doctor inventory HOLD; two medium
 + two low, all accepted (the compositional counterexample reproduced).
 Rev 11 patches (all four) traced by: claude-fable-5
-Awaiting: five-voice round 9 on rev 11 → then 4c.1.
+Five-voice round 9 on rev 11: openai-codex (gpt-5.6-sol), 2026-08-01 —
+DO-NOT-RATIFY; one medium, two lows, zero structural; doctor routing and staging
+HOLD. (The round's first dispatch hung silent 30 minutes and was idle-killed; the
+verdict came from a softened fresh-session re-dispatch.)
+Rev 12 patches (all three) + the gate-closure ruling traced by: claude-fable-5
+Next: 4c.1 build on this rev; 4c.3 adversarial pass on the built code stands.
