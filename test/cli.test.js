@@ -1657,20 +1657,35 @@ ok('state append cannot mint artifacts or defects behind their gates', () => {
   assert.strictEqual(s.defects.length, 0);
 });
 
-ok('the ledger defect mirror is written by transitions, not by hand', () => {
+// 4c D3 widened the exclusion (named CHANGELOG behavior change): the old gate
+// blocked only a hand-written status while severity and summary stayed
+// editable — family ownership with a side door is not ownership. The whole
+// collection now refuses outright on the CLI door; the status-only gate
+// remains beneath it as backstop.
+ok('ledger update cannot address the defect mirror at all; transitions still can', () => {
   state.initProject(cwd, { force: true });
   artifacts.addArtifact(cwd, { title: 'only', kind: 'spec' });
   const { state: d } = artifacts.addDefect(cwd, { severity: 'high', summary: 'mirror gate' });
   assert.throws(
     () => cli.run(['node', 'ratchet', 'ledger', 'update', 'defects', `{"id":"${d.ledgerId}","status":"resolved"}`]),
-    /status/
+    /defect verbs/
   );
-  assert.strictEqual(state.loadLedger(cwd).defects.find((x) => x.id === d.ledgerId).status, 'open', 'the mirror held');
+  // Not just status: a generic edit to ANY owned field refuses — the mirror
+  // projection owns status, severity, and summary end-to-end.
+  assert.throws(
+    () => cli.run(['node', 'ratchet', 'ledger', 'update', 'defects', `{"id":"${d.ledgerId}","severity":"low"}`]),
+    /defect verbs/
+  );
+  const mirrored = state.loadLedger(cwd).defects.find((x) => x.id === d.ledgerId);
+  assert.strictEqual(mirrored.status, 'open', 'the mirror held');
+  assert.strictEqual(mirrored.severity, 'high', 'severity held too');
   // the internal transition sync path still works
   cli.run(['node', 'ratchet', 'defect', 'resolve', d.id, '--evidence', 'fixed and re-run']);
   assert.strictEqual(state.loadLedger(cwd).defects.find((x) => x.id === d.ledgerId).status, 'resolved');
-  // non-status ledger writes are untouched
+  // family collections are untouched by the exclusion
   assert.doesNotThrow(() => cli.run(['node', 'ratchet', 'ledger', 'update', 'features', '{"name":"router"}']));
+  // the shared core refuses beneath the CLI door too — one meaning, layered
+  assert.throws(() => ledger.upsert(cwd, 'defects', { id: d.ledgerId, summary: 'rewritten' }), /defect verbs/);
 });
 
 // --- proof binding (0.8 Closure Gate) ---------------------------------------

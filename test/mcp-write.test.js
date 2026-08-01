@@ -267,6 +267,8 @@ const APERTURE_DIMS = ['ambiguity', 'terrain', 'taste', 'blastRadius', 'reversib
 const WRITE_ROSTER = [
   'workspace.open', 'workspace.scan', 'score.confidence', 'score.friction',
   'state.set', ...SESSION_VERBS, ...ARTIFACT_VERBS, ...MIRROR_VERBS,
+  // 4c: the second single-file safe core, appended in advertised order.
+  'ledger.update',
 ];
 
 ok('W1 a flagless server registers no write tools and cannot dispatch one', () => {

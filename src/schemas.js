@@ -5,7 +5,7 @@
 const crypto = require('crypto');
 
 const STATE_VERSION = 1;
-const LEDGER_VERSION = 1;
+const LEDGER_VERSION = 2;
 
 // The GENERATION of a record: which incarnation of this store it belongs to. A
 // wipe starts a new one, and a delta computed against a previous generation must
@@ -21,6 +21,30 @@ const LEDGER_VERSION = 1;
 // same shape, same source of randomness.
 function newGeneration() {
   return `gen-${Date.now().toString(36)}-${crypto.randomBytes(8).toString('hex')}`;
+}
+
+// The ledger's own lineage name (4c). Distinct prefix on purpose: a state
+// generation copied into a ledger (or the reverse) must fail the format check
+// rather than alias a lineage it never named. Bounded at mint AND at load
+// (LEDGER_GEN_MAX_BYTES) so a stored gen can never overflow the receipts that
+// embed it — the bound is what makes the receipt-cap verdict a function of the
+// request, not of the store.
+const LEDGER_GEN_MAX_BYTES = 64;
+
+function newLedgerGeneration() {
+  return `lgen-${Date.now().toString(36)}-${crypto.randomBytes(8).toString('hex')}`;
+}
+
+// Format check for a STORED ledger generation: the minted shape above —
+// `lgen-` prefix, lowercase base36/hex charset — within the byte bound. A
+// prefix-plus-non-empty check admitted an arbitrarily long gen (round-6
+// finding), which then overflowed receipts through no fault of the request.
+function isLedgerGeneration(value) {
+  return (
+    typeof value === 'string' &&
+    /^lgen-[0-9a-z]+-[0-9a-f]+$/.test(value) &&
+    Buffer.byteLength(value, 'utf8') <= LEDGER_GEN_MAX_BYTES
+  );
 }
 
 function nowIso(clock) {
@@ -76,11 +100,23 @@ function newLedger(clock) {
   const t = nowIso(clock);
   return {
     version: LEDGER_VERSION,
+    // The ledger's own revision line (4c): advanced by exactly one on every
+    // committed update-family write, monotonic within a lineage. WAL mirror
+    // publishes are rev-silent by rule (D2) — they change only records the
+    // family cannot reach.
+    ledgerRev: 0,
+    // Which incarnation of this ledger the record belongs to. Every creation
+    // and every wipe mints a fresh one, so a recreated ledger can never
+    // CAS-match an expectation formed against the old lineage.
+    ledgerGen: newLedgerGeneration(),
     createdAt: t,
     updatedAt: t,
     features: [], // { id, name, area, workflow, routes, status }
     tests: [], // { id, feature, name, kind, status, lastRun }
     defects: [], // { id, feature, severity, summary, status, foundAt }
+    // The ledger's receipt ring, same contract as state.operations: a receipt
+    // exists iff the write that earned it landed, because both ride one rename.
+    operations: [],
   };
 }
 
@@ -168,9 +204,137 @@ const ARTIFACT_RESERVED_FIELDS = [
   'supersededBy',
 ];
 
+// ---------------------------------------------------------------------------
+// The strict ledger validation matrix (4c). One contract for the loader, the
+// doctor, AND the fixtures: exactly two admissible shapes, everything else
+// unprovable. It REFUSES rather than repairs because every door that consults
+// it (wire write, CLI update, workspace.open) has sworn off inventing a fresh
+// ledger over damaged bytes.
+// ---------------------------------------------------------------------------
+
+const LEDGER_OPERATIONS_CAP = 32;
+const LEDGER_RECEIPT_ENTRY_CAP = 4096;
+// The update family's collections: defects is NOT a member (D3) — the state
+// defect family owns the mirror end-to-end, on both doors, permanently.
+const LEDGER_FAMILY_COLLECTIONS = ['features', 'tests'];
+
+const LEDGER_V1_KEYS = ['version', 'createdAt', 'updatedAt', 'features', 'tests', 'defects'];
+const LEDGER_V2_KEYS = [...LEDGER_V1_KEYS, 'ledgerRev', 'ledgerGen', 'operations'];
+const LEDGER_RECEIPT_KEYS = ['id', 'tool', 'argsHash', 'gen', 'rev', 'at', 'result'];
+const LEDGER_RESULT_KEYS = ['ok', 'committed', 'replayed', 'ledgerRev', 'collection', 'recordId', 'action'];
+
+// The canonical receipt stamp: exactly the 24-byte YYYY-MM-DDTHH:MM:SS.mmmZ
+// form. An exact WIDTH, not a ceiling — a variable-width stamp lets the
+// environment (RATCHET_NOW) flip an identical request between accept and
+// ReceiptTooLarge (round-7 counterexample), so every accepted clock value
+// must contribute the same bytes.
+const LEDGER_STAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+
+function isPlainRecord(v) {
+  return Boolean(v) && typeof v === 'object' && !Array.isArray(v);
+}
+
+function hasExactKeys(obj, keys) {
+  const own = Object.keys(obj);
+  return own.length === keys.length && keys.every((k) => Object.prototype.hasOwnProperty.call(obj, k));
+}
+
+function isCollectionOfRecords(list) {
+  return Array.isArray(list) && list.every(isPlainRecord);
+}
+
+// Verdict: { ok: true, version } or { ok: false, row, detail }. `row` names
+// the failing matrix row so the doctor can print the exact local diagnosis
+// (and its repair) while the wire keeps its one sentence.
+function validateLedgerRecord(obj) {
+  const bad = (row, detail) => ({ ok: false, row, detail });
+  if (!isPlainRecord(obj)) return bad('record', 'not a JSON object record');
+  if (obj.version !== 1 && obj.version !== 2) return bad('version', `unknown ledger version ${JSON.stringify(obj.version)}`);
+  if (obj.version === 1) {
+    // A v1 record carrying ANY lineage field — including a user-invented
+    // `operations` key — is a HYBRID: admission must never adopt fields it
+    // did not mint.
+    if (!hasExactKeys(obj, LEDGER_V1_KEYS)) {
+      return bad('keys', 'a version-1 ledger carries exactly the six version-1 keys — a lineage field on version 1 is a hybrid');
+    }
+  } else if (!hasExactKeys(obj, LEDGER_V2_KEYS)) {
+    return bad('keys', 'a version-2 ledger carries exactly the version-1 keys plus ledgerRev, ledgerGen, operations');
+  }
+  for (const k of ['createdAt', 'updatedAt']) {
+    if (typeof obj[k] !== 'string' || !obj[k]) return bad('timestamps', `${k} is not a non-empty string`);
+  }
+  for (const k of ['features', 'tests', 'defects']) {
+    if (!isCollectionOfRecords(obj[k])) return bad('collections', `${k} is not an array of plain objects`);
+  }
+  if (obj.version === 1) return { ok: true, version: 1 };
+
+  // A record AT Number.MAX_SAFE_INTEGER is matrix-VALID and read-servable;
+  // only a mutating commit atop it refuses (LedgerRevisionExhausted).
+  if (!Number.isSafeInteger(obj.ledgerRev) || obj.ledgerRev < 0) {
+    return bad('ledgerRev', 'ledgerRev is not a non-negative safe integer');
+  }
+  if (!isLedgerGeneration(obj.ledgerGen)) {
+    return bad('ledgerGen', `ledgerGen is missing, over ${LEDGER_GEN_MAX_BYTES} bytes, or not in the generated format`);
+  }
+  if (!Array.isArray(obj.operations) || obj.operations.length > LEDGER_OPERATIONS_CAP) {
+    return bad('operations', `operations is not an array of at most ${LEDGER_OPERATIONS_CAP} entries`);
+  }
+  const seenIds = new Set();
+  let lastRev = 0;
+  for (const entry of obj.operations) {
+    if (!isPlainRecord(entry) || !hasExactKeys(entry, LEDGER_RECEIPT_KEYS)) {
+      return bad('ring', 'a receipt entry does not carry exactly the receipt keys');
+    }
+    if (typeof entry.id !== 'string' || !/^[A-Za-z0-9_-]{22,128}$/.test(entry.id)) {
+      return bad('ring', 'a receipt id is not a valid operationId');
+    }
+    // Duplicate ids would make replay depend on which `find` wins.
+    if (seenIds.has(entry.id)) return bad('ring', 'duplicate receipt ids in the ring');
+    seenIds.add(entry.id);
+    if (entry.tool !== 'ledger.update') return bad('ring', `a receipt names a tool outside the family: ${JSON.stringify(entry.tool)}`);
+    if (typeof entry.argsHash !== 'string' || !/^sha256:[0-9a-f]{64}$/.test(entry.argsHash)) {
+      return bad('ring', 'a receipt argsHash is not a sha256 binding');
+    }
+    if (entry.gen !== obj.ledgerGen) return bad('ring', 'a receipt names a generation other than the record\'s own');
+    if (!Number.isSafeInteger(entry.rev) || entry.rev <= 0 || entry.rev > obj.ledgerRev) {
+      return bad('ring', 'a receipt revision is not a positive safe integer within the record\'s own ledgerRev');
+    }
+    if (entry.rev <= lastRev) return bad('ring', 'ring revisions are not unique and strictly increasing');
+    lastRev = entry.rev;
+    if (typeof entry.at !== 'string' || !LEDGER_STAMP_PATTERN.test(entry.at)) {
+      return bad('ring', 'a receipt stamp is not the canonical 24-byte UTC form');
+    }
+    const r = entry.result;
+    // Receipts persist only committed live results: a stored replayed:true or
+    // committed:false is unprovable.
+    if (!isPlainRecord(r) || !hasExactKeys(r, LEDGER_RESULT_KEYS)) {
+      return bad('ring', 'a receipt result does not carry exactly the persisted success keys');
+    }
+    if (r.ok !== true || r.committed !== true || r.replayed !== false) {
+      return bad('ring', 'a receipt result is not a committed live success');
+    }
+    if (r.ledgerRev !== entry.rev) return bad('ring', 'a receipt result names a revision other than its entry');
+    if (!LEDGER_FAMILY_COLLECTIONS.includes(r.collection)) return bad('ring', 'a receipt result names a collection outside the family');
+    if (typeof r.recordId !== 'string' || !r.recordId) return bad('ring', 'a receipt result recordId is not a non-empty string');
+    if (r.action !== 'created' && r.action !== 'updated') return bad('ring', 'a receipt result action is not created|updated');
+    if (Buffer.byteLength(JSON.stringify(entry), 'utf8') > LEDGER_RECEIPT_ENTRY_CAP) {
+      return bad('ring', `a receipt entry exceeds ${LEDGER_RECEIPT_ENTRY_CAP} UTF-8 bytes`);
+    }
+  }
+  return { ok: true, version: 2 };
+}
+
 module.exports = {
   STATE_VERSION,
   LEDGER_VERSION,
+  LEDGER_GEN_MAX_BYTES,
+  LEDGER_OPERATIONS_CAP,
+  LEDGER_RECEIPT_ENTRY_CAP,
+  LEDGER_FAMILY_COLLECTIONS,
+  LEDGER_STAMP_PATTERN,
+  newLedgerGeneration,
+  isLedgerGeneration,
+  validateLedgerRecord,
   nowIso,
   newGeneration,
   newState,

@@ -28,6 +28,7 @@ process.env.RATCHET_EVOLVE_LOG = path.join(tmp, 'evolve-log.jsonl');
 const mcp = require('../src/mcp/server');
 const stdio = require('../src/mcp/stdio');
 const state = require('../src/state');
+const ledgerMod = require('../src/ledger');
 
 const META = 'io.modelcontextprotocol/';
 const MODERN = '2026-07-28';
@@ -638,9 +639,8 @@ ok('S19 score.confidence deep-equals ratchet score confidence --json once its MC
   snapshot.artifacts = [{ id: 'art-1', title: 'spec', kind: 'spec', status: 'v1', holes: ['one hole'] }];
   snapshot.defects = [{ id: 'def-1', artifact: 'art-1', severity: 'high', status: 'open', title: 'unproven' }];
   state.saveState(repo, snapshot);
-  const ledger = state.loadLedger(repo);
-  ledger.features = [{ id: 'feat-1', name: 'derived reads', evidence: 'src/mcp/server.js' }];
-  state.saveLedger(repo, ledger);
+  // 4c: seeded through the family door — saveLedger is privatized.
+  ledgerMod.upsert(repo, 'features', { id: 'feat-1', name: 'derived reads', evidence: 'src/mcp/server.js' });
 
   const opened = payload(openWorkspace(conn, repo));
   const wire = payload(callTool(conn, 'score.confidence', { workspaceHandle: opened.workspaceHandle }));

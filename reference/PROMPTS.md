@@ -528,6 +528,10 @@ Then identify:
 5. The smallest fix likely to improve user trust.
 
 Do not declare coverage complete unless every route, screen, workflow, and API interaction has evidence.
+
+Routing rule: defect records enter and change ONLY through the defect verbs
+(defect add / resolve / reopen / supersede); ledger update addresses features and tests.
+A generic edit to the defect mirror would make it lie about the record it mirrors.
 ```
 
 ---

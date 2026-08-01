@@ -47,11 +47,20 @@ function assemble(cwd = process.cwd(), opts = {}) {
   // cold read keeps its resilient loaders — it may be the first touch ever.
   const s = opts.peek ? state.peekState(cwd) : state.loadState(cwd);
   let ledger = {};
+  // The ledger's lineage (4c) rides the one cold read beside everything else:
+  // persisted fields for a version-2 ledger, explicit nulls (plus the bytes
+  // hash an admission write echoes back) for version 1 — emptiness stated.
+  let ledgerLineage = { ledgerRev: null, ledgerGen: null };
   if (opts.peek) {
-    ledger = state.peekLedger(cwd);
+    // One read serves the projection AND the hash it certifies — a second
+    // read for the hash could describe different bytes than the parse.
+    const raw = state.peekLedgerRaw(cwd);
+    ledger = raw.parsed;
+    ledgerLineage = state.ledgerLineage(raw.parsed, raw.bytes);
   } else {
     try {
       ledger = state.loadLedger(cwd);
+      ledgerLineage = state.ledgerLineageAt(cwd);
     } catch (_e) {
       ledger = {};
     }
@@ -220,6 +229,7 @@ function assemble(cwd = process.cwd(), opts = {}) {
 
   return {
     validAsOf: s.updatedAt || '',
+    ...ledgerLineage,
     target: {
       locked: Boolean(s.objective && String(s.objective).trim()),
       objective: s.objective || '',

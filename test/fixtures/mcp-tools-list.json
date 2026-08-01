@@ -34,6 +34,21 @@
         "stateGen": {
           "type": "string"
         },
+        "ledgerRev": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "ledgerGen": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ledgerBytesHash": {
+          "type": "string"
+        },
         "pendingIntent": {
           "type": "boolean"
         },
@@ -64,6 +79,8 @@
         "worktreeId",
         "stateRev",
         "stateGen",
+        "ledgerRev",
+        "ledgerGen",
         "pendingIntent",
         "resources"
       ],

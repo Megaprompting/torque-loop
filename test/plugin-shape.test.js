@@ -430,6 +430,24 @@ ok('the MCP prompt surface is derived from PROMPTS.md, not remembered (drift gua
   }
 });
 
+ok('qa-ledger routes defects through the defect verbs on both guidance surfaces (4c D3)', () => {
+  // Both directions, deliberately: a negative-only test passes when all the
+  // useful guidance is deleted. The refused spelling must appear in NEITHER
+  // surface AND the prescribed route commands must appear in BOTH.
+  const surfaces = { 'skills/qa-ledger/SKILL.md': read('skills/qa-ledger/SKILL.md'), 'reference/PROMPTS.md': read('reference/PROMPTS.md') };
+  for (const [rel, text] of Object.entries(surfaces)) {
+    assert.ok(!/ledger update defects/.test(text), `${rel} must not teach the refused spelling "ledger update defects"`);
+  }
+  const skill = surfaces['skills/qa-ledger/SKILL.md'];
+  for (const route of ['defect add', 'defect resolve', 'defect reopen', 'defect supersede']) {
+    assert.ok(skill.includes(route), `skills/qa-ledger/SKILL.md prescribes the real route: ${route}`);
+  }
+  assert.ok(/defect verbs/i.test(surfaces['reference/PROMPTS.md']),
+    'the canonical qa-ledger prompt states the routing rule');
+  assert.ok(/ledger update addresses features and tests/i.test(surfaces['reference/PROMPTS.md']),
+    'and names what ledger update does address');
+});
+
 ok('the graph README parks the aperture cross-links instead of smuggling them in', () => {
   // The honest-scope boundary is load-bearing: the derived graph deliberately omits the
   // aperture cross-links (a separate repo, never adversarially attacked) and documents that

@@ -420,9 +420,23 @@ function cmdLedger(cwd, sub, rest, asJson) {
     case 'update': {
       assertMayWrite('ledger update');
       const [collection, payloadArg] = rest;
+      // D3, refused before the payload is even parsed: the defect mirror is
+      // the defect family's, on both doors. (The shared core refuses too —
+      // this door just names the route while the arguments are still cheap.)
+      if (collection === 'defects') {
+        throw new Error(
+          'ledger update no longer addresses defects: the mirror is written only by the defect verbs ' +
+            '(ratchet defect add|resolve|reopen|waive|supersede).'
+        );
+      }
       const payload = readPayload(payloadArg);
       const res = state.withWorkspaceLock(cwd, 'ledger update', () => ledger.upsert(cwd, collection, payload));
-      return out(`${res.action} ${collection}: ${res.item.id}`);
+      if (!res.committed) {
+        return out(`unchanged ${collection}: ${res.item.id} (identical merge — no revision, no restamp, no bytes)`);
+      }
+      return out(
+        `${res.action} ${collection}: ${res.item.id} (ledgerRev ${res.ledgerRev}${res.admitted ? ', ledger admitted to version 2' : ''})`
+      );
     }
     case undefined:
     case 'get': {
@@ -804,6 +818,16 @@ function cmdDoctor(cwd, asJson) {
   }
   add('every skills/*/SKILL.md has frontmatter + description', skillProblems.length === 0, skillProblems.join('; '));
 
+  // 4c ledger rows — the shared strict diagnosis, read-only, with the stated
+  // repair per row. This is plain `ratchet doctor`, the route the wire's
+  // LedgerDamaged / LedgerRevisionExhausted sentences send operators to
+  // (`doctor cold-start` is a different scan and is unchanged by 4c).
+  try {
+    for (const row of state.diagnoseLedger(cwd)) add(row.name, row.ok, row.detail);
+  } catch (e) {
+    add('ledger strict shape', false, e.message);
+  }
+
   // 4b WAL slot — read-only diagnosis, never a repair. A recoverable slot is
   // informational (any supported write recovers it on its way in); a slot
   // strict recovery cannot prove legal is the operator's, by name.
@@ -952,7 +976,7 @@ function help() {
       '',
       'LEDGER (QA canonical record)',
       '  ratchet ledger create              ensure ledger exists',
-      '  ratchet ledger update <coll> <json> upsert features|tests|defects',
+      '  ratchet ledger update <coll> <json> upsert features|tests (defects route through the defect verbs)',
       '  ratchet ledger get [--json]        ledger summary',
       '',
       'SCORING',
