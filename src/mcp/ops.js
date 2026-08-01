@@ -141,6 +141,12 @@ const CODED_OUTCOMES = {
   ERATCHETCLOSUREBLOCKED: 'closureBlocked',
   ERATCHETHUMANAUTHORITY: 'humanAuthority',
   ERATCHETRETRACT: 'retractRefused',
+  // 4b: strict recovery could not prove the store legal / defect attachment
+  // needs an explicit artifact. ERATCHETMIRRORPENDING is deliberately ABSENT:
+  // a post-decision mirror failure is not an outcome to answer with — the
+  // throw funnels to the retryable WriteFailed and the retry recovers first.
+  ERATCHETMIRROR: 'mirror',
+  ERATCHETATTACH: 'attachAmbiguous',
 };
 
 function executeWrite(opts) {
@@ -229,6 +235,80 @@ function executeWrite(opts) {
   return outcome;
 }
 
+// The cross-file variant (4b): the same ordered replay → generation → revision
+// checks, but the mutation runs through state.withMirroredMutation, so the
+// ledger half rides a write-ahead intent and a death between the two files is
+// a recoverable lag. `prepare(s, ledger, mintId)` returns null after recording
+// a refusal outcome, { kind: 'noop', verbFields }, or
+// { kind: 'commit', ledgerOps, verbFields }.
+function executeMirroredWrite(opts) {
+  const { state, root, tool, operationId, expectedStateRev, expectedStateGen, semanticArgs, prepare } = opts;
+  const argsHash = bindingHash(tool, semanticArgs, expectedStateRev, expectedStateGen);
+  if (!fs.existsSync(state.statePath(root))) return { kind: 'stateMissing' };
+
+  let outcome = null;
+  try {
+    state.withMirroredMutation(root, { action: tool, door: 'mcp', tool, operationId, argsHash }, (s, ledger) => {
+      const ring = Array.isArray(s.operations) ? s.operations : null;
+      const hit = ring ? ring.find((entry) => entry && entry.id === operationId) : undefined;
+      if (hit) {
+        outcome = hit.argsHash === argsHash
+          ? { kind: 'replayed', result: clone(hit.result) }
+          : { kind: 'conflict' };
+        return null;
+      }
+      if (String(s.gen || '') !== expectedStateGen) {
+        outcome = { kind: 'staleGen', actualStateGen: String(s.gen || '') || null };
+        return null;
+      }
+      const rev = revOf(s);
+      if (rev !== expectedStateRev) {
+        outcome = { kind: 'staleRev', actualStateRev: rev };
+        return null;
+      }
+      const mintId = (prefix, role) => {
+        const id = deriveId(prefix, expectedStateGen, tool, argsHash, role);
+        if (recordIdExists(s, id)) {
+          const e = new Error(`derived id ${id} already names a record`);
+          e.code = 'ERATCHETIDCONFLICT';
+          throw e;
+        }
+        return id;
+      };
+      const prep = prepare(s, ledger, mintId);
+      if (!prep || prep.kind === 'noop') {
+        outcome = { kind: 'noop', result: successResult(false, rev, prep && prep.verbFields) };
+        return null;
+      }
+      const result = successResult(true, rev + 1, prep.verbFields);
+      const entry = {
+        id: operationId,
+        tool,
+        argsHash,
+        gen: expectedStateGen,
+        rev: rev + 1,
+        at: schemas.nowIso(),
+        result,
+      };
+      if (JSON.stringify(entry).length > RECEIPT_ENTRY_CAP) {
+        const e = new Error(`operation receipt exceeds ${RECEIPT_ENTRY_CAP} bytes`);
+        e.code = 'ERATCHETRECEIPTCAP';
+        throw e;
+      }
+      if (!Array.isArray(s.operations)) s.operations = [];
+      s.operations.push(entry);
+      while (s.operations.length > OPERATIONS_CAP) s.operations.shift();
+      outcome = { kind: 'committed', result };
+      return { kind: 'commit', ledgerOps: prep.ledgerOps, result };
+    });
+  } catch (error) {
+    const kind = error && CODED_OUTCOMES[error.code];
+    if (kind) return { kind };
+    throw error;
+  }
+  return outcome;
+}
+
 module.exports = {
   OPERATIONS_CAP,
   RECEIPT_ENTRY_CAP,
@@ -237,4 +317,5 @@ module.exports = {
   deriveId,
   recordIdExists,
   executeWrite,
+  executeMirroredWrite,
 };

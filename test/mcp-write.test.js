@@ -262,10 +262,11 @@ ok('U4 derived ids keep 128 bits, are deterministic, and vary by role', () => {
 const ENVELOPE_KEYS = ['workspaceHandle', 'expectedStateRev', 'expectedStateGen', 'operationId'];
 const SESSION_VERBS = ['state.append', 'open_loop.close', 'open_loop.park', 'assumption.close', 'compile.done'];
 const ARTIFACT_VERBS = ['artifact.add', 'artifact.close', 'artifact.retract', 'score.aperture'];
+const MIRROR_VERBS = ['defect.add', 'defect.resolve', 'defect.reopen', 'defect.supersede'];
 const APERTURE_DIMS = ['ambiguity', 'terrain', 'taste', 'blastRadius', 'reversibility'];
 const WRITE_ROSTER = [
   'workspace.open', 'workspace.scan', 'score.confidence', 'score.friction',
-  'state.set', ...SESSION_VERBS, ...ARTIFACT_VERBS,
+  'state.set', ...SESSION_VERBS, ...ARTIFACT_VERBS, ...MIRROR_VERBS,
 ];
 
 ok('W1 a flagless server registers no write tools and cannot dispatch one', () => {
@@ -915,7 +916,8 @@ ok('V1 the --write roster advertises all ten write tools with pinned contracts',
     ['state.append', false], ['open_loop.close', true], ['open_loop.park', true],
     ['assumption.close', true], ['compile.done', true],
     ['artifact.add', true], ['artifact.close', true], ['artifact.retract', true],
-    ['score.aperture', false],
+    ['score.aperture', false], ['defect.add', true],
+    ['defect.resolve', true], ['defect.reopen', true], ['defect.supersede', true],
   ]) {
     const tool = byName.get(name);
     assert.deepStrictEqual(tool.annotations,
@@ -926,6 +928,7 @@ ok('V1 the --write roster advertises all ten write tools with pinned contracts',
       'StateNotInitialized', 'StaleGeneration', 'StaleStateRev',
       'OperationIdConflict', 'DeterministicIdConflict', 'UnknownRecordId',
       'ArtifactClosed', 'ClosureBlocked', 'HumanAuthorityRequired', 'RetractRefused',
+      'AttachmentAmbiguous', 'MirrorUnrecoverable',
       'WriteFailed',
     ], name);
   }
@@ -941,6 +944,12 @@ ok('V1 the --write roster advertises all ten write tools with pinned contracts',
   assert.deepStrictEqual(required('artifact.retract'), [...ENVELOPE_KEYS, 'id', 'reason']);
   assert.ok(byName.get('artifact.retract').inputSchema.properties.supersededBy);
   assert.deepStrictEqual(required('score.aperture'), [...ENVELOPE_KEYS, ...APERTURE_DIMS]);
+  assert.deepStrictEqual(required('defect.add'), [...ENVELOPE_KEYS, 'item']);
+  assert.deepStrictEqual(required('defect.resolve'), [...ENVELOPE_KEYS, 'id', 'evidence']);
+  assert.deepStrictEqual(required('defect.reopen'), [...ENVELOPE_KEYS, 'id', 'reason']);
+  assert.deepStrictEqual(required('defect.supersede'), [...ENVELOPE_KEYS, 'id', 'by']);
+  assert.ok(byName.get('defect.supersede').inputSchema.properties.reason, 'reason is optional wire surface');
+  assert.ok(!byName.has('defect.waive'), 'waivers have no MCP spelling — permanently');
   const success = (name) => byName.get(name).outputSchema.oneOf[0].required;
   const COMMON = ['ok', 'committed', 'stateRev', 'replayed'];
   assert.deepStrictEqual(success('state.append'), [...COMMON, 'collection', 'recordId', 'deduped']);
@@ -953,6 +962,11 @@ ok('V1 the --write roster advertises all ten write tools with pinned contracts',
   assert.deepStrictEqual(success('artifact.retract'), [...COMMON, 'artifactId', 'status', 'supersededBy']);
   assert.deepStrictEqual(success('score.aperture'), [...COMMON,
     'score', 'level', 'name', 'implement', 'sequence', 'mapRequired', 'dimensions', 'scope', 'recordedFog']);
+  assert.deepStrictEqual(success('defect.add'), [...COMMON,
+    'defectId', 'severity', 'action', 'artifact', 'attachedBy', 'ledgerId']);
+  for (const name of ['defect.resolve', 'defect.reopen', 'defect.supersede']) {
+    assert.deepStrictEqual(success(name), [...COMMON, 'defectId', 'status', 'ledgerId'], name);
+  }
   // The gated constructors are not appendable — the enum itself says so.
   assert.deepStrictEqual(byName.get('state.append').inputSchema.properties.collection.enum,
     ['decisions', 'assumptions', 'openLoops', 'touchedFiles', 'history']);
@@ -963,7 +977,7 @@ ok('V2 no session or artifact verb is listed or dispatchable on a flagless serve
   const conn = service([repo], false).createConnection();
   const listed = modern(conn, 'tools/list', {}).result.tools.map((t) => t.name);
   const open = openWorkspace(conn, repo);
-  for (const tool of [...SESSION_VERBS, ...ARTIFACT_VERBS]) {
+  for (const tool of [...SESSION_VERBS, ...ARTIFACT_VERBS, ...MIRROR_VERBS]) {
     assert.ok(!listed.includes(tool), `${tool} must not be advertised`);
     const response = callTool(conn, 'modern', tool, envelopeFor(open, {}));
     assert.strictEqual(response.error && response.error.code, -32602, tool);
@@ -1176,6 +1190,9 @@ ok('V9 a transition on a record that does not exist refuses UnknownRecordId with
     ['assumption.close', { id: 'asm-ghost', outcome: 'tested', evidence: 'e' }],
     ['artifact.close', { id: 'art-ghost' }],
     ['artifact.retract', { id: 'art-ghost', reason: 'gone' }],
+    ['defect.resolve', { id: 'def-ghost', evidence: 'e' }],
+    ['defect.reopen', { id: 'def-ghost', reason: 'r' }],
+    ['defect.supersede', { id: 'def-ghost', by: 'art-x' }],
   ]) {
     const structured = refusal(callTool(conn, 'modern', tool, envelopeFor(open, semantic)));
     assert.strictEqual(structured.error, 'UnknownRecordId', tool);
@@ -1252,6 +1269,14 @@ ok('V11 malformed verb arguments refuse at the boundary with zero bytes moved', 
     ['score.aperture', { ambiguity: '1', terrain: 0, taste: 0, blastRadius: 0, reversibility: 0 }],
     ['score.aperture', { terrain: 0, taste: 0, blastRadius: 0, reversibility: 0 }],
     ['score.aperture', { ambiguity: 0, terrain: 0, taste: 0, blastRadius: 0, reversibility: 0, extra: 1 }],
+    ['defect.add', { item: [] }],
+    ['defect.add', { item: { summary: 'x', status: 'resolved' } }],
+    ['defect.add', { item: { summary: 'x', status: 'waived' } }],
+    ['defect.resolve', { id: 'x', evidence: '' }],
+    ['defect.resolve', { id: '', evidence: 'e' }],
+    ['defect.reopen', { id: 'x', reason: '  ' }],
+    ['defect.supersede', { id: 'x', by: '' }],
+    ['defect.supersede', { id: 'x', by: 'y', reason: '' }],
   ];
   for (const [tool, semantic] of cases) {
     boundaryRefusal(callTool(conn, 'modern', tool, envelopeFor(open, semantic)));
@@ -1279,6 +1304,10 @@ ok('V12 every session and artifact verb answers a foreign handle with the one no
     ['artifact.close', { id: 'x' }],
     ['artifact.retract', { id: 'x', reason: 'r' }],
     ['score.aperture', { ambiguity: 0, terrain: 0, taste: 0, blastRadius: 0, reversibility: 0 }],
+    ['defect.add', { item: { summary: 'x' } }],
+    ['defect.resolve', { id: 'x', evidence: 'e' }],
+    ['defect.reopen', { id: 'x', reason: 'r' }],
+    ['defect.supersede', { id: 'x', by: 'y' }],
   ]) {
     messages.add(boundaryRefusal(callTool(foreign, 'modern', tool, envelopeFor(open, semantic))).message);
   }

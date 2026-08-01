@@ -9,6 +9,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Known limitation (parked, owner: Danny): a host-environment hold can stall the
+  mirror publish.** On the development host, replacing a freshly written `ledger.json`
+  intermittently refuses `EPERM` for longer than any bounded retry we ship (measured:
+  the source tmp stays movable, the destination opens `r+`, the replace alone refuses —
+  a holder sharing read/write but not delete; ~1–3% of operations, only under sustained
+  machine load, never reproduced by isolated probes). The canonical publish now waits
+  against a deadline (`RATCHET_PUBLISH_TIMEOUT_MS`, default 10s, the same shape git
+  ships for Windows renames), recovery's own mirror publish wears the same retryable
+  `ERATCHETMIRRORPENDING` code instead of leaking raw `EPERM`, and both doors answer
+  "re-run the command" — which provably converges (the WAL suite's M4, and its settled
+  harness). What is NOT claimed: that a single call always succeeds on such a host.
+  Diagnosing the holder needs OS-level tooling (handle enumeration), which is an
+  operator investigation, not a code path.
+
+<!-- Traced by: claude-fable-5 -->
+
+- **The defect transitions ride the slot — the mirror stops being best-effort.** Step
+  4b.2: `defect.resolve`, `defect.reopen`, `defect.supersede` join the wire (18-tool
+  `--write` roster), and every transition on BOTH doors — the CLI-only `defect waive`
+  included — commits its state change and its ledger-mirror status behind the same
+  write-ahead intent. The old best-effort mirror sync is gone: a ledger failure now
+  surfaces instead of being swallowed, and recovery completes the mirror the dying
+  process proved. **Named behavior change:** an exact-repeat transition (same target
+  status, same proof fields, mirror valid) is now a no-op — no log line, no history, no
+  revision — where it used to grow the log on every rerun; a repeat with DIFFERENT
+  proof refuses rather than silently replacing the original, and an exact repeat over a
+  missing or ambiguous mirror commits once solely to perform the D2b admission.
+  `defect.waive` remains absent from `tools/list` and the dispatcher, permanently. Five
+  new falsifiers (both-door equivalence, exact-repeat and conflicting-repeat semantics,
+  per-transition D2b admission, a real process dying between a transition and its
+  mirror, wire replay); the repeat no-op and the mirror-status propagation each seen
+  red against a deliberately broken variant.
+
+<!-- Traced by: claude-fable-5 -->
+
+- **The write-ahead intent slot — one operation, two canonical files, one crash story.**
+  Step 4b.1 of the ratified WAL design
+  (docs/superpowers/specs/2026-07-31-mcp-4b-wal-design.md): `defect.add` is the first
+  cross-file verb, on both doors — the state record, its QA-ledger mirror, and the
+  back-link commit behind one create-exclusive, size-capped, version-1 `intent.json`
+  carrying MATERIALIZED post-images and four exact pre/post byte hashes. The state
+  commit is the decision; recovery — living at the shared post-acquire path of BOTH
+  workspace-lock APIs, so every supported writer inherits it (**CLI-enforced**) — lands
+  every process death on one of three legal hash pairs and finishes or discards the
+  work byte-exactly, proven against the hashes the dying process recorded. Anything
+  strict recovery cannot prove preserves every byte and refuses `MirrorUnrecoverable`
+  on every write door and on `workspace.open`; `AttachmentAmbiguous` names the
+  several-live-artifacts refusal; both sentences are spec-pinned literals in the one
+  funnel. Dedup stays a no-op decided before any intent; escalation reaches the mirror
+  in the same operation; a legacy defect with no valid mirror is admitted on its first
+  committed escalation (D2b — one new mirror, old rows untouched). Every read states
+  `pendingIntent` out loud (race-safe revision+token sampling, derived, never
+  persisted); `ratchet doctor` gains read-only WAL diagnosis that names the condition
+  and never repairs. The guarantee covers process/server death, NOT sudden power loss
+  — file fsync is best-effort and the directory is never fsynced, stated in spec and
+  code. The canonical publish also gained a brief fenced retry for transient Windows
+  rename refusals (surfaced by the crash matrix; persistent refusals still throw). 22
+  falsifiers in `test/mcp-wal.test.js` including a real-process crash matrix dying at
+  the intent link, the state rename, the mirror rename, the clear unlink, and twice
+  INSIDE recovery itself; four mechanisms each seen red against a deliberately broken
+  variant (choke point disabled → 9 red, hash machine loosened, receipt validation
+  skipped, publish retry removed). `workspace.open` now snapshots under the workspace
+  lock so recovery precedes every handle.
+
+<!-- Traced by: claude-fable-5 -->
+
+
 - **The artifact verbs and the read that writes — the safe core is complete.** Step 4.3
   of the ratified write-tools design: `artifact.add`, `artifact.close`,
   `artifact.retract` and `score.aperture` complete the ten-tool `--write` roster, each a

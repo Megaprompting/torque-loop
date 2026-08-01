@@ -41,6 +41,9 @@
 // twice. See docs/superpowers/specs/2026-07-31-mcp-write-tools-design.md.
 // Step 4 traced by: claude-fable-5
 
+const crypto = require('crypto');
+const fs = require('fs');
+
 const handles = require('./handles');
 const ops = require('./ops');
 const prompts = require('./prompts');
@@ -104,6 +107,9 @@ const TOOL = Object.freeze({
       // recreated out-of-band, and a generation the client did not observe is
       // a world it never decided against.
       stateGen: { type: 'string' },
+      // Derived, never persisted: whether a 4b write-ahead intent occupies the
+      // slot. Open recovers under its lock first, so this is normally false.
+      pendingIntent: { type: 'boolean' },
       resources: {
         type: 'object',
         properties: {
@@ -115,7 +121,7 @@ const TOOL = Object.freeze({
         additionalProperties: false,
       },
     },
-    required: ['workspaceHandle', 'repositoryId', 'worktreeId', 'stateRev', 'stateGen', 'resources'],
+    required: ['workspaceHandle', 'repositoryId', 'worktreeId', 'stateRev', 'stateGen', 'pendingIntent', 'resources'],
     additionalProperties: false,
   },
   annotations: {
@@ -306,6 +312,8 @@ const WRITE_ERROR_BRANCH = Object.freeze({
         'ClosureBlocked',
         'HumanAuthorityRequired',
         'RetractRefused',
+        'AttachmentAmbiguous',
+        'MirrorUnrecoverable',
         'WriteFailed',
       ],
     },
@@ -672,6 +680,114 @@ const SCORE_APERTURE_TOOL = Object.freeze({
   },
 });
 
+const DEFECT_ADD_USAGE =
+  'defect.add requires exactly: workspaceHandle, expectedStateRev, expectedStateGen, operationId, item (an object)';
+
+const DEFECT_ADD_TOOL = Object.freeze({
+  name: 'defect.add',
+  title: 'Record a defect with its ledger mirror',
+  description:
+    'Record one defect on an opened workspace — the first cross-file verb: the state record and its QA-ledger mirror commit behind one write-ahead intent, so a server death between the two files is a recoverable lag, never a permanent disagreement. A repeat of an open finding dedups as a no-op; a worse repeat escalates the severity in place. Terminal birth statuses refuse at the boundary; waivers stay CLI acts. With several live artifacts, item.artifact must name the one this defect attacks. CAS-bound like every write.',
+  inputSchema: {
+    type: 'object',
+    properties: Object.assign({}, WRITE_ENVELOPE_PROPS, {
+      item: {
+        type: 'object',
+        description: 'The defect payload ({severity, summary, artifact, feature}). Severity defaults to medium; unknown severities coerce to medium.',
+      },
+    }),
+    required: [...WRITE_ENVELOPE_KEYS, 'item'],
+    additionalProperties: false,
+  },
+  outputSchema: {
+    oneOf: [
+      writeSuccessBranch({
+        defectId: { type: 'string' },
+        severity: { type: 'string', enum: [...schemas.SEVERITIES] },
+        action: { type: 'string', enum: ['created', 'escalated', 'deduped'] },
+        artifact: { type: ['string', 'null'] },
+        attachedBy: { type: 'string' },
+        ledgerId: { type: ['string', 'null'] },
+      }),
+      WRITE_ERROR_BRANCH,
+    ],
+  },
+  // An escalation overwrites the recorded severity in place — not additive.
+  annotations: WRITE_DESTRUCTIVE,
+});
+
+// The three wire transitions share one descriptor factory: same envelope, same
+// success projection (defectId, status, ledgerId — the mirror the operation
+// kept truthful), same destructive annotation. defect.waive is deliberately
+// NOT built here: waivers are human risk acceptance with no MCP spelling.
+function defectTransitionTool(name, title, description, semanticProps, required, statusConst) {
+  return Object.freeze({
+    name,
+    title,
+    description,
+    inputSchema: {
+      type: 'object',
+      properties: Object.assign({}, WRITE_ENVELOPE_PROPS, semanticProps),
+      required: [...WRITE_ENVELOPE_KEYS, ...required],
+      additionalProperties: false,
+    },
+    outputSchema: {
+      oneOf: [
+        writeSuccessBranch({
+          defectId: { type: 'string' },
+          status: { const: statusConst },
+          ledgerId: { type: ['string', 'null'] },
+        }),
+        WRITE_ERROR_BRANCH,
+      ],
+    },
+    annotations: WRITE_DESTRUCTIVE,
+  });
+}
+
+const DEFECT_RESOLVE_USAGE =
+  'defect.resolve requires exactly: workspaceHandle, expectedStateRev, expectedStateGen, operationId, id, evidence (non-empty)';
+const DEFECT_RESOLVE_TOOL = defectTransitionTool(
+  'defect.resolve',
+  'Resolve a defect with proof',
+  'Mark one defect resolved on an opened workspace — no proof, no resolve. The state transition and its ledger mirror commit behind one write-ahead intent; an exact repeat is a no-op, and a repeat with different proof refuses rather than silently replacing the original. CAS-bound like every write.',
+  {
+    id: { type: 'string', minLength: 1 },
+    evidence: { type: 'string', minLength: 1, description: 'Proof it is actually fixed.' },
+  },
+  ['id', 'evidence'],
+  'resolved'
+);
+
+const DEFECT_REOPEN_USAGE =
+  'defect.reopen requires exactly: workspaceHandle, expectedStateRev, expectedStateGen, operationId, id, reason (non-empty)';
+const DEFECT_REOPEN_TOOL = defectTransitionTool(
+  'defect.reopen',
+  'Reopen a defect that is not actually fixed',
+  'Reopen one defect on an opened workspace with the reason it is not actually fixed. Mirrored behind one write-ahead intent; exact repeats are no-ops. CAS-bound like every write.',
+  {
+    id: { type: 'string', minLength: 1 },
+    reason: { type: 'string', minLength: 1, description: 'Why it is not actually fixed.' },
+  },
+  ['id', 'reason'],
+  'reopened'
+);
+
+const DEFECT_SUPERSEDE_USAGE =
+  'defect.supersede requires exactly: workspaceHandle, expectedStateRev, expectedStateGen, operationId, id, by (non-empty), optionally reason (non-empty)';
+const DEFECT_SUPERSEDE_TOOL = defectTransitionTool(
+  'defect.supersede',
+  'Supersede a defect with its replacement',
+  'Mark one defect superseded on an opened workspace, naming the artifact or defect that replaced it. Mirrored behind one write-ahead intent; exact repeats are no-ops. CAS-bound like every write.',
+  {
+    id: { type: 'string', minLength: 1 },
+    by: { type: 'string', minLength: 1, description: 'The artifact or defect that replaced it.' },
+    reason: { type: 'string', minLength: 1, description: 'Optional context for the supersession.' },
+  },
+  ['id', 'by'],
+  'superseded'
+);
+
 // The one sentence each refusal speaks. A table, so the funnel test can assert
 // every wire sentence against this allowlist — no verb-specific catch can leak
 // a path, an errno, or a store location.
@@ -686,6 +802,9 @@ const WRITE_REFUSALS = Object.freeze({
   ClosureBlocked: 'artifact closure is blocked — bound proof, open defects, holes, or a damaged proof record stand in the way; the confidence read names each blocker',
   HumanAuthorityRequired: 'this closure needs named human authorization (record-scope proof or waived holes) — it has no wire spelling; run it from the CLI',
   RetractRefused: 'retraction refused — a probe exit states its outcome (reason starts "disposed:" or "promoted:"), and a promotion names a recorded non-probe replacement',
+  // The 4b literals are pinned by the ratified spec, word for word.
+  AttachmentAmbiguous: 'Several live artifacts could own this defect; provide item.artifact explicitly.',
+  MirrorUnrecoverable: 'The defect mirror cannot be read or recovered safely; run ratchet doctor and repair the reported condition before retrying.',
   WriteFailed: 'workspace write could not be completed',
 });
 
@@ -757,6 +876,33 @@ function runWrite(record, tool, args, semanticArgs, apply, alsoLockFile) {
   } catch (error) {
     return safeWriteError(error);
   }
+  return writeOutcome(outcome, args);
+}
+
+// The 4b variant: same boundary, same outcome mapping, but the execution runs
+// the cross-file protocol. A post-decision mirror failure throws out of the
+// executor and lands in safeWriteError — the retryable WriteFailed — because
+// no success is emitted until the mirror and the clear have both landed.
+function runMirroredWrite(record, tool, args, semanticArgs, prepare) {
+  let outcome;
+  try {
+    outcome = ops.executeMirroredWrite({
+      state,
+      root: record.root,
+      tool,
+      operationId: args.operationId,
+      expectedStateRev: args.expectedStateRev,
+      expectedStateGen: args.expectedStateGen,
+      semanticArgs,
+      prepare,
+    });
+  } catch (error) {
+    return safeWriteError(error);
+  }
+  return writeOutcome(outcome, args);
+}
+
+function writeOutcome(outcome, args) {
   switch (outcome.kind) {
     case 'replayed':
       return toolResult(Object.assign(outcome.result, { replayed: true }));
@@ -789,6 +935,10 @@ function runWrite(record, tool, args, semanticArgs, apply, alsoLockFile) {
       return writeRefusal('HumanAuthorityRequired');
     case 'retractRefused':
       return writeRefusal('RetractRefused');
+    case 'attachAmbiguous':
+      return writeRefusal('AttachmentAmbiguous');
+    case 'mirror':
+      return writeRefusal('MirrorUnrecoverable');
     default:
       return writeRefusal('WriteFailed');
   }
@@ -848,10 +998,51 @@ function safeOpenError(error) {
   if (error && error.code === 'ERATCHETGIT') {
     return 'workspace must be an accessible Git working tree directory';
   }
+  if (error && error.code === 'ERATCHETMIRROR') {
+    // Open recovers the 4b intent slot before issuing a handle; a slot strict
+    // recovery cannot prove legal is an operator condition, same voice as the
+    // write tools' allowlisted sentence.
+    return 'The defect mirror cannot be read or recovered safely; run ratchet doctor and repair the reported condition before retrying.';
+  }
   if (error && error.code && String(error.code).startsWith('ERATCHETHANDLE')) {
     return 'workspace authority could not be issued';
   }
   return 'workspace state could not be opened';
+}
+
+// The 4b pendingIntent sample: the SHA-256 of readable raw intent bytes, an
+// occupied-unreadable sentinel, or absent — never a bare existence bit, so two
+// different slots never sample equal. Non-repairing by construction: one read,
+// no lock, no store bytes created.
+function intentToken(root) {
+  try {
+    return `sha256:${crypto.createHash('sha256').update(fs.readFileSync(state.intentPath(root))).digest('hex')}`;
+  } catch (e) {
+    return e && e.code === 'ENOENT' ? 'absent' : 'occupied-unreadable';
+  }
+}
+
+// Non-repairing revision peek for the sampler pair. readJson swallows a parse
+// failure into null; 'rev:unknown' keeps that observation distinct from rev 0.
+function revToken(root) {
+  const parsed = state.readJson(state.statePath(root));
+  return parsed && Number.isInteger(parsed.rev) ? `rev:${parsed.rev}` : 'rev:unknown';
+}
+
+// Lock-free reads sample (state revision, intent token) around the assembly.
+// A stable absent token plus a stable revision is a clean linearization point;
+// anything unstable is conservatively reported as pendingIntent:true rather
+// than letting a mixed WAL snapshot claim it saw a settled store.
+function samplePendingIntent(root, assemble) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const tokenBefore = intentToken(root);
+    const revBefore = revToken(root);
+    const value = assemble();
+    if (intentToken(root) === tokenBefore && revToken(root) === revBefore) {
+      return { value, pendingIntent: tokenBefore !== 'absent' };
+    }
+  }
+  return { value: assemble(), pendingIntent: true };
 }
 
 function resourceUri(handle, name) {
@@ -954,8 +1145,15 @@ function createServer(options) {
         // creates it when it is missing: without this, the first ledger
         // resource read of a fresh workspace wrote bytes, and "every read is
         // pure" was false on the one path a client hits first.
-        snapshot = state.loadState(found.root);
-        state.loadLedger(found.root);
+        //
+        // 4b: the snapshot is taken INSIDE the workspace lock, because the
+        // lock's post-acquire path is where pending-intent recovery lives — a
+        // healthy store used to be read lock-free here, which would have
+        // issued a handle over a mirror still owed its recovery.
+        state.withWorkspaceLock(found.root, 'workspace open', () => {
+          snapshot = state.loadState(found.root);
+          state.loadLedger(found.root);
+        });
       } catch (error) {
         // Either record failing means no handle: authority over a workspace
         // whose canonical records could not be opened is authority to read
@@ -1010,6 +1208,9 @@ function createServer(options) {
         // The same loaded snapshot as stateRev: a revision and a generation
         // read separately could describe two different records.
         stateGen: snapshot ? String(snapshot.gen || '') : '',
+        // Sampled after the locked recovery above — normally 'absent'; a later
+        // writer's slot is the state CAS contract's problem, not this field's.
+        pendingIntent: intentToken(record.root) !== 'absent',
         resources: uris,
       };
       return {
@@ -1244,6 +1445,79 @@ function createServer(options) {
         });
     }
 
+    function defectAdd(arguments_) {
+      const args = writeArguments(arguments_, ['item'], DEFECT_ADD_USAGE);
+      const item = args.item;
+      if (!item || typeof item !== 'object' || Array.isArray(item)) throw rpc.rpcError(-32602, DEFECT_ADD_USAGE);
+      if (item.id !== undefined && !nonEmpty(item.id)) throw rpc.rpcError(-32602, DEFECT_ADD_USAGE);
+      // Terminal birth statuses refuse at the boundary, same rule as
+      // state.append; the shared core re-checks underneath.
+      const claimed = item.status == null ? '' : String(item.status).toLowerCase();
+      if (claimed && schemas.DEFECT_TERMINAL_STATUSES.includes(claimed)) {
+        throw rpc.rpcError(-32602,
+          'defect.add cannot birth a terminal status — resolve and supersede are transitions, and waivers stay CLI acts');
+      }
+      const record = resolveHandle(args.workspaceHandle, 'write');
+      return runMirroredWrite(record, 'defect.add', args, { item }, (s, ledger, mintId) => {
+        const prep = artifacts.prepareDefectAdd(record.root, s, ledger, item, mintId);
+        const rec = prep.record;
+        const verbFields = {
+          defectId: String(rec.id),
+          severity: rec.severity,
+          action: prep.action,
+          artifact: rec.artifact ? String(rec.artifact) : null,
+          attachedBy: String(rec.attachedBy || ''),
+          ledgerId: rec.ledgerId ? String(rec.ledgerId) : null,
+        };
+        if (prep.kind === 'noop') return { kind: 'noop', verbFields };
+        return { kind: 'commit', ledgerOps: prep.ledgerOps, verbFields };
+      });
+    }
+
+    // One handler shape for the three wire transitions: boundary gates travel
+    // as schema, the shared core owns the meaning, and the mirror rides the
+    // same intent. waive has no handler here, by rule.
+    function runDefectTransition(args, toStatus, tool, meta, semanticArgs) {
+      const record = resolveHandle(args.workspaceHandle, 'write');
+      return runMirroredWrite(record, tool, args, semanticArgs, (s, ledger, mintId) => {
+        const prep = artifacts.prepareDefectTransition(s, ledger, args.id, toStatus, meta, mintId);
+        const verbFields = {
+          defectId: String(prep.record.id),
+          status: toStatus,
+          ledgerId: prep.record.ledgerId ? String(prep.record.ledgerId) : null,
+        };
+        if (prep.kind === 'noop') return { kind: 'noop', verbFields };
+        return { kind: 'commit', ledgerOps: prep.ledgerOps, verbFields };
+      });
+    }
+
+    function defectResolve(arguments_) {
+      const args = writeArguments(arguments_, ['id', 'evidence'], DEFECT_RESOLVE_USAGE);
+      if (!nonEmpty(args.id) || !nonEmpty(args.evidence)) throw rpc.rpcError(-32602, DEFECT_RESOLVE_USAGE);
+      return runDefectTransition(args, 'resolved', 'defect.resolve',
+        { evidence: args.evidence, note: `resolved: ${args.evidence}` },
+        { id: args.id, evidence: args.evidence });
+    }
+
+    function defectReopen(arguments_) {
+      const args = writeArguments(arguments_, ['id', 'reason'], DEFECT_REOPEN_USAGE);
+      if (!nonEmpty(args.id) || !nonEmpty(args.reason)) throw rpc.rpcError(-32602, DEFECT_REOPEN_USAGE);
+      return runDefectTransition(args, 'reopened', 'defect.reopen',
+        { reason: args.reason, note: `reopened: ${args.reason}` },
+        { id: args.id, reason: args.reason });
+    }
+
+    function defectSupersede(arguments_) {
+      const args = writeArguments(arguments_, ['id', 'by'], DEFECT_SUPERSEDE_USAGE, ['reason']);
+      if (!nonEmpty(args.id) || !nonEmpty(args.by)) throw rpc.rpcError(-32602, DEFECT_SUPERSEDE_USAGE);
+      if (args.reason !== undefined && !nonEmpty(args.reason)) throw rpc.rpcError(-32602, DEFECT_SUPERSEDE_USAGE);
+      // Absent and null are one meaning in the binding, same as artifact.retract.
+      const reason = args.reason === undefined ? null : args.reason;
+      return runDefectTransition(args, 'superseded', 'defect.supersede',
+        { by: args.by, reason: reason || '', note: `superseded by ${args.by}${reason ? `: ${reason}` : ''}` },
+        { id: args.id, by: args.by, reason });
+    }
+
     function scoreAperture(arguments_) {
       const args = writeArguments(arguments_, [...APERTURE_DIMENSION_KEYS], SCORE_APERTURE_USAGE);
       const dims = {};
@@ -1283,6 +1557,10 @@ function createServer(options) {
         { descriptor: ARTIFACT_CLOSE_TOOL, run: artifactClose },
         { descriptor: ARTIFACT_RETRACT_TOOL, run: artifactRetract },
         { descriptor: SCORE_APERTURE_TOOL, run: scoreAperture },
+        { descriptor: DEFECT_ADD_TOOL, run: defectAdd },
+        { descriptor: DEFECT_RESOLVE_TOOL, run: defectResolve },
+        { descriptor: DEFECT_REOPEN_TOOL, run: defectReopen },
+        { descriptor: DEFECT_SUPERSEDE_TOOL, run: defectSupersede },
       ] : []),
     ];
 
@@ -1301,10 +1579,15 @@ function createServer(options) {
 
     function readResource(params, context) {
       const available = resourceRecord(params.uri);
-      let value;
-      if (available.parsed.name === 'state') value = state.loadState(available.record.root);
-      else if (available.parsed.name === 'ledger') value = state.loadLedger(available.record.root);
-      else value = receipt.assemble(available.record.root);
+      // 4b: every resource states the WAL observation out loud. The flag is
+      // derived at read time and injected into the projection only — the disk
+      // bytes never gain it. Reads stay byte-pure: the sampler never repairs.
+      const sampled = samplePendingIntent(available.record.root, () => {
+        if (available.parsed.name === 'state') return state.loadState(available.record.root);
+        if (available.parsed.name === 'ledger') return state.loadLedger(available.record.root);
+        return receipt.assemble(available.record.root);
+      });
+      const value = Object.assign({}, sampled.value, { pendingIntent: sampled.pendingIntent });
 
       return withCache({
         contents: [{

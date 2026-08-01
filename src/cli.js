@@ -459,7 +459,9 @@ function cmdDefect(cwd, argv, asJson) {
   switch (sub) {
     case 'add': {
       const payload = readPayload(positionals[2]);
-      const rec = mutate(cwd, 'defect add', () => artifacts.addDefect(cwd, payload));
+      // No outer transaction: addDefect owns the 4b mirrored boundary (state +
+      // ledger behind one write-ahead intent), and a boundary cannot nest.
+      const rec = artifacts.addDefect(cwd, payload);
       return out(`defect ${rec.state.id} added: [${rec.state.severity}] ${rec.state.summary}`);
     }
     case 'list': {
@@ -479,14 +481,14 @@ function cmdDefect(cwd, argv, asJson) {
       // Proof gate, same spirit as the evolve KEEP gate: a defect cannot be
       // marked fixed without stating the proof that it is actually fixed.
       need(evidence, 'defect resolve requires --evidence "<proof it is actually fixed>" — no proof, no resolve');
-      mutate(cwd, 'defect resolve', () => artifacts.transitionDefect(cwd, id, 'resolved', { evidence, note: `resolved: ${evidence}` }));
+      artifacts.transitionDefect(cwd, id, 'resolved', { evidence, note: `resolved: ${evidence}` });
       return out(`defect ${id} → resolved`);
     }
     case 'reopen': {
       need(id, 'usage: ratchet defect reopen <id> --reason "<why>"');
       const reason = strOpt(opts.reason);
       need(reason, 'defect reopen requires --reason "<why it is not actually fixed>"');
-      mutate(cwd, 'defect reopen', () => artifacts.transitionDefect(cwd, id, 'reopened', { reason, note: `reopened: ${reason}` }));
+      artifacts.transitionDefect(cwd, id, 'reopened', { reason, note: `reopened: ${reason}` });
       return out(`defect ${id} → reopened`);
     }
     case 'waive': {
@@ -495,9 +497,7 @@ function cmdDefect(cwd, argv, asJson) {
       const reason = strOpt(opts.reason);
       need(owner, 'defect waive requires --owner "<who accepts the risk>"');
       need(reason, 'defect waive requires --reason "<why shipping anyway is acceptable>"');
-      mutate(cwd, 'defect waive', () =>
-        artifacts.transitionDefect(cwd, id, 'waived', { owner, reason, note: `waived by ${owner}: ${reason}` })
-      );
+      artifacts.transitionDefect(cwd, id, 'waived', { owner, reason, note: `waived by ${owner}: ${reason}` });
       return out(`defect ${id} → waived (owner: ${owner})`);
     }
     case 'supersede': {
@@ -505,13 +505,11 @@ function cmdDefect(cwd, argv, asJson) {
       const by = strOpt(opts.by);
       need(by, 'defect supersede requires --by <artifact-or-defect-id>');
       const reason = strOpt(opts.reason);
-      mutate(cwd, 'defect supersede', () =>
-        artifacts.transitionDefect(cwd, id, 'superseded', {
-          by,
-          reason,
-          note: `superseded by ${by}${reason ? `: ${reason}` : ''}`,
-        })
-      );
+      artifacts.transitionDefect(cwd, id, 'superseded', {
+        by,
+        reason,
+        note: `superseded by ${by}${reason ? `: ${reason}` : ''}`,
+      });
       return out(`defect ${id} → superseded (by: ${by})`);
     }
     default:
@@ -816,6 +814,27 @@ function cmdDoctor(cwd, asJson) {
     stateDetail = e.message;
   }
   add('state dir writable', stateOk, stateDetail);
+
+  // 4b WAL slot — read-only diagnosis, never a repair. A recoverable slot is
+  // informational (any supported write recovers it on its way in); a slot
+  // strict recovery cannot prove legal is the operator's, by name.
+  try {
+    const slot = state.diagnoseIntent(cwd);
+    if (!slot.pending) add('WAL intent slot', true, 'no pending intent');
+    else if (slot.verdict === 'ambiguous') {
+      add('WAL intent slot', false,
+        `${slot.reason} Do not delete the slot blindly — repair the named condition; recovery clears it.`);
+    } else {
+      const meaning = {
+        discarded: 'discardable — the state decision never published',
+        completed: 'mirror owed — the next supported write completes it',
+        cleared: 'clearable — the mirror already landed',
+      };
+      add('WAL intent slot', true, `pending intent, ${meaning[slot.verdict] || slot.verdict}`);
+    }
+  } catch (e) {
+    add('WAL intent slot', false, e.message);
+  }
 
   let snapOk = true;
   let snapDetail = '';

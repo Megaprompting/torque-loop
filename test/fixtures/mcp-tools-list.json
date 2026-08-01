@@ -34,6 +34,9 @@
         "stateGen": {
           "type": "string"
         },
+        "pendingIntent": {
+          "type": "boolean"
+        },
         "resources": {
           "type": "object",
           "properties": {
@@ -61,6 +64,7 @@
         "worktreeId",
         "stateRev",
         "stateGen",
+        "pendingIntent",
         "resources"
       ],
       "additionalProperties": false
