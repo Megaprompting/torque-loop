@@ -947,6 +947,12 @@ ok('W3 an exact repeat over a stale mirror commits once and trues status, severi
   const added = settled(() => artifacts.addDefect(repo, { severity: 'high', summary: 'truth drifts' }));
   settled(() => artifacts.transitionDefect(repo, added.state.id, 'resolved', { evidence: 'fixed', note: 'resolved: fixed' }));
   const ledgerId = readState(repo).defects[0].ledgerId;
+  const settledState = readState(repo);
+  const audit = {
+    history: settledState.history.length,
+    log: settledState.defects[0].log.length,
+    resolvedAt: settledState.defects[0].resolvedAt,
+  };
   const ledger = readLedger(repo);
   const row = ledger.defects.find((d) => d.id === ledgerId);
   row.status = 'open';
@@ -955,6 +961,11 @@ ok('W3 an exact repeat over a stale mirror commits once and trues status, severi
   fs.writeFileSync(state.ledgerPath(repo), wal.serializeRecord(ledger));
   const repeat = settled(() => artifacts.transitionDefect(repo, added.state.id, 'resolved', { evidence: 'fixed', note: 'resolved: fixed' }));
   assert.strictEqual(repeat.status, 'resolved');
+  const truedState = readState(repo);
+  assert.deepStrictEqual(
+    { history: truedState.history.length, log: truedState.defects[0].log.length, resolvedAt: truedState.defects[0].resolvedAt },
+    audit,
+    'the truing commit moved ONLY the mirror — no duplicate audit line, no restamped proof');
   const trued = readLedger(repo).defects.find((d) => d.id === ledgerId);
   assert.deepStrictEqual(
     { status: trued.status, severity: trued.severity, summary: trued.summary },
@@ -973,6 +984,51 @@ ok('W4 doctor observes a pending slot without recovering it', () => {
     { cwd: repo, encoding: 'utf8', env: cleanGitEnv(), windowsHide: true });
   assert.match(String(run.stdout), /pending/i, 'doctor names the slot it sees');
   assert.deepStrictEqual(storeSnapshot(repo), before, 'diagnosis moved zero bytes — doctor never recovers');
+});
+
+ok('W4b a slot landing after the diagnosis sample still survives doctor', () => {
+  const repo = initRepo('w4b');
+  const cli = require('../src/cli');
+  const realDiagnose = state.diagnoseIntent;
+  const realWrite = process.stdout.write;
+  const realExit = process.exitCode;
+  const realCwd = process.cwd();
+  let planted = null;
+  try {
+    state.diagnoseIntent = function raced(cwd) {
+      const res = realDiagnose.call(state, cwd);
+      planted = craftedSlot(repo, 'after-state'); // the slot lands right after the sample
+      return res;
+    };
+    process.chdir(repo);
+    process.stdout.write = () => true; // doctor's report is not under test; its writes are
+    cli.run(['node', 'ratchet', 'doctor', '--json']);
+  } finally {
+    process.stdout.write = realWrite;
+    process.chdir(realCwd);
+    state.diagnoseIntent = realDiagnose;
+    process.exitCode = realExit;
+  }
+  assert.ok(fs.existsSync(state.intentPath(repo)), 'the late slot is not consumed by the probe');
+  assert.strictEqual(hashOf(state.ledgerPath(repo)), planted.intent.ledgerBeforeHash,
+    'the owed mirror is still owed — doctor recovered nothing');
+});
+
+ok('W7 a peeked record with invalid UTF-8 refuses instead of serving a normalized projection', () => {
+  const repo = initRepo('w7');
+  const conn = service([repo], true).createConnection();
+  const open = openWorkspace(conn, repo);
+  const stateFile = state.statePath(repo);
+  const bytes = Buffer.from(bytesOf(stateFile));
+  const at = bytes.indexOf(Buffer.from('objective', 'utf8'));
+  assert.ok(at > 0, 'the state record carries an objective field');
+  bytes[at + 3] = 0xff; // one invalid byte inside a JSON string
+  fs.writeFileSync(stateFile, bytes);
+  const res = modern(conn, 'resources/read', { uri: open.resources.state });
+  assert.ok(res.error, 'an unprovable record is a refusal, not a lossy U+FFFD projection');
+  assert.strictEqual(res.error.message, mcp.WRITE_REFUSALS.MirrorUnrecoverable,
+    'the refusal speaks the allowlisted sentence, never a store path');
+  assert.ok(bytes.equals(bytesOf(stateFile)), 'the read changed nothing');
 });
 
 ok('W5 a resource read over an unreadable ledger refuses conservatively and writes nothing', () => {

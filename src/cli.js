@@ -804,16 +804,11 @@ function cmdDoctor(cwd, asJson) {
   }
   add('every skills/*/SKILL.md has frontmatter + description', skillProblems.length === 0, skillProblems.join('; '));
 
-  // 4b WAL slot — read-only diagnosis, never a repair, and it goes FIRST:
-  // initProject below acquires the workspace lock, whose choke point RUNS
-  // recovery — doctor observing a slot through that door would consume the
-  // very thing it reports. A recoverable slot is informational (any supported
-  // write recovers it on its way in); a slot strict recovery cannot prove
-  // legal is the operator's, by name.
-  let slotPending = false;
+  // 4b WAL slot — read-only diagnosis, never a repair. A recoverable slot is
+  // informational (any supported write recovers it on its way in); a slot
+  // strict recovery cannot prove legal is the operator's, by name.
   try {
     const slot = state.diagnoseIntent(cwd);
-    slotPending = Boolean(slot.pending);
     if (!slot.pending) add('WAL intent slot', true, 'no pending intent');
     else if (slot.verdict === 'ambiguous') {
       add('WAL intent slot', false,
@@ -827,25 +822,32 @@ function cmdDoctor(cwd, asJson) {
       add('WAL intent slot', true, `pending intent, ${meaning[slot.verdict] || slot.verdict}`);
     }
   } catch (e) {
-    slotPending = true; // an undiagnosable slot is still a slot — do not recover it
     add('WAL intent slot', false, e.message);
   }
 
-  // The writability probe runs initProject, and the lock it takes would
-  // recover a pending slot on its way in — so under a pending slot the probe
-  // defers instead of quietly consuming the evidence doctor just reported.
+  // The writability probe never travels the write door: initProject acquires
+  // the workspace lock, whose choke point RUNS recovery — a slot present now,
+  // or landing at any point during this command, would be consumed by the
+  // very tool that exists to report it. An existing store is probed with a
+  // scratch file (named .tmp- like every inert residue); only a store whose
+  // directory does not exist yet is created through initProject, and a
+  // directory that does not exist holds no slot to consume.
   let stateDetail = '';
   let stateOk = true;
-  if (slotPending) {
-    stateDetail = 'deferred — a pending WAL intent is reported above, and this probe would recover it';
-  } else {
-    try {
+  try {
+    const dir = state.projectDir(cwd); // still names a store conflict out loud
+    if (fs.existsSync(dir)) {
+      const probe = path.join(dir, `.doctor-probe.tmp-${process.pid.toString(36)}`);
+      fs.writeFileSync(probe, 'doctor writability probe\n');
+      fs.unlinkSync(probe);
+      stateDetail = dir;
+    } else {
       state.initProject(cwd);
       stateDetail = state.projectDir(cwd);
-    } catch (e) {
-      stateOk = false;
-      stateDetail = e.message;
     }
+  } catch (e) {
+    stateOk = false;
+    stateDetail = e.message;
   }
   add('state dir writable', stateOk, stateDetail);
 

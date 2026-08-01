@@ -1592,14 +1592,16 @@ function runMirrored(cwd, o, action, prepare) {
 function peekCanonical(file, what) {
   let raw;
   try {
-    raw = fs.readFileSync(file, 'utf8');
+    raw = fs.readFileSync(file);
   } catch (e) {
     const err = new Error(`${what} is ${e && e.code === 'ENOENT' ? 'absent' : 'unreadable'} on a read path — run ratchet doctor`);
     err.code = 'ERATCHETMIRROR';
     throw err;
   }
   try {
-    const parsed = JSON.parse(raw);
+    // Fatal decode, same rule as the slot parser: a lossy read would serve a
+    // U+FFFD-normalized projection of a record nobody wrote.
+    const parsed = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(raw));
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not a record');
     return parsed;
   } catch (_e) {

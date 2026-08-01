@@ -449,7 +449,11 @@ function prepareDefectTransition(s, ledger, id, toStatus, meta, mintId) {
       );
     }
     // Exact repeat but the mirror is missing, ambiguous, or stale: commit once
-    // solely to perform the D2b admission (or the in-place truing) below.
+    // SOLELY to admit or true the mirror — the mirror op alone. The transition
+    // already happened; re-applying it would restamp proof-owned timestamps
+    // and append duplicate log/history lines, forging a second audit trail
+    // for one event (review round 2, finding 3).
+    return { kind: 'commit', record: d, ledgerOps: [mirrorOpFor(ledger, d, now, mintId)] };
   }
 
   d.status = toStatus;

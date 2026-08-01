@@ -24,10 +24,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     (summary was dropped), and the exact-repeat validity check compares all three
     instead of counting linked rows — a stale-but-unique mirror is now trued by one
     committed repeat, then repeats no-op again.
-  - **Doctor observes without recovering (W4):** the WAL diagnosis now runs BEFORE the
-    writability probe, and under a pending slot the probe defers — previously doctor's
-    own `initProject` lock acquisition ran recovery, consumed the slot, and reported
-    "no pending intent" about the store it had just changed.
+  - **Doctor observes without recovering (W4, W4b):** the WAL diagnosis runs first, and
+    the writability probe no longer travels the write door at all — an existing store
+    is probed with a scratch file instead of `initProject`, whose lock acquisition ran
+    recovery. Previously doctor consumed the slot and reported "no pending intent"
+    about the store it had just changed; round 2 showed even a reordered probe loses a
+    slot that lands after the diagnosis sample, so the probe is now lock-free by
+    construction (W4b races a slot in after the sample and proves it survives).
   - **Resource reads are byte-pure, enforced (W5):** the MCP read paths (state/ledger
     resources, the receipt resource, `score.confidence`) now use pure peeks that never
     create, back up, or reinitialize a record; an unprovable record answers the one
@@ -36,6 +39,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **CLEAR re-checks identity (W6):** the slot delete (spec CLEAR step) re-reads the
     slot and refuses if the bytes are not the bytes this pass proved — on both the
     transaction's own clear and recovery's fenced clear.
+  - **Round 2 of the same review added three more, fixed the same way:** the peeks
+    decode fatally like the slot parser — a record with invalid UTF-8 answers the
+    allowlisted sentence instead of serving a U+FFFD-normalized projection (W7); the
+    stale-mirror truing commit moves ONLY the mirror — no duplicate log/history line,
+    no restamped proof timestamp; "commits once solely to admit it" now means exactly
+    that (W3 extended); and the doctor probe race above (W4b).
+  - **Known limitation (parked, review round 2): the identity-checked clear is two
+    syscalls.** The CLEAR step re-reads and compares before deleting, exactly as the
+    spec words it — but compare and unlink cannot be one atomic operation through a
+    pathname API (no compare-and-unlink exists; same class as the 2.5 check→read gap).
+    A substitution landing in that window is deleted. Reaching it requires a writer
+    that bypasses the workspace lock — every lawful writer publishes and clears slots
+    under it — so this is recorded as a named limit, not repaired with machinery the
+    contract cannot honor.
   - Ruled NOT defects, on the record: pre-commit `.tmp-` residue (documented inert by
     design in 4b.1), CLI/MCP byte-equality (ids and receipts differ by ratified
     design), and the MCP retry wording (the spec deliberately gives MCP the generic
