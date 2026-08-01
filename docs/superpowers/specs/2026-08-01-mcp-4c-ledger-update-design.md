@@ -1,7 +1,7 @@
 # MCP Step 4c: `ledger.update` — the second single-file safe core
 
-Date: 2026-08-01 (rev 7)
-Base: `main` at `41f7bf4` (all of step 4b merged and proven; PR #37 six-of-six CI)
+Date: 2026-08-01 (rev 8)
+Base: `main` at `141133e` (step 4b + both hardening PRs #38/#39 merged and proven)
 Branch: `feat/mcp-4c-ledger-update`
 Status: RATIFIED AS AMENDED — awaiting the five-voice re-run on this rev. History:
 rev 1 HOLD (D1/D2/D4 YES, D3/D5 returned) → rev 2 redesigned D3 (defect edits excluded
@@ -39,7 +39,23 @@ residual is stated once and referenced, never contradicted), decides saveLedger
 (PRIVATIZED; both upsert callers route through commitLedgerFamily; the publisher set
 is closed), and completes the checklist dispositions (wal.js untouched-by-4c,
 templates/ledger.json regenerated in 4c.2, README suite count fixed in #39). Gate
-remaining: five-voice round 5 on this rev, then 4c.1.
+remaining: five-voice round 5 on rev 7 returned DO-NOT-RATIFY with no critical and
+the shipped code confirmed correct — six precision findings, all accepted: the two
+falsifier-discrimination gaps landed as the test-only PR #40 (H3b asserts nextRev's
+own diagnosis, H3d split per field plus a safe-base/unsafe-target vector, each seen
+red against a deliberately weakened guard); this rev fixes box 3's ceiling wording
+(MAX-1 → MAX is a success publishing one after-image, not a zero-byte case),
+declares the expectedLedgerRev boundary contract (null or safe integer 0..2^53-1
+with schema minimum/maximum), closes the leftover publisher-set clause to the exact
+trio and points the test obligation at BOTH mirror-publish sites, qualifies the
+last three generic recreation passages to different-gen, tells ReceiptTooLarge's
+remediation truthfully per trigger (create: shorter id proceeds; update of an
+oversized-id record: not receiptable over the wire, CLI still can; oversized stored
+gen: doctor) with the capOverflow → ReceiptTooLarge mapping explicit and the
+state-side mislabel recorded as an open loop, enumerates all nine reachable error
+codes, prescribes the qa-ledger PROMPTS/SKILL routing delta with a
+neither-surface-carries-the-refused-spelling test, moves template regeneration to
+4c.1, and corrects the base SHA. Round 6 on this rev, then 4c.1.
 
 ## Objective
 
@@ -167,7 +183,10 @@ recovery precedes every supported writer.
 
 - `workspaceHandle` — same `resolveHandle` + `authority.use(handle, 'write')` as every
   4.1 tool; registered only on a `--write` server; one non-enumerating refusal.
-- `expectedLedgerRev` / `expectedLedgerGen` — required. Either BOTH carry the values
+- `expectedLedgerRev` / `expectedLedgerGen` — required. `expectedLedgerRev` is
+  `null` or a safe integer `0..9007199254740991` (declared in the advertised schema
+  with `minimum` AND `maximum`, the same contract the state envelope ships;
+  boundary vectors pin both edges). Either BOTH carry the values
   read from `workspace.open`/the ledger resource, or BOTH are `null`, which is the
   explicit spelling of "I decided against a pre-envelope (version-1) ledger" (D4) and
   then REQUIRES `expectedLedgerHash` naming the exact observed bytes. A mixed pair, a
@@ -296,8 +315,9 @@ target collection refuses `DeterministicIdConflict` before changing bytes. CLI k
 
 The eviction theorem transfers whole: a receipt evicts only after ≥ 32 later family
 commits, so the evicted operation's `expectedLedgerRev` is deeply stale and its retry
-refuses. `ledgerGen` covers the out-of-band recreation lineage case, exactly as
-`stateGen` does for state.
+refuses. `ledgerGen` covers the DIFFERENT-GEN recreation lineage case — every supported
+wipe/recreate mints a new generation — exactly as `stateGen` does for state; the
+same-gen raw-copy residual is the one stated in the publisher-invariant section.
 
 ## Contract boundary
 
@@ -425,8 +445,9 @@ falsifiable — `state.js` also exports raw primitives like `writeJson`,
 `writeFileAtomic`, and `ledgerPath`, and `writeJson(ledgerPath(root), obj)` publishes
 anything). The rule and its test cover the ENUMERATED supported canonical publisher
 APIs — the family commit, the mirror publisher, creation/wipe, and whatever
-the now-privatized `saveLedger` routes into — within an unchanged `ledgerGen`. The
-raw exported primitives
+nothing else — the closed trio, restated wherever the invariant appears: the family
+commit, the private WAL mirror publisher, and the creation/wipe paths, within an
+unchanged `ledgerGen`. The raw exported primitives
 are out-of-band by the 4b doctrine (a raw low-level write is corruption tooling, not
 a supported writer door); they cannot be made revision-aware without becoming the
 thing they exist beneath. The residual is stated honestly (round-3 correction — rev 5
@@ -436,9 +457,11 @@ preserving gen and rev, with no intent pending, is NOT detected — the next fam
 matches. That is the same trust boundary every canonical record in this system
 already lives with; the enumerated-publisher invariant is a claim about supported
 doors, not about an author with filesystem access. `initProject --force` is
-classified above: lineage replacement, not a rev-silent edit. The test therefore proves: through every enumerated supported
-publisher, features/tests cannot change without `ledgerRev` advancing under the same
-gen — not a claim over arbitrary exported plumbing.
+classified above: lineage replacement, not a rev-silent edit. The test therefore proves, against the SAME closed trio named above — family
+commit, WAL mirror publisher (BOTH of its sites: the ordinary transaction publish
+and recovery's re-publish), creation/wipe — that features/tests cannot change
+without `ledgerRev` advancing under the same gen. Not a claim over arbitrary
+exported plumbing, and not a quantifier over an unstated set.
 
 Why this is sound rather than convenient:
 
@@ -473,12 +496,23 @@ identical retry must fail identically):
   ratchet doctor and archive or reset the ledger before writing.` A mutating commit
   atop a record at `Number.MAX_SAFE_INTEGER`. Non-retryable; replay, no-ops, and
   reads remain available.
-- `ReceiptTooLarge`: `The operation's receipt exceeds the persisted cap; shorten the
-  record id or oversized fields and retry as a new operation.` Deterministic — the
-  receipt echoes `recordId` (client-supplied `item.id`) and lineage fields, and a
-  ~5,000-byte id stays under the 16-KiB item cap while blowing the 4-KiB receipt
-  cap. Non-retryable as sent; a NEW operation with shorter fields proceeds. Both
-  output-schema branches, fixtures, and CHANGELOG bullets are owed with the tool.
+- `ReceiptTooLarge`: `The operation's receipt exceeds the persisted cap; this
+  request cannot succeed as sent — see ratchet doctor if the store's own fields are
+  oversized.` Deterministic — the receipt echoes `recordId` (client-supplied
+  `item.id`) and lineage fields, and a ~5,000-byte id stays under the 16-KiB item
+  cap while blowing the 4-KiB receipt cap. The remediation is told truthfully per
+  trigger (round-5 correction — "shorten and retry" was wrong for two of three
+  cases): a CREATE with an oversized id proceeds as a new operation with a shorter
+  id; an UPDATE addressing an existing oversized-id record cannot be receipted over
+  the wire at all (the id names the record — shortening it addresses a different
+  record; the CLI, which persists no receipt, still can); an oversized stored
+  `ledgerGen` is not client-controllable and is a store condition for doctor. The
+  outcome mapping is explicit: for `ledger.update`, the `capOverflow` outcome maps
+  to `ReceiptTooLarge`, never to retryable `WriteFailed`. The state-side writers
+  keep today's `WriteFailed` mapping for the identical condition — a known
+  inherited mislabel, RECORDED as an open loop (owner: Danny) rather than silently
+  rewriting ten shipped tool schemas inside 4c. Both output-schema branches,
+  fixtures, and CHANGELOG bullets are owed with the tool.
 
 - `StaleLedgerRev`: structured error with `expectedLedgerRev` and `actualLedgerRev`,
   both INTEGER-ONLY (round-2 finding: the nullable branch was unreachable — a
@@ -586,7 +620,7 @@ gen, or a version/field mismatch locally and repairs nothing.
   no-op + the D3 `ledger update defects` refusal (all named CHANGELOG changes),
   `workspace.open`/resource projections.
 - **4c.3 — Adversarial pass.** Family-vs-WAL interleavings under the lock, admission
-  races, damaged-ledger matrix, eviction/recreation lineage cases, refusal
+  races, damaged-ledger matrix, eviction and different-gen-recreation lineage cases, refusal
   byte-purity, error-text allowlist, both protocol eras, both OS families.
 
 ### Landing checklist (five-voice finding: name every surface before building)
@@ -602,11 +636,17 @@ advertises `features|tests|defects` and must drop `defects`). `wal.js` is untouc
 BY 4C and the 4c diff proves it — its safe-integer revision parsing landed in the
 pre-4c hardening (PR #39), so "untouched" is a claim about this step, not about
 history. `templates/ledger.json` (packaged v1 template) is REGENERATED to the
-version-2 shape in 4c.2 — a template that mints the shape admission exists to
-retire would be drift by packaging. Beyond src (round-2 finding — the packaged surfaces):
+version-2 shape in 4c.1, the same sub-step that ships schema v2 (round-5
+correction: regenerating it in 4c.2 would package exactly the drift the checklist
+forbids for one sub-step's width). Beyond src (round-2 finding — the packaged surfaces):
 `skills/qa-ledger/SKILL.md` instructs the exact command D3 now refuses and must be
-rewritten (which drags `reference/PROMPTS.md` and the plugin-shape sync rules with
-it); README documents only the four read tools — the conditional write roster,
+rewritten, and the delta is PRESCRIBED, not discovered (round-5 finding — the drift
+police prove PROMPTS.md → generated JSON, not skill ↔ prompt semantics): the
+canonical qa-ledger prompt in `reference/PROMPTS.md` gains the D3 routing rule in
+so many words — defect records enter and change ONLY through the defect verbs;
+`ledger update` addresses features and tests — and the SKILL.md serialize section
+swaps `ratchet ledger update defects …` for the corresponding `ratchet defect …`
+commands, with a test asserting the refused spelling appears in neither surface; README documents only the four read tools — the conditional write roster,
 `ledger.update`, and the v1 `ledgerBytesHash` read surface need rows.
 Tests: `cli`, `mcp-server`, `mcp-write`, `mcp-wal` (call sites migrating off raw
 `saveLedger`), entry/concurrency suites, plugin-shape (skill/README sync). Fixture
@@ -626,10 +666,13 @@ rewrite); CLI strict load on existing bytes; identical-merge no-op (with
 `ledgerRev: null` on the v1 no-op); `item.id` string tightening; `saveLedger`
 classification; hash-bound admission and the public `ledgerBytesHash` /
 `expectedLedgerHash` / `actualLedgerHash` contract; the complete public
-success/error schema for the tool (`StaleLedgerRev` / `StaleLedgerGen` /
-`LedgerDamaged` / `LedgerRevisionExhausted` / `ReceiptTooLarge` shapes, the two new
-codes declared non-retryable); revision ceiling semantics; the `saveLedger`
-privatization.
+error surface for the tool — ALL NINE reachable codes, enumerated so the schema
+work cannot undercount: the five ledger-specific (`StaleLedgerRev`,
+`StaleLedgerGen`, `LedgerDamaged`, `LedgerRevisionExhausted`, `ReceiptTooLarge` —
+the last two declared non-retryable) plus the four inherited
+(`OperationIdConflict`, `DeterministicIdConflict`, `WriteFailed`,
+`MirrorUnrecoverable` via central recovery); revision ceiling semantics; the
+`saveLedger` privatization.
 
 Notably absent from 4c, restated: no intent-schema change, no new WAL tooling, no
 version bump (the release that ships 4c bumps all five fields then, not now).
@@ -666,7 +709,7 @@ tree 4c.1 builds on carries every repair this spec's envelope section mandates.
 
 1. **Replay proofs.** The five 4.1 crash-boundary tests against the ledger line — lost
    response, crash before commit (real child-process failpoint at the rename), reconnect
-   replay across a server replacement, binding conflict, eviction/reset/recreation —
+   replay across a server replacement, binding conflict, eviction/reset/different-gen recreation —
    each seen red against a deliberately broken variant.
 2. **One rename.** A committed write moves `ledgerRev` exactly once with its receipt in
    the same bytes; a kill at any point leaves exactly the before-bytes or the
@@ -676,9 +719,10 @@ tree 4c.1 builds on carries every repair this spec's envelope section mandates.
    DIFFERENT-GEN recreation (round-4 rename: the gen-minting case is what CAS
    refuses; the same-gen raw-copy residual is out-of-band by the stated doctrine and
    is pinned as accepted, not refused) each refuse — or pin — with byte-snapshot
-   proof of zero movement. Plus the ceiling pair: `MAX - 1 → MAX` commits;
-   mutation-at-`MAX` refuses `LedgerRevisionExhausted`; an oversized deterministic
-   receipt refuses `ReceiptTooLarge`; all three zero-byte.
+   proof of zero movement. Plus the ceiling set: `MAX - 1 → MAX` COMMITS and
+   publishes exactly one after-image (it is a success, not a refusal);
+   mutation-at-`MAX` refuses `LedgerRevisionExhausted` and an oversized
+   deterministic receipt refuses `ReceiptTooLarge` — those two move zero bytes.
 4. **Admission.** Version-1 fixtures admit exactly once under race (two hash-bearing
    admitters, one commit, one `StaleLedgerGen`); the admitting rename carries version,
    gen, rev 1, ring, and the domain change together; CLI first-touch admits
@@ -790,4 +834,8 @@ incomplete, PR #39 completed it (both merged, CI 6/6, falsifiers red-first).
 Five-voice round 4 on rev 6: openai-codex (gpt-5.6-sol), 2026-08-01 — DO-NOT-RATIFY;
 seven findings, all accepted (one critical against the shipped fix itself).
 Rev 7 patches (spec-side five) traced by: claude-fable-5
-Awaiting: five-voice round 5 on rev 7 → then 4c.1.
+Five-voice round 5 on rev 7: openai-codex (gpt-5.6-sol), 2026-08-01 — DO-NOT-RATIFY,
+no critical, shipped code confirmed correct; six precision findings, all accepted
+(falsifier gaps → test-only PR #40, red-checked against weakened guards).
+Rev 8 patches (spec-side) traced by: claude-fable-5
+Awaiting: five-voice round 6 on rev 8 → then 4c.1.
