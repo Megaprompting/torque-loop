@@ -1,21 +1,17 @@
 # MCP Step 4c: `ledger.update` — the second single-file safe core
 
-Date: 2026-08-01 (rev 3)
+Date: 2026-08-01 (rev 4)
 Base: `main` at `41f7bf4` (all of step 4b merged and proven; PR #37 six-of-six CI)
 Branch: `feat/mcp-4c-ledger-update`
-Status: REV 3 AFTER FIVE-VOICE DO-NOT-RATIFY. History: rev 1 HOLD (D1/D2/D4 YES,
-D3/D5 returned) → rev 2 redesigned D3 (defect edits excluded on BOTH doors) and D5
-(open stops repairing the ledger), ratified by Danny 2026-08-01 → the independent
-five-voice pass on rev 2 returned DO-NOT-RATIFY: claims 1/3/5 and the core of 6 sound,
-seven findings (1 critical, 2 high, 2 medium, 2 low). All seven ACCEPTED at the gate.
-Six are patched into this rev: the publisher split that makes D2 CLI-enforceable
-(critical — exported `saveLedger` was a revision-silent escape), the strict validation
-matrix, the open-boundary ordering, `item.id`/`recordId` typing, the cross-ring
-wording correction, and the landing checklist. The seventh — null-lineage admission
-cannot name WHICH version-1 ledger it decided against — is an accepted defect whose
-fix amends ratified D4, so D4 is REOPENED below with two candidate resolutions and a
-recommendation (owner: Danny). No 4c code until D4 is re-ruled and the five-voice pass
-clears this rev.
+Status: RATIFIED AS AMENDED — awaiting the five-voice re-run on this rev. History:
+rev 1 HOLD (D1/D2/D4 YES, D3/D5 returned) → rev 2 redesigned D3 (defect edits excluded
+on BOTH doors) and D5 (open stops repairing the ledger), ratified by Danny 2026-08-01
+→ five-voice pass on rev 2: DO-NOT-RATIFY, seven findings, all accepted; six patched
+in rev 3 (publisher split making D2 CLI-enforceable, strict validation matrix,
+open-lock ordering, `item.id` typing, cross-ring wording, landing checklist); the
+seventh reopened D4 → Danny re-ruled D4 as OPTION A, hash-bound admission, 2026-08-01
+(this rev folds it in as settled design). Gate remaining: five-voice re-run on rev 4,
+then 4c.1.
 
 ## Objective
 
@@ -129,15 +125,18 @@ recovery precedes every supported writer.
   4.1 tool; registered only on a `--write` server; one non-enumerating refusal.
 - `expectedLedgerRev` / `expectedLedgerGen` — required. Either BOTH carry the values
   read from `workspace.open`/the ledger resource, or BOTH are `null`, which is the
-  explicit spelling of "I decided against a pre-envelope (version-1) ledger" (D4).
-  A mixed pair refuses `-32602` at the boundary. State's `expectedStateRev`/`Gen` do
-  not appear: this tool touches no state bytes, moves no state revision, and writes no
-  state receipt.
+  explicit spelling of "I decided against a pre-envelope (version-1) ledger" (D4) and
+  then REQUIRES `expectedLedgerHash` naming the exact observed bytes. A mixed pair, a
+  null pair without the hash, or a non-null pair carrying one refuses `-32602` at the
+  boundary. State's `expectedStateRev`/`Gen` do not appear: this tool touches no
+  state bytes, moves no state revision, and writes no state receipt.
 - `operationId` — unchanged 4.1 contract (`[A-Za-z0-9_-]{22,128}`, never reused for a
   different operation).
 - `argsHash` — SHA-256 over the 4.1 canonical encoding of
-  `{tool, collection, item, expectedLedgerRev, expectedLedgerGen}`. Handle and
-  operationId excluded, for the reconnect reason 4.1 proved the hard way.
+  `{tool, collection, item, expectedLedgerRev, expectedLedgerGen,
+  expectedLedgerHash}` (the hash field normalized to `null` on version-2 writes, the
+  `supersededBy` precedent). Handle and operationId excluded, for the reconnect
+  reason 4.1 proved the hard way.
 - `item` — free-form object, same admission the CLI upsert gives it today; this spec
   deliberately does not invent record schemas for features/tests (their shapes remain
   the documented conventions in `schemas.js` comments). The canonical serialization of
@@ -166,7 +165,9 @@ recovery precedes every supported writer.
    different `argsHash` → `OperationIdConflict`; zero bytes move. Replay precedes CAS
    (the 4.1 order, for the 4.1 reason), and BOTH follow the strict load.
 4. Lineage check: `expectedLedgerGen` against the loaded value (`null` matches only a
-   version-1 ledger). Mismatch → `StaleLedgerGen`, zero bytes.
+   version-1 ledger, and then `expectedLedgerHash` must equal the hash of the exact
+   loaded bytes — D4 as re-ruled). Gen mismatch, or hash mismatch on an admission
+   write, → `StaleLedgerGen`, zero bytes.
 5. Revision check: `expectedLedgerRev` against `ledgerRev` (`null` matches only a
    version-1 ledger). Mismatch → `StaleLedgerRev`, zero bytes.
 6. Domain: the existing `ledger.upsert` merge semantics, one implementation behind
@@ -213,9 +214,10 @@ The matrix is the contract for the loader, the doctor, AND the fixtures: verific
 box 8 enumerates one fixture per row.
 
 Deterministic ids for created records:
-`<prefix>-<sha256(expectedLedgerGen | tool | argsHash | role)[0..31]>`, with the
-literal string `null` standing in for a pre-envelope expectation, so an admission
-write's retry converges on the same id. A derived id already naming any record in the
+`<prefix>-<sha256(expectedLedgerGen | tool | argsHash | role)[0..31]>`, with
+`expectedLedgerHash` standing in for the absent gen on an admission write (D4) — the
+observed bytes ARE the lineage there, so an admission retry converges on the same id
+for the same observed ledger. A derived id already naming any record in the
 target collection refuses `DeterministicIdConflict` before changing bytes. CLI keeps
 `makeId`; its boundary has no retry.
 
@@ -284,38 +286,36 @@ New ledgers are born version 2 (`newLedger` stamps `ledgerRev: 0`, a fresh `ledg
 `operations: []`), including the `init --force` replacement path — a wiped ledger is a
 NEW lineage with a new gen, which is exactly what makes a pre-wipe expectation refuse.
 
-**ACCEPTED DEFECT (five-voice high finding) — the null pair names a schema state, not
-a lineage.** `null/null` matches "some version-1 ledger", not THE version-1 ledger the
-client decided against. The failure: an admission receipt is gone (evicted, or the
-admitted file was destroyed), a DIFFERENT valid v1 backup is restored out-of-band, and
-a held null expectation still matches — the old decision applies to unrelated bytes.
-That is precisely the recreation case generations exist to refuse, and a v1 ledger
-physically has no generation. Two candidate resolutions, decision REOPENED under D4
-below (owner: Danny):
+**The null pair alone names a schema state, not a lineage — so admission binds the
+bytes (D4 as re-ruled by Danny, Option A).** `null/null` would match "some version-1
+ledger", not THE version-1 ledger the client decided against: with the admission
+receipt gone, a DIFFERENT valid v1 backup restored out-of-band would satisfy a held
+null expectation — the recreation case generations exist to refuse, on the one record
+that physically has no generation. Therefore an admission write carries a third
+required field:
 
-- **Option A (recommended — closes the hole without crossing the ratified line):**
-  admission writes carry a third required field, `expectedLedgerHash` — the SHA-256
-  of the exact v1 canonical bytes the client observed. `workspace.open` and the
-  ledger resource expose that hash (`ledgerBytesHash`) whenever `ledgerGen` is null.
-  The admission CAS becomes "still version 1 AND still exactly these bytes"; a
-  mismatch refuses `StaleLedgerGen` carrying `actualLedgerGen: null` plus the actual
-  hash. Honest residual, stated in the spec: a byte-identical v1 restore remains
-  indistinguishable — but then the decision basis is byte-identical, which is the
-  same claim every CAS makes. `expectedLedgerHash` joins the binding hash; the
-  deterministic-id derivation for admission uses it in place of the absent gen.
-- **Option B (the reviewer's recommendation — cleaner, but crosses ratified D4):**
-  `workspace.open` migrates a HEALTHY v1 ledger to v2 under its lock (post-recovery,
-  pre-handle: mint gen, `ledgerRev: 0`, empty ring), so every wire write sees a real
-  lineage and the null-pair machinery is deleted. Cost: open becomes a writer over
-  healthy existing bytes on every legacy store — the exact "upgrade-on-open turns a
-  read boundary into a silent writer" alternative the ratified D4 rejected. The
-  counter-argument is real too: open already writes on absence, so "open initializes"
-  arguably extends to "open modernizes," and the client ergonomics are strictly
-  better (no admission special case at all).
+- `expectedLedgerHash` — the SHA-256 (`sha256:` form) of the exact v1 canonical bytes
+  the client observed. `workspace.open` and the ledger resource expose that hash as
+  `ledgerBytesHash` whenever `ledgerGen` is null (and omit it, never null it, on
+  version-2 stores — emptiness stated by the null gen itself).
+- The admission CAS is "still version 1 AND still exactly these bytes". A hash
+  mismatch refuses `StaleLedgerGen` with `actualLedgerGen: null` and the actual bytes
+  hash (`actualLedgerHash`) so the client can re-read and re-decide.
+- The envelope rule is exhaustive at the boundary: EITHER non-null rev + non-null gen
+  with NO `expectedLedgerHash`, OR the null pair WITH it. Any other combination
+  refuses `-32602` before the store is touched.
+- `expectedLedgerHash` joins the binding hash (normalized to `null` for version-2
+  writes, the `supersededBy` precedent), and the deterministic-id derivation for an
+  admission write uses it in place of the absent gen — so an admission retry
+  converges on the same ids for the same observed bytes.
+- Honest residual, stated: a byte-identical v1 restore remains indistinguishable.
+  That is acceptable by construction — the decision basis is byte-identical, which is
+  the same claim every CAS makes about the record it certifies.
 
-Verification boxes 3 and 4 extend per the chosen option (hash-CAS fixtures and
-restored-backup refusal under A; migration idempotence, migration-vs-CLI-admission
-interleaving, and read-purity boundary proofs under B).
+Verification obligations: box 3 gains "null pair + wrong hash against a different v1
+fixture refuses with zero bytes"; box 4 gains "admission receipt evicted, different
+valid v1 backup restored, the old admission envelope refuses; the byte-identical
+restore case is pinned as accepted-by-design."
 
 ## The concurrency rule (the one D5 demanded)
 
@@ -372,7 +372,8 @@ Three codes join the one safe funnel (`safeWriteError`), literal, path/errno-fre
   (integer or `null`), same contract as `StaleStateRev`.
 - `StaleLedgerGen`: structured error with `expectedLedgerGen` and `actualLedgerGen`
   (string or `null`); wins before the revision comparison; also the refusal a stale
-  null-pair admission race receives.
+  admission receives — a lost race (actual gen non-null) or a bytes mismatch
+  (actual gen `null` plus `actualLedgerHash` naming what is actually on disk).
 - `LedgerDamaged`: `The ledger record cannot be read safely; run ratchet doctor and
   repair the reported condition before retrying.` A store condition, not a request
   refusal: the strict load could not prove healthy bytes, zero bytes moved, and no
@@ -413,7 +414,10 @@ against the pre-open snapshot; box 8 proves it.
 Reads: `workspace.open`, the ledger resource, and the receipt surface expose
 `ledgerRev` and `ledgerGen` (both `null` for version 1) beside the existing fields —
 these are persisted canonical bytes, not derived flags, so byte-pure reads simply
-report them. `pendingIntent` semantics are unchanged from 4b. `ratchet doctor` learns
+report them. On a version-1 store the same surfaces additionally expose
+`ledgerBytesHash` (derived from the bytes just read — a hash of what was served, not
+a new persisted field), which is what an admission write echoes back as
+`expectedLedgerHash`; version-2 responses omit it. `pendingIntent` semantics are unchanged from 4b. `ratchet doctor` learns
 the version-2 shape read-only: it names a malformed ring, a non-integer rev, a missing
 gen, or a version/field mismatch locally and repairs nothing.
 
@@ -491,12 +495,15 @@ version bump (the release that ships 4c bumps all five fields then, not now).
    the same bytes; a kill at any point leaves exactly the before-bytes or the
    after-bytes; no third shape exists in any fixture.
 3. **CAS.** Stale rev, stale gen, null-pair against version 2, non-null pair against
-   version 1, and same-rev out-of-band recreation each refuse with byte-snapshot proof
-   of zero movement.
-4. **Admission.** Version-1 fixtures admit exactly once under race (two null-pair
-   writers, one commit, one `StaleLedgerGen`); the admitting rename carries version,
+   version 1, admission hash against a DIFFERENT v1 fixture, and same-rev out-of-band
+   recreation each refuse with byte-snapshot proof of zero movement.
+4. **Admission.** Version-1 fixtures admit exactly once under race (two hash-bearing
+   admitters, one commit, one `StaleLedgerGen`); the admitting rename carries version,
    gen, rev 1, ring, and the domain change together; CLI first-touch admits
-   identically; WAL recovery over a version-1 ledger never admits.
+   identically; WAL recovery over a version-1 ledger never admits. Lineage fixtures:
+   admission receipt evicted then a different valid v1 backup restored → the old
+   admission envelope refuses on hash; the byte-identical restore case is pinned as
+   accepted-by-design with the residual named in the assertion message.
 5. **WAL coexistence.** With version-2 ledgers, the full 4b crash matrix still
    converges byte-exact (mirror publishes preserve rev/gen/ring); a family commit and
    a defect verb interleaved under the lock never lose either write; version-1 intents
@@ -524,11 +531,11 @@ version bump (the release that ships 4c bumps all five fields then, not now).
 ## Decision points for ratification (owner: Danny)
 
 On the record: rev 1 review called D1/D2/D4 YES, D3/D5 NO; Danny ratified rev 2's
-redesigned D3/D5 on 2026-08-01. The five-voice pass on rev 2 then returned
-DO-NOT-RATIFY: D1, D3, and D5 stand as ratified; D2 stands AMENDED by the publisher
-split (an enforcement mechanism for the ratified rule, not a reversal); D4 is
-REOPENED and owes Danny one ruling (A or B). The five-voice pass re-runs on this rev
-after that ruling, before any code.
+redesigned D3/D5 on 2026-08-01. The five-voice pass on rev 2 returned DO-NOT-RATIFY;
+its findings left D1, D3, and D5 standing, amended D2 with the publisher split (an
+enforcement mechanism for the ratified rule, not a reversal), and reopened D4. Danny
+re-ruled D4 as Option A (hash-bound admission) on 2026-08-01. All five calls are now
+explicit again; the five-voice re-run on THIS rev is the last gate before 4c.1.
 
 - **D1 — Second single-file safe core, not a WAL tool.** The ledger becomes a
   first-class record (version 2: `ledgerRev`, `ledgerGen`, `operations` ring) and
@@ -549,17 +556,17 @@ after that ruling, before any code.
   is not ownership. CLI `ledger update defects` now refuses outright (named CHANGELOG
   behavior change); the status-only gate remains as backstop. Alternative: the rev 1
   wire-only exclusion — rejected on review. **Recommended: YES as redesigned.**
-- **D4 — REOPENED (five-voice high finding).** The rev 2 null-pair CAS names a schema
-  state, not a lineage: after the admission receipt is gone, a different valid v1
-  backup restored out-of-band satisfies the old expectation. The race-safety, the
-  no-migration-verb call, WAL-never-admits, and the replay ordering all survive; what
-  needs Danny's re-ruling is HOW an admission write names which v1 bytes it decided
-  against. **Option A (recommended): bind the exact observed v1 bytes with a required
-  `expectedLedgerHash`** — preserves "no read ever upgrades bytes," honest residual
-  (byte-identical restores indistinguishable) stated. **Option B: open migrates
-  healthy v1 → v2 pre-handle** — deletes the admission machinery entirely, at the
-  cost of the upgrade-on-open line rev 2 was ratified for drawing. Full text in the
-  D4 policy section.
+- **D4 — RE-RULED: Option A, hash-bound admission (Danny, 2026-08-01).** The five-
+  voice pass proved the rev 2 null pair named a schema state, not a lineage (a
+  different valid v1 backup restored after receipt loss would satisfy an old
+  expectation). Admission now additionally binds the exact observed v1 bytes with a
+  required `expectedLedgerHash`; mismatch refuses `StaleLedgerGen` with the actual
+  hash. Preserves "no read ever upgrades bytes"; the byte-identical-restore residual
+  is stated and accepted by construction. The rejected alternative on the record:
+  open migrates healthy v1 → v2 pre-handle (reviewer-preferred ergonomics, but it
+  crosses the upgrade-on-open line this design was ratified for drawing). Race-
+  safety, no-migration-verb, WAL-never-admits, and replay ordering all carry over
+  from the rev 2 call.
 - **D5 (redesigned) — strict loading on every door that matters, INCLUDING the open
   boundary.** Rev 1 covered the CLI (no CAS flags; rev-advance; strict load for
   existing bytes; identical-merge no-op — all kept, all named CHANGELOG changes) but
@@ -582,5 +589,6 @@ claims 1/3/5/6-core graded HOLDS; 7 findings, all accepted at the gate; the crit
 finding's citations (exported `saveLedger`, test usage as a writer door) verified
 against the tree before this rev.
 Rev 3 patches (6 findings) traced by: claude-fable-5
-Awaiting: Danny's D4 re-ruling (Option A recommended) → five-voice pass on rev 3 →
-then 4c.1.
+D4 re-ruled by Danny 2026-08-01: Option A, hash-bound admission.
+Rev 4 (D4 folded in as settled design) traced by: claude-fable-5
+Awaiting: five-voice re-run on rev 4 → then 4c.1.
