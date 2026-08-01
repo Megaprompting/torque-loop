@@ -161,7 +161,11 @@ function ensureDir(dir) {
 
 function readJson(file) {
   try {
-    return JSON.parse(fs.readFileSync(file, 'utf8'));
+    // Fatal decode: this is the healthy-record fast path, and a lossy read
+    // here hands callers a U+FFFD-normalized object that a lawful write then
+    // serializes. Undecodable bytes are not healthy — answer null and let the
+    // slow path preserve them.
+    return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(fs.readFileSync(file)));
   } catch (_e) {
     return null;
   }
@@ -272,7 +276,7 @@ function backupCorrupt(file, raw) {
 function readJsonResilient(file) {
   let raw;
   try {
-    raw = fs.readFileSync(file, 'utf8');
+    raw = fs.readFileSync(file);
   } catch (e) {
     // ENOENT is the only error that means "there is no record yet". Anything
     // else — an ACL that denies read but permits write, a lock, EIO — means the
@@ -284,9 +288,19 @@ function readJsonResilient(file) {
         'refusing to reinitialize over a record that is present but unreadable. Fix access, then re-run.'
     );
   }
-  if (!raw.trim()) return null; // empty file → fresh, no noisy backup
+  let text;
   try {
-    const parsed = JSON.parse(raw);
+    text = new TextDecoder('utf-8', { fatal: true }).decode(raw);
+  } catch (_e) {
+    // Invalid bytes travel the SAME preservation path as invalid JSON. The
+    // lossy decode used to parse them into a U+FFFD-normalized record that a
+    // lawful ordinary write then serialized — the two canonical files settled
+    // in disagreement with no backup, no intent, and no warning.
+    return rejectUnusable(file, raw, 'it is not valid UTF-8');
+  }
+  if (!text.trim()) return null; // empty file → fresh, no noisy backup
+  try {
+    const parsed = JSON.parse(text);
     // `null`, `false`, `0`, `""` and `[]` all parse. They are not records, and the
     // caller reinitializes over anything falsey — so they have to travel the SAME
     // preservation path as malformed bytes, or a valid-but-unusable document gets
@@ -760,7 +774,7 @@ function recoverPendingIntentLocked(cwd) {
           throw e;
         }
       },
-      clearIntent: () => clearIntentFile(file),
+      clearIntent: (proven) => clearIntentFile(file, proven),
       validateMcpReceipt: validateMirrorReceipt,
     });
   } finally {
@@ -772,11 +786,28 @@ function recoverPendingIntentLocked(cwd) {
 // rename: a scanner holding intent.json for an instant must not fail an
 // operation whose work is already done. A persistent refusal throws and the
 // slot survives — recovery clears it later, which is exactly what it is for.
-function clearIntentFile(file) {
+// The spec's CLEAR step re-checks intent identity before the delete: the bytes
+// removed must be the bytes this pass proved, or the delete would erase a slot
+// some other story published. A mismatch is ambiguous and the slot survives.
+function clearIntentFile(file, provenBytes) {
   const deadline = Date.now() + envMs('RATCHET_PUBLISH_TIMEOUT_MS', 10000);
   for (;;) {
     try {
       fenceForFile(file);
+      if (provenBytes) {
+        let current;
+        try {
+          current = fs.readFileSync(file);
+        } catch (e) {
+          if (e && e.code === 'ENOENT') return; // already cleared — done is done
+          throw e;
+        }
+        if (!current.equals(Buffer.from(provenBytes))) {
+          const err = new Error('WAL intent unrecoverable: the slot changed identity before its clear');
+          err.code = 'ERATCHETMIRROR';
+          throw err;
+        }
+      }
       fs.unlinkSync(file);
       return;
     } catch (e) {
@@ -798,6 +829,7 @@ function validateMirrorReceipt(stateObj, intent) {
   if (hits.length !== 1) return false;
   const hit = hits[0];
   return (
+    hit.tool === intent.tool &&
     hit.argsHash === intent.argsHash &&
     String(hit.gen || '') === intent.stateGen &&
     hit.rev === intent.targetStateRev &&
@@ -1478,7 +1510,10 @@ function readForMirror(file, what) {
     throw err;
   }
   try {
-    const parsed = JSON.parse(bytes.toString('utf8'));
+    // Fatal decode, same rule as the slot parser: a lossy read here would let
+    // a lawful write serialize a U+FFFD-normalized record and settle the two
+    // files in permanent disagreement with no pending intent left behind.
+    const parsed = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not a record');
     return { bytes, parsed };
   } catch (_e) {
@@ -1537,8 +1572,10 @@ function runMirrored(cwd, o, action, prepare) {
   };
   // Self-check: the slot we publish must be one our own recovery accepts —
   // cap included. Failing closed here costs nothing; failing open costs a
-  // store nobody can recover.
-  wal.parseIntent(Buffer.from(wal.serializeRecord(intent), 'utf8'));
+  // store nobody can recover. The bytes are kept: the clear below re-checks
+  // it deletes exactly the slot this transaction published.
+  const intentBytes = Buffer.from(wal.serializeRecord(intent), 'utf8');
+  wal.parseIntent(intentBytes);
   if (!createJsonExclusive(intentPath(cwd), intent)) {
     const err = new Error('the intent slot is occupied — recovery should have resolved it; refusing to overwrite');
     err.code = 'ERATCHETMIRROR';
@@ -1553,7 +1590,7 @@ function runMirrored(cwd, o, action, prepare) {
   // recovery. The operation HAS happened; only the answer must say "pending".
   try {
     writeFileAtomic(ledgerPath(cwd), ledgerAfterBytes, () => fenceForFile(ledgerPath(cwd)));
-    clearIntentFile(intentPath(cwd));
+    clearIntentFile(intentPath(cwd), intentBytes);
   } catch (e) {
     const err = new Error(
       `the state change committed (rev ${s.rev}) but the mirror is pending recovery — re-run the command: ${e && e.message}`
@@ -1562,6 +1599,41 @@ function runMirrored(cwd, o, action, prepare) {
     throw err;
   }
   return { committed: true, rev: s.rev, state: s, result: prep.result };
+}
+
+// Pure reads for the MCP read paths (spec 4b: every resource read is byte-pure,
+// a stable projection or a conservative refusal). Unlike the resilient loaders
+// they never create, back up, or reinitialize — present-but-unprovable bytes
+// refuse with the mirror code the funnel already maps to its one sentence, and
+// absence after open (which initializes both records) is the same condition.
+function peekCanonical(file, what) {
+  let raw;
+  try {
+    raw = fs.readFileSync(file);
+  } catch (e) {
+    const err = new Error(`${what} is ${e && e.code === 'ENOENT' ? 'absent' : 'unreadable'} on a read path — run ratchet doctor`);
+    err.code = 'ERATCHETMIRROR';
+    throw err;
+  }
+  try {
+    // Fatal decode, same rule as the slot parser: a lossy read would serve a
+    // U+FFFD-normalized projection of a record nobody wrote.
+    const parsed = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(raw));
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not a record');
+    return parsed;
+  } catch (_e) {
+    const err = new Error(`${what} is present but not a readable record — run ratchet doctor`);
+    err.code = 'ERATCHETMIRROR';
+    throw err;
+  }
+}
+
+function peekState(cwd) {
+  return peekCanonical(statePath(cwd), 'state record');
+}
+
+function peekLedger(cwd) {
+  return peekCanonical(ledgerPath(cwd), 'ledger record');
 }
 
 function loadLedger(cwd) {
@@ -1627,6 +1699,8 @@ module.exports = {
   withFileLock,
   diagnoseIntent,
   loadLedger,
+  peekState,
+  peekLedger,
   saveLedger,
   makeId,
   proposeOnlyAgent,

@@ -42,13 +42,19 @@ function authorityState(git) {
   return { level: 'committed-local', label: 'committed-local — HEAD is on no remote branch' };
 }
 
-function assemble(cwd = process.cwd()) {
-  const s = state.loadState(cwd);
+function assemble(cwd = process.cwd(), opts = {}) {
+  // MCP resource reads peek (byte-pure, refuse on unprovable bytes); the CLI
+  // cold read keeps its resilient loaders — it may be the first touch ever.
+  const s = opts.peek ? state.peekState(cwd) : state.loadState(cwd);
   let ledger = {};
-  try {
-    ledger = state.loadLedger(cwd);
-  } catch (_e) {
-    ledger = {};
+  if (opts.peek) {
+    ledger = state.peekLedger(cwd);
+  } else {
+    try {
+      ledger = state.loadLedger(cwd);
+    } catch (_e) {
+      ledger = {};
+    }
   }
 
   let events = [];

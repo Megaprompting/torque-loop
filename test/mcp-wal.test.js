@@ -892,6 +892,390 @@ ok('T5 the wire transitions mean the CLI meaning; replay answers the retry; supe
 });
 
 // ---------------------------------------------------------------------------
+// 4b.3: falsifiers from the independent review round (Codex, 2026-08-01).
+// Each one was seen RED against main @ b029c81 before its fix landed.
+// ---------------------------------------------------------------------------
+
+ok('W1 a slot whose bytes are not UTF-8 refuses instead of parsing a lossy normalization', () => {
+  const repo = fixture('w1');
+  craftedSlot(repo);
+  const slotFile = state.intentPath(repo);
+  const bytes = Buffer.from(bytesOf(slotFile));
+  const at = bytes.indexOf(Buffer.from('wal-crafted-operation', 'utf8'));
+  assert.ok(at > 0, 'the crafted operationId is in the slot');
+  bytes[at + 4] = 0xff; // one invalid byte inside a JSON string
+  fs.writeFileSync(slotFile, bytes);
+  const before = storeSnapshot(repo);
+  assert.throws(() => triggerRecovery(repo), (e) => Boolean(e) && e.code === 'ERATCHETMIRROR',
+    'invalid bytes are ambiguous — a U+FFFD substitute is a different operationId, not this one');
+  assert.deepStrictEqual(storeSnapshot(repo), before, 'the refusal preserved every byte');
+});
+
+ok('W2 recovery refuses a post-state slot whose tool contradicts the receipt it names', () => {
+  const repo = initRepo('w2');
+  const conn = service([repo], true).createConnection();
+  const open = openWorkspace(conn, repo);
+  const origRename = fs.renameSync;
+  fs.renameSync = (a, b) => {
+    if (path.basename(String(b)) === 'ledger.json') {
+      const e = new Error('injected mirror failure');
+      e.code = 'EIO';
+      throw e;
+    }
+    return origRename(a, b);
+  };
+  let failed;
+  try {
+    failed = refusal(callTool(conn, 'defect.add', envelopeFor(open, { item: { severity: 'high', summary: 'tool binding' } })));
+  } finally {
+    fs.renameSync = origRename;
+  }
+  assert.strictEqual(failed.error, 'WriteFailed');
+  const slot = readIntent(repo);
+  assert.strictEqual(slot.tool, 'defect.add');
+  slot.tool = 'defect.resolve'; // a known tool — just not the one this receipt earned
+  fs.writeFileSync(state.intentPath(repo), wal.serializeRecord(slot));
+  const before = storeSnapshot(repo);
+  assert.throws(() => triggerRecovery(repo), (e) => Boolean(e) && e.code === 'ERATCHETMIRROR',
+    'an after-image receipt must carry the tool the intent names');
+  assert.deepStrictEqual(storeSnapshot(repo), before, 'nothing moved under the contradiction');
+});
+
+ok('W3 an exact repeat over a stale mirror commits once and trues status, severity, and summary', () => {
+  const repo = fixture('w3');
+  initStore(repo);
+  const added = settled(() => artifacts.addDefect(repo, { severity: 'high', summary: 'truth drifts' }));
+  settled(() => artifacts.transitionDefect(repo, added.state.id, 'resolved', { evidence: 'fixed', note: 'resolved: fixed' }));
+  const ledgerId = readState(repo).defects[0].ledgerId;
+  const settledState = readState(repo);
+  const audit = {
+    history: settledState.history.length,
+    log: settledState.defects[0].log.length,
+    resolvedAt: settledState.defects[0].resolvedAt,
+  };
+  const ledger = readLedger(repo);
+  const row = ledger.defects.find((d) => d.id === ledgerId);
+  row.status = 'open';
+  row.severity = 'low';
+  row.summary = 'STALE SUMMARY';
+  fs.writeFileSync(state.ledgerPath(repo), wal.serializeRecord(ledger));
+  const repeat = settled(() => artifacts.transitionDefect(repo, added.state.id, 'resolved', { evidence: 'fixed', note: 'resolved: fixed' }));
+  assert.strictEqual(repeat.status, 'resolved');
+  const truedState = readState(repo);
+  assert.deepStrictEqual(
+    { history: truedState.history.length, log: truedState.defects[0].log.length, resolvedAt: truedState.defects[0].resolvedAt },
+    audit,
+    'the truing commit moved ONLY the mirror — no duplicate audit line, no restamped proof');
+  const trued = readLedger(repo).defects.find((d) => d.id === ledgerId);
+  assert.deepStrictEqual(
+    { status: trued.status, severity: trued.severity, summary: trued.summary },
+    { status: 'resolved', severity: 'high', summary: 'truth drifts' },
+    'the one committed repeat trues every axis the spec projection names');
+  const settledBytes = storeSnapshot(repo);
+  settled(() => artifacts.transitionDefect(repo, added.state.id, 'resolved', { evidence: 'fixed', note: 'resolved: fixed' }));
+  assert.deepStrictEqual(storeSnapshot(repo), settledBytes, 'once truthful, the repeat is a no-op again');
+});
+
+ok('W4 doctor observes a pending slot without recovering it', () => {
+  const repo = fixture('w4');
+  craftedSlot(repo, 'after-state'); // recoverable: the mirror is owed
+  const before = storeSnapshot(repo);
+  const run = childProcess.spawnSync(process.execPath, [path.join(__dirname, '..', 'bin', 'ratchet'), 'doctor'],
+    { cwd: repo, encoding: 'utf8', env: cleanGitEnv(), windowsHide: true });
+  assert.match(String(run.stdout), /pending/i, 'doctor names the slot it sees');
+  assert.deepStrictEqual(storeSnapshot(repo), before, 'diagnosis moved zero bytes — doctor never recovers');
+});
+
+ok('W4b a slot landing after the diagnosis sample still survives doctor', () => {
+  const repo = initRepo('w4b');
+  const cli = require('../src/cli');
+  const realDiagnose = state.diagnoseIntent;
+  const realWrite = process.stdout.write;
+  const realExit = process.exitCode;
+  const realCwd = process.cwd();
+  let planted = null;
+  try {
+    state.diagnoseIntent = function raced(cwd) {
+      const res = realDiagnose.call(state, cwd);
+      planted = craftedSlot(repo, 'after-state'); // the slot lands right after the sample
+      return res;
+    };
+    process.chdir(repo);
+    process.stdout.write = () => true; // doctor's report is not under test; its writes are
+    cli.run(['node', 'ratchet', 'doctor', '--json']);
+  } finally {
+    process.stdout.write = realWrite;
+    process.chdir(realCwd);
+    state.diagnoseIntent = realDiagnose;
+    process.exitCode = realExit;
+  }
+  assert.ok(fs.existsSync(state.intentPath(repo)), 'the late slot is not consumed by the probe');
+  assert.strictEqual(hashOf(state.ledgerPath(repo)), planted.intent.ledgerBeforeHash,
+    'the owed mirror is still owed — doctor recovered nothing');
+});
+
+ok('W4c doctor never travels the write door — a missing store is probed, not initialized', () => {
+  const repo = initRepo('w4c'); // no initStore: the store directory does not exist
+  const cli = require('../src/cli');
+  const realInit = state.initProject;
+  const realWrite = process.stdout.write;
+  const realExit = process.exitCode;
+  const realCwd = process.cwd();
+  let entered = 0;
+  let captured = '';
+  try {
+    state.initProject = function counted(...a) {
+      entered++;
+      return realInit.apply(state, a);
+    };
+    process.chdir(repo);
+    process.stdout.write = (s) => {
+      captured += String(s);
+      return true;
+    };
+    cli.run(['node', 'ratchet', 'doctor', '--json']);
+  } finally {
+    process.stdout.write = realWrite;
+    process.chdir(realCwd);
+    state.initProject = realInit;
+    process.exitCode = realExit;
+  }
+  const writable = JSON.parse(captured).checks.find((c) => c.name === 'state dir writable');
+  assert.strictEqual(entered, 0,
+    'the probe must never enter initProject — its lock would recover whatever store just appeared');
+  assert.strictEqual(writable.ok, true, 'the writability answer is still a real answer');
+  assert.ok(!fs.existsSync(state.projectDir(repo)), 'diagnosis created no store');
+});
+
+ok('W8 a mirrored write over a state record with invalid UTF-8 refuses and moves nothing', () => {
+  const repo = fixture('w8');
+  initStore(repo);
+  settled(() => artifacts.addDefect(repo, { severity: 'high', summary: 'utf8 sentinel state' }));
+  const stateFile = state.statePath(repo);
+  const bytes = Buffer.from(bytesOf(stateFile));
+  const at = bytes.indexOf(Buffer.from('utf8 sentinel state', 'utf8'));
+  assert.ok(at > 0);
+  bytes[at + 2] = 0xff; // one invalid byte inside the recorded summary
+  fs.writeFileSync(stateFile, bytes);
+  const before = storeSnapshot(repo);
+  assert.throws(
+    () => artifacts.addDefect(repo, { severity: 'low', summary: 'a different lawful finding' }),
+    (e) => Boolean(e) && e.code === 'ERATCHETMIRROR',
+    'a strict read never normalizes canonical bytes into a record nobody wrote');
+  assert.deepStrictEqual(storeSnapshot(repo), before, 'the refusal moved zero bytes');
+});
+
+ok('W9 a mirrored write over a ledger record with invalid UTF-8 refuses and moves nothing', () => {
+  const repo = fixture('w9');
+  initStore(repo);
+  settled(() => artifacts.addDefect(repo, { severity: 'high', summary: 'utf8 sentinel ledger' }));
+  const ledgerFile = state.ledgerPath(repo);
+  const bytes = Buffer.from(bytesOf(ledgerFile));
+  const at = bytes.indexOf(Buffer.from('utf8 sentinel ledger', 'utf8'));
+  assert.ok(at > 0);
+  bytes[at + 2] = 0xff;
+  fs.writeFileSync(ledgerFile, bytes);
+  const before = storeSnapshot(repo);
+  assert.throws(
+    () => artifacts.addDefect(repo, { severity: 'low', summary: 'a different lawful finding' }),
+    (e) => Boolean(e) && e.code === 'ERATCHETMIRROR',
+    'the mirror side is held to the same strict decode as the state side');
+  assert.deepStrictEqual(storeSnapshot(repo), before, 'the refusal moved zero bytes');
+});
+
+ok('W7 a peeked record with invalid UTF-8 refuses instead of serving a normalized projection', () => {
+  const repo = initRepo('w7');
+  const conn = service([repo], true).createConnection();
+  const open = openWorkspace(conn, repo);
+  const stateFile = state.statePath(repo);
+  const bytes = Buffer.from(bytesOf(stateFile));
+  const at = bytes.indexOf(Buffer.from('objective', 'utf8'));
+  assert.ok(at > 0, 'the state record carries an objective field');
+  bytes[at + 3] = 0xff; // one invalid byte inside a JSON string
+  fs.writeFileSync(stateFile, bytes);
+  const res = modern(conn, 'resources/read', { uri: open.resources.state });
+  assert.ok(res.error, 'an unprovable record is a refusal, not a lossy U+FFFD projection');
+  assert.strictEqual(res.error.message, mcp.WRITE_REFUSALS.MirrorUnrecoverable,
+    'the refusal speaks the allowlisted sentence, never a store path');
+  assert.ok(bytes.equals(bytesOf(stateFile)), 'the read changed nothing');
+});
+
+ok('W5 a resource read over an unreadable ledger refuses conservatively and writes nothing', () => {
+  const repo = initRepo('w5');
+  const conn = service([repo], true).createConnection();
+  const open = openWorkspace(conn, repo);
+  craftedSlot(repo); // occupy the slot so the store is mid-story
+  fs.writeFileSync(state.ledgerPath(repo), '{ this is not a record');
+  const files = () => fs.readdirSync(state.projectDir(repo)).filter((n) => n !== '.lock' && !n.includes('.tmp-')).sort();
+  const filesBefore = files();
+  const ledgerBytes = bytesOf(state.ledgerPath(repo));
+  const res = modern(conn, 'resources/read', { uri: open.resources.ledger });
+  assert.ok(res.error, 'an unprovable ledger is a refusal, not a fresh projection');
+  assert.strictEqual(res.error.message, mcp.WRITE_REFUSALS.MirrorUnrecoverable,
+    'the refusal speaks the allowlisted sentence, never a store path');
+  assert.deepStrictEqual(files(), filesBefore, 'the read created no backup, no fresh record, no residue');
+  assert.ok(ledgerBytes.equals(bytesOf(state.ledgerPath(repo))), 'the unreadable bytes are untouched');
+});
+
+ok('W6 clear verifies the slot it deletes is the slot it proved', () => {
+  const repo = fixture('w6');
+  craftedSlot(repo); // before/before: recovery would discard, then clear
+  const slotFile = state.intentPath(repo);
+  const substitute = Object.assign(readIntent(repo), { operationId: 'wal-substituted-operation' });
+  const origRead = fs.readFileSync;
+  let swapped = false;
+  fs.readFileSync = function (file, ...rest) {
+    const out = origRead.call(fs, file, ...rest);
+    if (!swapped && String(file) === slotFile) {
+      swapped = true; // swap AFTER recovery has read and proven the original
+      fs.writeFileSync(slotFile, wal.serializeRecord(substitute));
+    }
+    return out;
+  };
+  try {
+    assert.throws(() => triggerRecovery(repo), (e) => Boolean(e) && e.code === 'ERATCHETMIRROR',
+      'deleting bytes that no longer match the proven slot is ambiguous, not a clear');
+  } finally {
+    fs.readFileSync = origRead;
+  }
+  assert.strictEqual(readIntent(repo).operationId, 'wal-substituted-operation',
+    'the substituted slot survived the refused clear');
+});
+
+ok('W10 an ordinary state writer never serializes a normalized record — bytes back up, loudly', () => {
+  const repo = fixture('w10');
+  initStore(repo);
+  settled(() => artifacts.addDefect(repo, { severity: 'high', summary: 'ordinary state sentinel' }));
+  const stateFile = state.statePath(repo);
+  const damaged = Buffer.from(bytesOf(stateFile));
+  const at = damaged.indexOf(Buffer.from('ordinary state sentinel', 'utf8'));
+  assert.ok(at > 0);
+  damaged[at + 2] = 0xff;
+  fs.writeFileSync(stateFile, damaged);
+  settled(() => state.withWorkspaceMutation(repo, { action: 'w10 ordinary write' }, (s) => {
+    s.objective = 'a lawful unrelated write';
+  }));
+  assert.ok(!bytesOf(stateFile).toString('utf8').includes('�'),
+    'no U+FFFD ever reaches a canonical file — normalization is not recovery');
+  const dir = path.dirname(stateFile);
+  const backups = fs.readdirSync(dir).filter((n) => n.startsWith('state.json.corrupt.'));
+  assert.ok(backups.length >= 1, 'the undecodable bytes were preserved before anything replaced them');
+  for (const b of backups) {
+    assert.ok(damaged.equals(bytesOf(path.join(dir, b))), 'the backup is the exact original bytes');
+  }
+});
+
+ok('W11 an ordinary ledger writer never serializes a normalized record — bytes back up, loudly', () => {
+  const repo = fixture('w11');
+  initStore(repo);
+  settled(() => artifacts.addDefect(repo, { severity: 'high', summary: 'ordinary ledger sentinel' }));
+  const ledgerFile = state.ledgerPath(repo);
+  const damaged = Buffer.from(bytesOf(ledgerFile));
+  const at = damaged.indexOf(Buffer.from('ordinary ledger sentinel', 'utf8'));
+  assert.ok(at > 0);
+  damaged[at + 2] = 0xff;
+  fs.writeFileSync(ledgerFile, damaged);
+  const loaded = state.loadLedger(repo);
+  settled(() => state.saveLedger(repo, loaded));
+  assert.ok(!bytesOf(ledgerFile).toString('utf8').includes('�'), 'no U+FFFD ever reaches a canonical file');
+  const dir = path.dirname(ledgerFile);
+  const backups = fs.readdirSync(dir).filter((n) => n.startsWith('ledger.json.corrupt.'));
+  assert.ok(backups.length >= 1, 'the undecodable bytes were preserved');
+  for (const b of backups) {
+    assert.ok(damaged.equals(bytesOf(path.join(dir, b))), 'the backup is the exact original bytes');
+  }
+});
+
+ok('W12 recovery refuses a state after-image whose bytes are not UTF-8, hash match or not', () => {
+  const repo = fixture('w12');
+  craftedSlot(repo, 'after-state');
+  const stateFile = state.statePath(repo);
+  const damaged = Buffer.from(bytesOf(stateFile));
+  const at = damaged.indexOf(Buffer.from('crafted', 'utf8'));
+  assert.ok(at > 0);
+  damaged[at + 2] = 0xff;
+  fs.writeFileSync(stateFile, damaged);
+  const slot = readIntent(repo);
+  slot.stateAfterHash = wal.hashBytes(damaged); // an adversarially consistent slot
+  fs.writeFileSync(state.intentPath(repo), wal.serializeRecord(slot));
+  const before = storeSnapshot(repo);
+  assert.throws(() => triggerRecovery(repo), (e) => Boolean(e) && e.code === 'ERATCHETMIRROR',
+    'a hash can certify damaged bytes; the parse must still refuse them');
+  assert.deepStrictEqual(storeSnapshot(repo), before, 'the refusal preserved every byte');
+});
+
+ok('W13 the doctor probe proves directory creation, not just file creation', () => {
+  const repo = initRepo('w13');
+  const cli = require('../src/cli');
+  const realMkdir = fs.mkdirSync;
+  const realWrite = process.stdout.write;
+  const realExit = process.exitCode;
+  const realCwd = process.cwd();
+  let captured = '';
+  try {
+    fs.mkdirSync = function denied(target, ...rest) {
+      if (String(target).includes('.doctor-probe')) {
+        const e = new Error(`EPERM: operation not permitted, mkdir '${target}'`);
+        e.code = 'EPERM';
+        throw e; // the ACL shape Windows grants: files allowed, directories denied
+      }
+      return realMkdir.call(fs, target, ...rest);
+    };
+    process.chdir(repo);
+    process.stdout.write = (s) => {
+      captured += String(s);
+      return true;
+    };
+    cli.run(['node', 'ratchet', 'doctor', '--json']);
+  } finally {
+    fs.mkdirSync = realMkdir;
+    process.stdout.write = realWrite;
+    process.chdir(realCwd);
+    process.exitCode = realExit;
+  }
+  const writable = JSON.parse(captured).checks.find((c) => c.name === 'state dir writable');
+  assert.strictEqual(writable.ok, false,
+    'a place where directories cannot be created is not writable for a store');
+});
+
+ok('W14 a half-failed doctor probe cleans up after itself', () => {
+  const repo = initRepo('w14');
+  initStore(repo);
+  const cli = require('../src/cli');
+  const realWriteFile = fs.writeFileSync;
+  const realWrite = process.stdout.write;
+  const realExit = process.exitCode;
+  const realCwd = process.cwd();
+  let captured = '';
+  try {
+    fs.writeFileSync = function denied(target, ...rest) {
+      if (String(target).includes('.doctor-probe')) {
+        const e = new Error(`EACCES: permission denied, open '${target}'`);
+        e.code = 'EACCES';
+        throw e; // the mkdir succeeded; the file inside is what fails
+      }
+      return realWriteFile.call(fs, target, ...rest);
+    };
+    process.chdir(repo);
+    process.stdout.write = (s) => {
+      captured += String(s);
+      return true;
+    };
+    cli.run(['node', 'ratchet', 'doctor', '--json']);
+  } finally {
+    fs.writeFileSync = realWriteFile;
+    process.stdout.write = realWrite;
+    process.chdir(realCwd);
+    process.exitCode = realExit;
+  }
+  const writable = JSON.parse(captured).checks.find((c) => c.name === 'state dir writable');
+  assert.strictEqual(writable.ok, false, 'the half-failed probe still answers honestly');
+  const residue = fs.readdirSync(state.projectDir(repo)).filter((n) => n.includes('.doctor-probe'));
+  assert.deepStrictEqual(residue, [],
+    'a failed diagnostic leaves nothing a cold-start scan could misread as an interrupted write');
+});
+
+// ---------------------------------------------------------------------------
 
 process.stdout.write(`\n${passed} passed, ${failures.length} failed\n`);
 if (failures.length) {

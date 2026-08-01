@@ -804,17 +804,6 @@ function cmdDoctor(cwd, asJson) {
   }
   add('every skills/*/SKILL.md has frontmatter + description', skillProblems.length === 0, skillProblems.join('; '));
 
-  let stateDetail = '';
-  let stateOk = true;
-  try {
-    state.initProject(cwd);
-    stateDetail = state.projectDir(cwd);
-  } catch (e) {
-    stateOk = false;
-    stateDetail = e.message;
-  }
-  add('state dir writable', stateOk, stateDetail);
-
   // 4b WAL slot — read-only diagnosis, never a repair. A recoverable slot is
   // informational (any supported write recovers it on its way in); a slot
   // strict recovery cannot prove legal is the operator's, by name.
@@ -835,6 +824,46 @@ function cmdDoctor(cwd, asJson) {
   } catch (e) {
     add('WAL intent slot', false, e.message);
   }
+
+  // The writability probe never travels the write door — not even for a store
+  // that does not exist yet: initProject acquires the workspace lock, whose
+  // choke point RUNS recovery, and a first store created by another process
+  // in the sample-to-probe window would be recovered by the very tool that
+  // exists to report it (seen live in review round 3). An existing store is
+  // probed with a scratch file (named .tmp- like every inert residue); a
+  // missing store probes its nearest existing ancestor — the first write
+  // creates the store itself.
+  let stateDetail = '';
+  let stateOk = true;
+  try {
+    const dir = state.projectDir(cwd); // still names a store conflict out loud
+    let probeDir = dir;
+    while (!fs.existsSync(probeDir)) {
+      const up = path.dirname(probeDir);
+      if (up === probeDir) break;
+      probeDir = up;
+    }
+    // The probe proves BOTH creations a real writer needs: a directory (the
+    // lock is a mkdir; a missing store starts as one) and a file inside it —
+    // Windows ACLs grant these separately, and a file-only probe said
+    // "writable" where the first real write then failed its mkdir.
+    const scratch = path.join(probeDir, `.doctor-probe.tmp-${process.pid.toString(36)}`);
+    try {
+      fs.mkdirSync(scratch);
+      fs.writeFileSync(path.join(scratch, 'probe'), 'doctor writability probe\n');
+    } finally {
+      // Best-effort, always: a probe that failed half-way must not leave
+      // residue a cold-start scan could misread as an interrupted write.
+      try {
+        fs.rmSync(scratch, { recursive: true, force: true });
+      } catch (_e) { /* the writability answer stands either way */ }
+    }
+    stateDetail = probeDir === dir ? dir : `${dir} (not created yet — the first write creates it)`;
+  } catch (e) {
+    stateOk = false;
+    stateDetail = e.message;
+  }
+  add('state dir writable', stateOk, stateDetail);
 
   let snapOk = true;
   let snapDetail = '';

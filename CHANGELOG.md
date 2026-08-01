@@ -7,6 +7,87 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **4b.3 review round (independent Codex verification, verdict "NO" on six contract
+  gaps — all six accepted, fixed red-first; three claim-wording findings ruled
+  not-defects).** All CLI-enforced, each with a falsifier (W1–W6) seen red against
+  `main @ b029c81` before its fix:
+  - **Strict slots decode strictly (W1):** `parseIntent` now uses a fatal UTF-8 decode;
+    a slot with invalid bytes refuses as unrecoverable instead of being lossily
+    normalized into an operationId nobody published — and then cleared.
+  - **The receipt must carry the intent's tool (W2):** `validateMirrorReceipt` compares
+    `receipt.tool` to `intent.tool`; a post-state slot whose tool contradicts the
+    receipt it names is ambiguous, never completed.
+  - **Mirror validity means agreement, not linkage (W3):** the spec projection carries
+    status, severity, AND summary. The transition mirror op now writes all three
+    (summary was dropped), and the exact-repeat validity check compares all three
+    instead of counting linked rows — a stale-but-unique mirror is now trued by one
+    committed repeat, then repeats no-op again.
+  - **Doctor observes without recovering (W4, W4b):** the WAL diagnosis runs first, and
+    the writability probe no longer travels the write door at all — an existing store
+    is probed with a scratch file instead of `initProject`, whose lock acquisition ran
+    recovery. Previously doctor consumed the slot and reported "no pending intent"
+    about the store it had just changed; round 2 showed even a reordered probe loses a
+    slot that lands after the diagnosis sample, so the probe is now lock-free by
+    construction (W4b races a slot in after the sample and proves it survives).
+  - **Resource reads are byte-pure, enforced (W5):** the MCP read paths (state/ledger
+    resources, the receipt resource, `score.confidence`) now use pure peeks that never
+    create, back up, or reinitialize a record; an unprovable record answers the one
+    allowlisted MirrorUnrecoverable sentence. Previously a resource read over a
+    malformed ledger wrote a `.corrupt` backup file — a write on a read path.
+  - **CLEAR re-checks identity (W6):** the slot delete (spec CLEAR step) re-reads the
+    slot and refuses if the bytes are not the bytes this pass proved — on both the
+    transaction's own clear and recovery's fenced clear.
+  - **Round 2 of the same review added three more, fixed the same way:** the peeks
+    decode fatally like the slot parser — a record with invalid UTF-8 answers the
+    allowlisted sentence instead of serving a U+FFFD-normalized projection (W7); the
+    stale-mirror truing commit moves ONLY the mirror — no duplicate log/history line,
+    no restamped proof timestamp; "commits once solely to admit it" now means exactly
+    that (W3 extended); and the doctor probe race above (W4b).
+  - **Round 3 of the same review added two more, fixed the same way:** the strict
+    mirrored-write reads and recovery's two record parses decode fatally like
+    everything else (W8, W9) — previously a lawful write over a record carrying one
+    invalid byte would commit a U+FFFD-normalized serialization and settle state and
+    ledger in permanent disagreement with no pending intent left behind; and doctor's
+    missing-store branch no longer reaches `initProject` at all (W4c) — a missing
+    store probes its nearest existing ancestor, so no first store appearing in the
+    sample-to-probe window can be recovered by the diagnosis tool. Doctor no longer
+    creates the store as a side effect; the first write does.
+  - **Round 4 of the same review added two more, fixed the same way:** the ordinary
+    loaders joined the fatal-decode rule (W10, W11) — `readJson`'s fast-path peek
+    answers null on undecodable bytes, and `readJsonResilient` routes invalid UTF-8
+    through the same loud backup-then-reinitialize path it has always used for invalid
+    JSON, with the backup now preserving the exact original bytes; previously a lawful
+    ordinary write would silently serialize a U+FFFD-normalized record and settle the
+    two canonical files in disagreement with no backup and no intent. And the doctor
+    writability probe now proves directory creation as well as file creation (W13) —
+    Windows ACLs grant the two separately, the lock is a mkdir, and a file-only probe
+    answered "writable" where the first real write then failed. W12 additionally pins
+    recovery's own fatal decode against an adversarially consistent slot whose hash
+    certifies undecodable bytes.
+  - **Round 5 returned the review's YES** ("one operation, two files, one crash story —
+    the mirror guarantee holds"): both round-4 fixes verified, the decode sweep found
+    no remaining permissive parse on any canonical byte path, and the probe matrix
+    passed all four ACL shapes. Its one LOW — a half-failed doctor probe left its
+    scratch directory behind — is fixed (cleanup in a best-effort finally, W14).
+  - **Known limitation (parked, review round 2): the identity-checked clear is two
+    syscalls.** The CLEAR step re-reads and compares before deleting, exactly as the
+    spec words it — but compare and unlink cannot be one atomic operation through a
+    pathname API (no compare-and-unlink exists; same class as the 2.5 check→read gap).
+    A substitution landing in that window is deleted. Reaching it requires a writer
+    that bypasses the workspace lock — every lawful writer publishes and clears slots
+    under it — so this is recorded as a named limit, not repaired with machinery the
+    contract cannot honor.
+  - Ruled NOT defects, on the record: pre-commit `.tmp-` residue (documented inert by
+    design in 4b.1), CLI/MCP byte-equality (ids and receipts differ by ratified
+    design), and the MCP retry wording (the spec deliberately gives MCP the generic
+    `WriteFailed`; the CLI carries the "re-run" sentence). S20's loader count was
+    updated to the new peek — the one-snapshot contract it pins is unchanged and it
+    now additionally pins that reads never touch the creating loader.
+
+<!-- Traced by: claude-fable-5 -->
+
 ### Added
 
 - **Known limitation (parked, owner: Danny): a host-environment hold can stall the

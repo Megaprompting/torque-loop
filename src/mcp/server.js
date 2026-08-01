@@ -1276,8 +1276,8 @@ function createServer(options) {
         // let a write that landed in between make the revision describe a
         // record these layers never saw — a number that certifies the wrong
         // bytes is worse than no number.
-        const snapshot = state.loadState(record.root);
-        const ledger = state.loadLedger(record.root);
+        const snapshot = state.peekState(record.root);
+        const ledger = state.peekLedger(record.root);
         // readEventsWithHealth, not readEvents: the malformed-line warning goes
         // to stderr, and no MCP client reads stderr. Damage that only appears
         // there is damage the wire silently certifies as clean.
@@ -1581,12 +1581,22 @@ function createServer(options) {
       const available = resourceRecord(params.uri);
       // 4b: every resource states the WAL observation out loud. The flag is
       // derived at read time and injected into the projection only — the disk
-      // bytes never gain it. Reads stay byte-pure: the sampler never repairs.
-      const sampled = samplePendingIntent(available.record.root, () => {
-        if (available.parsed.name === 'state') return state.loadState(available.record.root);
-        if (available.parsed.name === 'ledger') return state.loadLedger(available.record.root);
-        return receipt.assemble(available.record.root);
-      });
+      // bytes never gain it. Reads stay byte-pure: peeks, not the resilient
+      // loaders — a resource read must never create a record or back one up.
+      let sampled;
+      try {
+        sampled = samplePendingIntent(available.record.root, () => {
+          if (available.parsed.name === 'state') return state.peekState(available.record.root);
+          if (available.parsed.name === 'ledger') return state.peekLedger(available.record.root);
+          return receipt.assemble(available.record.root, { peek: true });
+        });
+      } catch (e) {
+        if (e && e.code === 'ERATCHETMIRROR') {
+          // The conservative refusal: the one allowlisted sentence, no store path.
+          throw rpc.rpcError(-32603, WRITE_REFUSALS.MirrorUnrecoverable);
+        }
+        throw e;
+      }
       const value = Object.assign({}, sampled.value, { pendingIntent: sampled.pendingIntent });
 
       return withCache({
