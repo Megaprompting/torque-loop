@@ -1,6 +1,6 @@
 # MCP Step 4c: `ledger.update` — the second single-file safe core
 
-Date: 2026-08-01 (rev 6)
+Date: 2026-08-01 (rev 7)
 Base: `main` at `41f7bf4` (all of step 4b merged and proven; PR #37 six-of-six CI)
 Branch: `feat/mcp-4c-ledger-update`
 Status: RATIFIED AS AMENDED — awaiting the five-voice re-run on this rev. History:
@@ -27,8 +27,19 @@ canonicalization mandated, byte-measured caps on both rings, enumerated persiste
 result, matrix bound strictly below MAX_SAFE_INTEGER (exhaustion cannot exist),
 box-8 baseline = post-recovery snapshot, out-of-band residual stated honestly,
 fixture/CHANGELOG inventory corrected. Danny routed the shipped defects
-hardening-first; they landed as PR #38 (main @ 8b137e4, CI 6/6). Gate remaining:
-five-voice round 4 on this rev, then 4c.1.
+hardening-first (PR #38 @ 8b137e4) → five-voice round 4 on rev 6: DO-NOT-RATIFY,
+seven findings, all accepted — the critical one against PR #38 itself (guard on one
+publisher only), completed as PR #39 (main @ 141133e: shared nextRev successor on
+every publisher, safe-integer WAL parsing, one shared cap predicate, schema
+maximum); spec-side this rev fixes the self-invalidating revision ceiling (bound now
+≤ MAX with non-retryable LedgerRevisionExhausted on mutating commits at the
+ceiling), adds non-retryable ReceiptTooLarge for deterministic receipt overflow,
+qualifies every recreation claim to the gen-minting case (the same-gen raw-copy
+residual is stated once and referenced, never contradicted), decides saveLedger
+(PRIVATIZED; both upsert callers route through commitLedgerFamily; the publisher set
+is closed), and completes the checklist dispositions (wal.js untouched-by-4c,
+templates/ledger.json regenerated in 4c.2, README suite count fixed in #39). Gate
+remaining: five-voice round 5 on this rev, then 4c.1.
 
 ## Objective
 
@@ -111,18 +122,23 @@ existing `version/createdAt/updatedAt/features/tests/defects`:
   update-family write (scope defined in D2). Monotonic WITHIN a lineage: it never
   restarts while `ledgerGen` is unchanged. A wipe (`init --force`) is a lineage
   replacement — new gen, `ledgerRev: 0` — not a restart of this line. The matrix
-  bound is `0 ≤ ledgerRev < Number.MAX_SAFE_INTEGER` — strictly below the ceiling, so
-  "valid but cannot advance" is a state that CANNOT EXIST (round-3 finding: routing
-  exhaustion to `LedgerDamaged` was an untruthful diagnosis for readable bytes; the
-  truthful fix is that a record AT the ceiling fails the matrix — it is unprovable
-  data no supported writer could have produced, 9e15 commits away — and every record
-  the matrix accepts can advance safely). Doctor names the bound violation like any
-  other matrix row; fixtures pin `MAX_SAFE_INTEGER - 1` (valid, advances) and
-  `MAX_SAFE_INTEGER` (refuses).
+  bound is `0 ≤ ledgerRev ≤ Number.MAX_SAFE_INTEGER` (round-4 correction: rev 6's
+  strictly-below bound was SELF-INVALIDATING — it pinned `MAX - 1` as valid and
+  advancing, whose successor the same matrix then rejected). The coherent semantics
+  are the ones the state line ships today: a record may REACH the ceiling; at the
+  ceiling, reads, replay, CAS comparison, and no-ops all still work, and a genuinely
+  MUTATING commit refuses with the new non-retryable `LedgerRevisionExhausted`
+  (below) — zero bytes, doctor names the condition. Fixtures pin the
+  `MAX - 1 → MAX` commit succeeding and the mutation-at-`MAX` refusal. The state
+  side's shared `nextRev` successor (PR #39) is the same rule, one file over.
 - `ledgerGen` — minted once at ledger creation (same `newGeneration` discipline as
-  state, distinct prefix so a swapped file cannot alias). Names the lineage, so an
-  out-of-band destroy-and-recreate cannot CAS-match an old expectation at a reused
-  numeric revision.
+  state, distinct prefix so a swapped file cannot alias). Names the lineage, so a
+  recreation that MINTS OR CHANGES the generation — every supported wipe and
+  creation path — cannot CAS-match an old expectation at a reused numeric revision.
+  Qualified deliberately (round-4 correction): a raw out-of-band write that copies
+  the old gen and rev into different bytes is NOT detected by any CAS — that
+  residual is stated in full in the publisher-invariant section, and no sentence in
+  this spec claims otherwise.
 - `operations` — the receipt ring, cap 32 entries, ≤ 4 KiB serialized per entry, the
   same shape as `state.operations` (`{id, tool, argsHash, gen, rev, at, result}` with
   `gen`/`rev` naming the LEDGER lineage). Appended in the same rename that commits the
@@ -238,8 +254,9 @@ else as unprovable:
   `ledgerRev`, `ledgerGen`, or `operations`, including a user-invented `operations`
   key — is a HYBRID and refuses: admission must never adopt fields it did not mint.
 - **Version 2:** the v1 keys plus exactly `{ledgerRev, ledgerGen, operations}`;
-  `version === 2`; `ledgerRev` a non-negative safe integer STRICTLY below
-  `Number.MAX_SAFE_INTEGER`; `ledgerGen` a non-empty
+  `version === 2`; `ledgerRev` a non-negative safe integer (a record AT
+  `Number.MAX_SAFE_INTEGER` is matrix-VALID and read-servable; only a mutating
+  commit atop it refuses, as `LedgerRevisionExhausted`); `ledgerGen` a non-empty
   string with the ledger prefix; `operations` an array of ≤ 32 entries, each with
   exactly the receipt keys `{id, tool, argsHash, gen, rev, at, result}`, where every
   field has ONE admissible shape (the round-2 pass caught that exact-keys without
@@ -349,8 +366,8 @@ NEW lineage with a new gen, which is exactly what makes a pre-wipe expectation r
 bytes (D4 as re-ruled by Danny, Option A).** `null/null` would match "some version-1
 ledger", not THE version-1 ledger the client decided against: with the admission
 receipt gone, a DIFFERENT valid v1 backup restored out-of-band would satisfy a held
-null expectation — the recreation case generations exist to refuse, on the one record
-that physically has no generation. Therefore an admission write carries a third
+null expectation — the gen-minting recreation case generations exist to refuse, on
+the one record that physically has no generation. Therefore an admission write carries a third
 required field:
 
 - `expectedLedgerHash` — the SHA-256 (`sha256:` form) of the exact v1 canonical bytes
@@ -394,18 +411,22 @@ that changed unseen. Rev 3 therefore splits the publishers, convention-7 style:
   no-op detection, `ledgerRev + 1`, optional MCP receipt; features/tests only.
 - the WAL mirror publisher — private to recovery and the defect family: defects +
   top-level `updatedAt` only, rev/gen/ring-silent, exact prepared bytes.
-- `saveLedger` loses its unrestricted public form: it either delegates to the family
-  commit (and therefore advances the rev and obeys the collection partition) or is
-  privatized outright — feasible, the round-2 pass confirmed its only production
-  callers are the two upsert branches. Existing test call sites migrate to the
-  classified doors; that churn is named in the landing checklist.
+- `saveLedger` is PRIVATIZED — decided (round-4 finding: "delegates or is
+  privatized" left the publisher set unenumerated, and an invariant over an
+  undecided set is not an invariant). The two production callers (both
+  `ledger.upsert` branches) route through `commitLedgerFamily`; no exported
+  `saveLedger` remains. Existing test call sites migrate to the classified doors;
+  that churn is named in the landing checklist. The enumerated supported publisher
+  set is therefore CLOSED: `commitLedgerFamily`, the private WAL mirror publisher,
+  and the creation/wipe paths — nothing else.
 
 The invariant is scoped honestly (round-2 critical finding: "no exported path" is
 falsifiable — `state.js` also exports raw primitives like `writeJson`,
 `writeFileAtomic`, and `ledgerPath`, and `writeJson(ledgerPath(root), obj)` publishes
 anything). The rule and its test cover the ENUMERATED supported canonical publisher
 APIs — the family commit, the mirror publisher, creation/wipe, and whatever
-`saveLedger` becomes — within an unchanged `ledgerGen`. The raw exported primitives
+the now-privatized `saveLedger` routes into — within an unchanged `ledgerGen`. The
+raw exported primitives
 are out-of-band by the 4b doctrine (a raw low-level write is corruption tooling, not
 a supported writer door); they cannot be made revision-aware without becoming the
 thing they exist beneath. The residual is stated honestly (round-3 correction — rev 5
@@ -443,7 +464,21 @@ family write observes a half-published mirror.
 
 ## Error and read surface
 
-Three codes join the one safe funnel (`safeWriteError`), literal, path/errno-free:
+Five codes join the one safe funnel (`safeWriteError`), literal, path/errno-free.
+Two are NON-RETRYABLE by declaration (round-4 finding: the inherited funnel folded
+deterministic refusals into the retryable `WriteFailed`, and "retry" is a lie when an
+identical retry must fail identically):
+
+- `LedgerRevisionExhausted`: `The ledger revision line cannot advance further; run
+  ratchet doctor and archive or reset the ledger before writing.` A mutating commit
+  atop a record at `Number.MAX_SAFE_INTEGER`. Non-retryable; replay, no-ops, and
+  reads remain available.
+- `ReceiptTooLarge`: `The operation's receipt exceeds the persisted cap; shorten the
+  record id or oversized fields and retry as a new operation.` Deterministic — the
+  receipt echoes `recordId` (client-supplied `item.id`) and lineage fields, and a
+  ~5,000-byte id stays under the 16-KiB item cap while blowing the 4-KiB receipt
+  cap. Non-retryable as sent; a NEW operation with shorter fields proceeds. Both
+  output-schema branches, fixtures, and CHANGELOG bullets are owed with the tool.
 
 - `StaleLedgerRev`: structured error with `expectedLedgerRev` and `actualLedgerRev`,
   both INTEGER-ONLY (round-2 finding: the nullable branch was unreachable — a
@@ -487,8 +522,10 @@ bytes" claim). The locked sequence: recover (4b choke point, already there) →
 strict-PROBE the ledger (one read distinguishing genuine absence from existing bytes;
 validate existing bytes against the matrix) → REFUSE the open now if existing bytes
 are unprovable, before anything initializes → initialize/load state → create the
-ledger create-exclusive iff the original probe found genuine absence → snapshot both
-records → issue the handle. The zero-byte claim is scoped precisely (round-2 finding:
+ledger create-exclusive iff the original probe found genuine absence (and if the
+create LOSES that race, strictly re-read and validate the winner's bytes before
+proceeding — round-4 detail: absence observed once is not absence still) → snapshot
+both records → issue the handle. The zero-byte claim is scoped precisely (round-2 finding:
 recovery may legitimately COMPLETE owed work — clearing a proven intent — before the
 probe runs, and that is committed 4b recovery, not this refusal's bytes): a
 `LedgerDamaged` refusal produced by the strict probe moves zero canonical bytes
@@ -561,8 +598,12 @@ ledger envelope executor beside `executeWrite`), `mcp/server.js` (tool #19 appen
 advertised order — the roster today is exactly 18: four base + fourteen writes — plus
 open changes and resource projections), `receipt.js` (ledger lineage on the one cold
 read), `cli.js` (delegation + refusals + HELP TEXT — the `ledger update` line still
-advertises `features|tests|defects` and must drop `defects`). `wal.js` is UNTOUCHED
-and the diff proves it. Beyond src (round-2 finding — the packaged surfaces):
+advertises `features|tests|defects` and must drop `defects`). `wal.js` is untouched
+BY 4C and the 4c diff proves it — its safe-integer revision parsing landed in the
+pre-4c hardening (PR #39), so "untouched" is a claim about this step, not about
+history. `templates/ledger.json` (packaged v1 template) is REGENERATED to the
+version-2 shape in 4c.2 — a template that mints the shape admission exists to
+retire would be drift by packaging. Beyond src (round-2 finding — the packaged surfaces):
 `skills/qa-ledger/SKILL.md` instructs the exact command D3 now refuses and must be
 rewritten (which drags `reference/PROMPTS.md` and the plugin-shape sync rules with
 it); README documents only the four read tools — the conditional write roster,
@@ -586,12 +627,14 @@ rewrite); CLI strict load on existing bytes; identical-merge no-op (with
 classification; hash-bound admission and the public `ledgerBytesHash` /
 `expectedLedgerHash` / `actualLedgerHash` contract; the complete public
 success/error schema for the tool (`StaleLedgerRev` / `StaleLedgerGen` /
-`LedgerDamaged` shapes).
+`LedgerDamaged` / `LedgerRevisionExhausted` / `ReceiptTooLarge` shapes, the two new
+codes declared non-retryable); revision ceiling semantics; the `saveLedger`
+privatization.
 
 Notably absent from 4c, restated: no intent-schema change, no new WAL tooling, no
 version bump (the release that ships 4c bumps all five fields then, not now).
 
-### Defects surfaced in the SHIPPED safe core (round 3; recorded, routing owed to Danny)
+### Defects surfaced in the SHIPPED safe core (rounds 3–4; RESOLVED)
 
 Three round-3 findings are live in main today, independent of 4c — recorded here so
 they cannot be silently inherited:
@@ -608,13 +651,16 @@ they cannot be silently inherited:
    (`state.js:1126/1163`, `ops.js:205`): `Number.isInteger` admits 2^53, where `+ 1`
    stops advancing and stale CAS matches.
 
-RESOLVED (Danny ruled hardening-first, 2026-08-01): all three shipped as PR #38
-(`fix/mcp-core-hardening`, merged to main @ 8b137e4, CI six-of-six green) with
-falsifiers H1–H5 seen red against the unpatched tree — prototype-safe canonicalizer,
-`Buffer.byteLength` caps at both sites, safe-integer boundary + commit guard, and the
-iterative 64-deep argument cap as `-32602`. The tree 4c.1 builds on now carries the
-repairs this spec's envelope section mandates; `test/mcp-hardening.test.js` is the
-standing regression.
+RESOLVED in two rounds (Danny ruled hardening-first, 2026-08-01): PR #38 (merged @
+8b137e4) shipped the prototype-safe canonicalizer, byte caps, boundary + commit
+guards, and the depth cap; round 4 then proved #38's revision guard covered ONE
+publisher while the mirrored WAL path, `init --force`, and WAL intent parsing still
+computed `+ 1` bare — PR #39 (merged @ 141133e) completed it with the shared
+`nextRev` checked successor on every publisher, safe-integer WAL parsing on both
+revision fields, ONE shared byte-measured cap predicate, and the advertised schema
+`maximum`. Falsifiers H1–H5 and H3b/H3c/H3d/H4b/H4c all seen red first (pre-fix tree
+or mutated variant); `test/mcp-hardening.test.js` is the standing regression. The
+tree 4c.1 builds on carries every repair this spec's envelope section mandates.
 
 ## Verification (acceptance, every box)
 
@@ -626,8 +672,13 @@ standing regression.
    the same bytes; a kill at any point leaves exactly the before-bytes or the
    after-bytes; no third shape exists in any fixture.
 3. **CAS.** Stale rev, stale gen, null-pair against version 2, non-null pair against
-   version 1, admission hash against a DIFFERENT v1 fixture, and same-rev out-of-band
-   recreation each refuse with byte-snapshot proof of zero movement.
+   version 1, admission hash against a DIFFERENT v1 fixture, and same-rev
+   DIFFERENT-GEN recreation (round-4 rename: the gen-minting case is what CAS
+   refuses; the same-gen raw-copy residual is out-of-band by the stated doctrine and
+   is pinned as accepted, not refused) each refuse — or pin — with byte-snapshot
+   proof of zero movement. Plus the ceiling pair: `MAX - 1 → MAX` commits;
+   mutation-at-`MAX` refuses `LedgerRevisionExhausted`; an oversized deterministic
+   receipt refuses `ReceiptTooLarge`; all three zero-byte.
 4. **Admission.** Version-1 fixtures admit exactly once under race (two hash-bearing
    admitters, one commit, one `StaleLedgerGen`); the admitting rename carries version,
    gen, rev 1, ring, and the domain change together; CLI first-touch admits
@@ -734,5 +785,9 @@ Five-voice round 3 on rev 5: openai-codex (gpt-5.6-sol), 2026-08-01 — DO-NOT-R
 nine findings, all accepted; three are live shipped-core defects (canonicalizer
 verified against ops.js:46 before this rev).
 Rev 6 patches (all nine) traced by: claude-fable-5
-Awaiting: Danny's routing for the shipped-core defects → five-voice round 4 on rev 6
-→ then 4c.1.
+Shipped-core routing: Danny ruled hardening-first; PR #38 landed, round 4 proved it
+incomplete, PR #39 completed it (both merged, CI 6/6, falsifiers red-first).
+Five-voice round 4 on rev 6: openai-codex (gpt-5.6-sol), 2026-08-01 — DO-NOT-RATIFY;
+seven findings, all accepted (one critical against the shipped fix itself).
+Rev 7 patches (spec-side five) traced by: claude-fable-5
+Awaiting: five-voice round 5 on rev 7 → then 4c.1.
