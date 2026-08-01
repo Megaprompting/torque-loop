@@ -904,7 +904,7 @@ ok('W20 a reconnect after server death replays the receipt through a new handle'
 // schema, and its refusals stay byte-pure.
 // ---------------------------------------------------------------------------
 
-ok('V1 the --write roster advertises all ten write tools with pinned contracts', () => {
+ok('V1 the --write roster advertises every write tool with pinned contracts', () => {
   const repo = initRepo('v1-repo');
   const conn = service([repo], true).createConnection();
   const tools = modern(conn, 'tools/list', {}).result.tools;
