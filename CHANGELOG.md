@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Safe-core hardening (three live defects found by the 4c design review rounds 2–3,
+  2026-08-01; all CLI-enforced, each with a falsifier (H1–H5) seen red against the
+  unpatched tree):**
+  - **The binding hash is injective again (H1a/H1b):** the canonicalizer assigned
+    sorted keys into a plain object, so a JSON-parsed own `__proto__` key invoked the
+    prototype setter and vanished from the hash — two DIFFERENT operations could share
+    one binding hash, and a retained retry falsely replayed the other operation's
+    recorded result instead of refusing `OperationIdConflict`. Keys now assign into a
+    null-prototype object; `__proto__`-bearing payloads hash distinctly and conflict
+    correctly.
+  - **Receipt caps measure UTF-8 bytes (H2):** both receipt-cap predicates counted
+    UTF-16 code units (`.length`), undercounting astral characters 2:1 — a legal
+    emoji-heavy result committed a receipt past the 4 KiB byte contract. Both sites
+    now measure `Buffer.byteLength(..., 'utf8')`.
+  - **Revisions are safe integers end to end (H3/H5):** `Number.isInteger` admits
+    2^53, where `+ 1` silently stops advancing and every stale CAS keeps matching.
+    The write boundary now refuses an unsafe `expectedStateRev` (`-32602`), and
+    `commitState` refuses to publish atop a revision that cannot advance safely —
+    only a hand-written record can be there, and refusal beats a revision that lies.
+  - **Deep nesting is malformed input, not an internal error (H4):** a small, valid,
+    deeply nested `item` blew the recursive canonicalizer's stack and surfaced as an
+    internal failure. The write boundary now enforces an iterative depth cap (64) and
+    refuses `-32602` before anything downstream recurses.
+
 - **4b.3 review round (independent Codex verification, verdict "NO" on six contract
   gaps — all six accepted, fixed red-first; three claim-wording findings ruled
   not-defects).** All CLI-enforced, each with a falsifier (W1–W6) seen red against

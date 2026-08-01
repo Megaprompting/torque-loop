@@ -1161,6 +1161,13 @@ function loadState(cwd) {
 }
 
 function commitState(cwd, state, baseRev) {
+  // 2^53 passes Number.isInteger but `+ 1` no longer moves it — a commit atop
+  // it would publish a mutation whose revision did not advance, and every
+  // stale CAS would keep matching. Only a hand-written record can be here
+  // (9e15 real commits away), so refusing is the honest answer, not repair.
+  if (!Number.isSafeInteger(baseRev + 1)) {
+    throw new Error(`state revision ${baseRev} cannot advance safely; repair the record before writing`);
+  }
   // Last instant before the canonical publish: do we still own the lock?
   assertStillOwner(cwd, `state rev ${baseRev + 1}`);
   state.updatedAt = schemas.nowIso();
