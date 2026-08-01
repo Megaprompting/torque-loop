@@ -59,8 +59,15 @@ function assemble(cwd = process.cwd(), opts = {}) {
     ledgerLineage = state.ledgerLineage(raw.parsed, raw.bytes);
   } else {
     try {
-      ledger = state.loadLedger(cwd);
-      ledgerLineage = state.ledgerLineageAt(cwd);
+      // loadLedger first, because the CLI read may be the first touch ever and
+      // owns the create/repair. Then ONE raw read serves both the contents and
+      // the lineage: reading them separately let a family commit land between
+      // the two, pairing revision N with health computed from N-1 — a report
+      // describing a record that never existed.
+      state.loadLedger(cwd);
+      const snapshot = state.peekLedgerRaw(cwd);
+      ledger = snapshot.parsed;
+      ledgerLineage = state.ledgerLineage(snapshot.parsed, snapshot.bytes);
     } catch (_e) {
       ledger = {};
     }

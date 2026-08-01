@@ -41,13 +41,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     version-2 bytes create-exclusive. Its descriptor gains `ledgerRev`, `ledgerGen`, and
     conditional `ledgerBytesHash`; the ledger resource and the receipt serve the same
     lineage projection.
-  - **Publisher closure:** `saveLedger` is PRIVATIZED (removed from the exports). The
-    supported ledger publisher set is closed to `commitLedgerFamily` (the only
-    rev-advancing door), the private WAL mirror publisher (defects + top-level
-    `updatedAt` only — rev-, gen-, and ring-silent), and the creation/wipe paths.
-    Features/tests cannot change through a supported door without `ledgerRev` advancing
-    under the same gen. Raw exported primitives (`writeJson`, `writeFileAtomic`) remain
-    out-of-band corruption tooling by the 4b doctrine, stated, not covered.
+  - **Publisher closure, enforced at the door itself:** `saveLedger` is PRIVATIZED
+    (removed from the exports). The supported ledger publisher set is closed to
+    `commitLedgerFamily` (the only rev-advancing door), the private WAL mirror
+    publisher (defects + top-level `updatedAt` only — rev-, gen-, and ring-silent),
+    and the creation/wipe paths. `commitLedgerFamily` PROVES both of its arguments
+    rather than trusting its callers: it re-reads the ledger strictly under the held
+    lock and refuses unless the base is still byte-identical to what the caller
+    decided against; it refuses an after-image that touches the defect mirror,
+    `createdAt`, the generation, or retained receipts (only `features`/`tests` may
+    differ); and it validates the complete after-image against the strict matrix
+    before the rename. Features/tests cannot change through a supported door without
+    `ledgerRev` advancing under the same gen. Raw exported primitives (`writeJson`,
+    `writeFileAtomic`) remain out-of-band corruption tooling by the 4b doctrine,
+    stated, not covered.
+  - **The receipt reads the ledger once.** The CLI cold read took the ledger's
+    contents from one read and its lineage from a second, so a family commit landing
+    between them reported revision N beside health computed from N−1 — a record that
+    never existed. Contents and lineage now come from one post-initialization
+    snapshot.
   - **Revision ceiling semantics:** a record may REACH `Number.MAX_SAFE_INTEGER`; at the
     ceiling reads, replay, CAS and no-ops still work, and a genuinely mutating commit
     refuses non-retryable `LedgerRevisionExhausted` with zero bytes.

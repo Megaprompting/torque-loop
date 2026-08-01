@@ -1769,12 +1769,49 @@ function nextLedgerRev(baseRev) {
 // version-1 base (the one rename carries version 2, a minted gen, rev 1, and
 // the ring), the checked successor on version 2, the optional MCP receipt
 // (built by the caller once the target lineage is known), the ring cap, the
-// updatedAt stamp, and the fenced publish. Features/tests only by
-// construction: the domain layer refuses defects before this door is reached.
+// updatedAt stamp, and the fenced publish.
+//
+// It PROVES both of its arguments rather than trusting them. This door is
+// exported, so "the publisher set is closed" is only true if the door itself
+// enforces the closure — the review that found this had published a rev-0
+// snapshot over a committed rev-1 write, emitting different bytes that still
+// claimed revision 1, and had inserted a defect record with no WAL behind it.
+// A caller's good behavior is not an invariant (convention 7).
 function commitLedgerFamily(cwd, action, loaded, after, opts = {}) {
   assertMayWrite(action);
   return withWorkspaceLock(cwd, action, () => {
     assertStillOwner(cwd, 'the ledger');
+    if (!loaded || !Buffer.isBuffer(loaded.bytes)) {
+      throw new Error('the ledger family publisher needs the exact base bytes it decided against (state.readLedgerStrict)');
+    }
+    // The base has to still BE the record. Re-read under the held lock and
+    // compare bytes: anything else lets a snapshot from before somebody else's
+    // commit overwrite it, and the successor computed from that stale base
+    // re-uses a revision number that already named different bytes.
+    const current = readLedgerStrict(cwd);
+    if (current.absent || !current.bytes.equals(loaded.bytes)) {
+      throw new Error(
+        'refusing a ledger family publish: the base moved since it was loaded — re-read the ledger and re-apply the change'
+      );
+    }
+    const base = current.ledger;
+    // Only features and tests may differ. Everything else the family cannot
+    // reach must arrive exactly as the base had it, or this door becomes the
+    // side entrance the whole partition exists to deny.
+    if (!isDeepStrictEqual(after.defects, base.defects)) {
+      throw new Error('refusing a ledger family publish: the defect mirror belongs to the defect verbs and the WAL, not to this door');
+    }
+    if (after.createdAt !== base.createdAt) {
+      throw new Error('refusing a ledger family publish: createdAt is not the family\'s to rewrite');
+    }
+    if (current.version === 2) {
+      if (after.ledgerGen !== base.ledgerGen) {
+        throw new Error('refusing a ledger family publish: the generation names the lineage and only a wipe mints a new one');
+      }
+      if (!isDeepStrictEqual(after.operations, base.operations)) {
+        throw new Error('refusing a ledger family publish: the receipt ring is appended by this door alone — retained receipts are replay evidence');
+      }
+    }
     let gen;
     let rev;
     if (loaded.version === 1) {
@@ -1796,6 +1833,15 @@ function commitLedgerFamily(cwd, action, loaded, after, opts = {}) {
       while (after.operations.length > schemas.LEDGER_OPERATIONS_CAP) after.operations.shift();
     }
     after.updatedAt = schemas.nowIso();
+    // Last gate before the rename: the record this door is about to publish
+    // must be one the strict loader will accept. Publishing bytes the matrix
+    // would refuse hands the next reader a store nobody can open.
+    const verdict = schemas.validateLedgerRecord(after);
+    if (!verdict.ok || verdict.version !== 2) {
+      throw new Error(
+        `refusing a ledger family publish: the after-image fails the strict matrix row "${verdict.row || 'version'}" — ${verdict.detail || 'not a version-2 record'}`
+      );
+    }
     writeJson(ledgerPath(cwd), after);
     return { ledgerRev: rev, ledgerGen: gen, admitted: loaded.version === 1 };
   });

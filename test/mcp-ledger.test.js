@@ -1075,6 +1075,95 @@ ok('L20 a derived id colliding with an existing target-collection record refuses
   assert.deepStrictEqual(storeSnapshot(repo), before);
 });
 
+// ---------------------------------------------------------------------------
+// The publisher boundary itself. commitLedgerFamily is the one rev-advancing
+// door AND an exported function, so its contract has to be enforced there, not
+// assumed of its callers: an unproven base or an after-image reaching outside
+// features/tests would make "the publisher set is closed" prose.
+// ---------------------------------------------------------------------------
+
+ok('L22 the family publisher refuses a base that moved since it was loaded', () => {
+  const repo = initRepo('l22-repo');
+  state.loadState(repo);
+  state.loadLedger(repo);
+  const stale = state.readLedgerStrict(repo);
+  ledgerMod.upsert(repo, 'features', { id: 'feat-legit', name: 'legitimate rev 1' });
+  const committed = ledgerBytes(repo);
+  const forged = JSON.parse(JSON.stringify(stale.ledger));
+  forged.features.push({ id: 'feat-stale', name: 'published from a rev-0 snapshot' });
+  assert.throws(
+    () => state.commitLedgerFamily(repo, 'test stale base', stale, forged),
+    /moved since it was loaded/,
+    'a stale base must refuse — publishing it erases a committed write and relabels it with the same revision'
+  );
+  assert.ok(ledgerBytes(repo).equals(committed), 'the legitimate commit survives, byte-identical');
+  const disk = readLedger(repo);
+  assert.strictEqual(disk.ledgerRev, 1);
+  assert.deepStrictEqual(disk.features.map((f) => f.id), ['feat-legit']);
+});
+
+ok('L23 the family publisher refuses an after-image reaching outside features/tests', () => {
+  const repo = initRepo('l23-repo');
+  const conn = service([repo], true).createConnection();
+  const open = openWorkspace(conn, repo);
+  // Through the wire, so the ring actually holds a retained receipt to protect.
+  payload(callTool(conn, 'ledger.update', ledgerEnvelope(open, { item: { id: 'feat-one', name: 'one' } })));
+  const before = ledgerBytes(repo);
+
+  const forge = (mutate) => {
+    const loaded = state.readLedgerStrict(repo);
+    const after = JSON.parse(JSON.stringify(loaded.ledger));
+    mutate(after);
+    return () => state.commitLedgerFamily(repo, 'test forged after-image', loaded, after);
+  };
+  const cases = [
+    ['a defect written without the WAL', (a) => a.defects.push({ id: 'ldef-forged', severity: 'critical', summary: 'no defect verb', status: 'resolved' }), /defect mirror/],
+    ['retained receipts dropped', (a) => { a.operations = []; }, /receipt ring/],
+    ['the lineage swapped', (a) => { a.ledgerGen = 'lgen-0-00'; }, /generation/],
+    ['createdAt rewritten', (a) => { a.createdAt = '1999-01-01T00:00:00.000Z'; }, /createdAt/],
+    ['an after-image the strict matrix rejects', (a) => a.features.push(42), /strict matrix/],
+  ];
+  for (const [name, mutate, pattern] of cases) {
+    assert.throws(forge(mutate), pattern, name);
+    assert.ok(ledgerBytes(repo).equals(before), `${name}: zero bytes moved`);
+  }
+});
+
+ok('L24 the CLI receipt derives ledger contents and lineage from ONE snapshot', () => {
+  const repo = initRepo('l24-repo');
+  const receipt = require('../src/receipt');
+  state.loadState(repo);
+  ledgerMod.upsert(repo, 'features', { id: 'feat-base', name: 'base' });
+  // Commit a family write in the window between the receipt's ledger reads: a
+  // report that pairs revision N with health computed from N-1 describes a
+  // record that never existed.
+  const realRead = fs.readFileSync;
+  let injected = false;
+  function patched(file, ...rest) {
+    if (!injected && file === state.ledgerPath(repo)) {
+      injected = true;
+      const stale = realRead.call(fs, file, ...rest);
+      fs.readFileSync = realRead;
+      ledgerMod.upsert(repo, 'tests', { id: 'test-injected', name: 'injected', status: 'fail' });
+      fs.readFileSync = patched;
+      return stale;
+    }
+    return realRead.call(fs, file, ...rest);
+  }
+  let assembled;
+  try {
+    fs.readFileSync = patched;
+    assembled = receipt.assemble(repo);
+  } finally {
+    fs.readFileSync = realRead;
+  }
+  assert.ok(injected, 'the injection point must actually fire, or this proves nothing');
+  const disk = readLedger(repo);
+  assert.strictEqual(assembled.ledgerRev, disk.ledgerRev, 'the reported revision is the one on disk');
+  assert.strictEqual(assembled.verdict.ledger.counts.tests, disk.tests.length,
+    'and the ledger health describes THAT revision, not the one before it');
+});
+
 ok('L21 the five ledger sentences are allowlisted: no path, errno, or store location', () => {
   for (const code of ['StaleLedgerRev', 'StaleLedgerGen', 'LedgerDamaged', 'LedgerRevisionExhausted', 'ReceiptTooLarge']) {
     const sentence = mcp.WRITE_REFUSALS[code];

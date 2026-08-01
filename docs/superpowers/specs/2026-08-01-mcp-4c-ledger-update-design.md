@@ -108,6 +108,23 @@ claims) both graded HOLDS; the residue (a fixture-sweep sentence omitting two
 contributors its own inventory named, two summary phrases still in present tense,
 one four-line citation drift) is absorbed in this rev.
 
+POST-BUILD (the bet, settled honestly): the gate ruling below said the build's own
+falsifiers would be the next reviewers and that a design flaw surfacing there was the
+bet failing. It partly failed, and the record says so. A five-voice pass on the BUILT
+4c.1 (2026-08-01, commit 6ff7748) reproduced two publisher defects the nine pre-code
+rounds did not reach: `commitLedgerFamily` — the replacement for the privatized
+`saveLedger` — trusted its caller's base and after-image, so a stale snapshot
+published over a committed write and re-used its revision number, and a defect record
+could enter the mirror with no WAL behind it. The rounds specified the closed
+publisher SET but never that the door must PROVE its own arguments; "the publisher set
+is closed" was therefore prose at the one place it had to be code (convention 7, the
+lesson this project already names). Both were fixed at the door — strict re-read plus
+byte-equality on the base, family-only invariants on the after-image, full matrix
+validation before the rename — with falsifiers L22/L23 seen red against 6ff7748 first,
+and the reviewer's own reproductions re-run against the patched tree. The same pass
+found the receipt's two-read lineage pairing (L24) and this box-8 wording error, both
+corrected here.
+
 REVIEW LOOP CLOSED AT THE GATE (ruling, on the record): nine rounds, 54 findings,
 every one accepted or rejected with tree evidence; no round produced a RATIFY, and
 the ruling is that none will — the last three rounds' findings were sentence
@@ -872,10 +889,16 @@ tree 4c.1 builds on carries every repair this spec's envelope section mandates.
    path on either door reaches the mirror collection.
 7. **No-op.** Identical merge on both doors: no rev, no receipt, no restamp, zero
    bytes; the two lost-no-op outcomes pinned.
-8. **Strict load.** Absent/empty/malformed/invalid-UTF-8/wrong-shape/over-cap/
-   ACL-denied ledger fixtures refuse `LedgerDamaged`, create no backup and no fresh
-   ledger, on wire and CLI update paths; doctor names each condition locally. The
-   OPEN boundary proves the same matrix: absence creates version-2 bytes
+8. **Strict load.** Empty/malformed/invalid-UTF-8/wrong-shape/over-cap/ACL-denied
+   ledger fixtures refuse `LedgerDamaged`, create no backup and no fresh ledger, on
+   wire and CLI update paths; doctor names each condition locally. ABSENCE is per
+   door by rule, not by accident (round-10 correction: this box previously listed
+   absence among the CLI refusals, contradicting the CLI section's own normative
+   rule): the WIRE update refuses it (`workspace.open` already initialized this
+   store, so a missing file behind a live handle is out-of-band destruction), while
+   the CLI update CREATES a fresh version-2 ledger under its lock (the CLI
+   invocation is its own initialization boundary). The OPEN boundary proves the
+   same split: absence creates version-2 bytes
    create-exclusive under the lock; every unhealthy-existing fixture refuses the open
    with no handle issued, no `.corrupt` backup, and store contents byte-identical to
    the snapshot taken IMMEDIATELY AFTER recovery and before the probe (round-3
