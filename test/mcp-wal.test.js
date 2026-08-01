@@ -1014,6 +1014,75 @@ ok('W4b a slot landing after the diagnosis sample still survives doctor', () => 
     'the owed mirror is still owed — doctor recovered nothing');
 });
 
+ok('W4c doctor never travels the write door — a missing store is probed, not initialized', () => {
+  const repo = initRepo('w4c'); // no initStore: the store directory does not exist
+  const cli = require('../src/cli');
+  const realInit = state.initProject;
+  const realWrite = process.stdout.write;
+  const realExit = process.exitCode;
+  const realCwd = process.cwd();
+  let entered = 0;
+  let captured = '';
+  try {
+    state.initProject = function counted(...a) {
+      entered++;
+      return realInit.apply(state, a);
+    };
+    process.chdir(repo);
+    process.stdout.write = (s) => {
+      captured += String(s);
+      return true;
+    };
+    cli.run(['node', 'ratchet', 'doctor', '--json']);
+  } finally {
+    process.stdout.write = realWrite;
+    process.chdir(realCwd);
+    state.initProject = realInit;
+    process.exitCode = realExit;
+  }
+  const writable = JSON.parse(captured).checks.find((c) => c.name === 'state dir writable');
+  assert.strictEqual(entered, 0,
+    'the probe must never enter initProject — its lock would recover whatever store just appeared');
+  assert.strictEqual(writable.ok, true, 'the writability answer is still a real answer');
+  assert.ok(!fs.existsSync(state.projectDir(repo)), 'diagnosis created no store');
+});
+
+ok('W8 a mirrored write over a state record with invalid UTF-8 refuses and moves nothing', () => {
+  const repo = fixture('w8');
+  initStore(repo);
+  settled(() => artifacts.addDefect(repo, { severity: 'high', summary: 'utf8 sentinel state' }));
+  const stateFile = state.statePath(repo);
+  const bytes = Buffer.from(bytesOf(stateFile));
+  const at = bytes.indexOf(Buffer.from('utf8 sentinel state', 'utf8'));
+  assert.ok(at > 0);
+  bytes[at + 2] = 0xff; // one invalid byte inside the recorded summary
+  fs.writeFileSync(stateFile, bytes);
+  const before = storeSnapshot(repo);
+  assert.throws(
+    () => artifacts.addDefect(repo, { severity: 'low', summary: 'a different lawful finding' }),
+    (e) => Boolean(e) && e.code === 'ERATCHETMIRROR',
+    'a strict read never normalizes canonical bytes into a record nobody wrote');
+  assert.deepStrictEqual(storeSnapshot(repo), before, 'the refusal moved zero bytes');
+});
+
+ok('W9 a mirrored write over a ledger record with invalid UTF-8 refuses and moves nothing', () => {
+  const repo = fixture('w9');
+  initStore(repo);
+  settled(() => artifacts.addDefect(repo, { severity: 'high', summary: 'utf8 sentinel ledger' }));
+  const ledgerFile = state.ledgerPath(repo);
+  const bytes = Buffer.from(bytesOf(ledgerFile));
+  const at = bytes.indexOf(Buffer.from('utf8 sentinel ledger', 'utf8'));
+  assert.ok(at > 0);
+  bytes[at + 2] = 0xff;
+  fs.writeFileSync(ledgerFile, bytes);
+  const before = storeSnapshot(repo);
+  assert.throws(
+    () => artifacts.addDefect(repo, { severity: 'low', summary: 'a different lawful finding' }),
+    (e) => Boolean(e) && e.code === 'ERATCHETMIRROR',
+    'the mirror side is held to the same strict decode as the state side');
+  assert.deepStrictEqual(storeSnapshot(repo), before, 'the refusal moved zero bytes');
+});
+
 ok('W7 a peeked record with invalid UTF-8 refuses instead of serving a normalized projection', () => {
   const repo = initRepo('w7');
   const conn = service([repo], true).createConnection();

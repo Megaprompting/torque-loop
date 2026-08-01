@@ -1496,7 +1496,10 @@ function readForMirror(file, what) {
     throw err;
   }
   try {
-    const parsed = JSON.parse(bytes.toString('utf8'));
+    // Fatal decode, same rule as the slot parser: a lossy read here would let
+    // a lawful write serialize a U+FFFD-normalized record and settle the two
+    // files in permanent disagreement with no pending intent left behind.
+    const parsed = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not a record');
     return { bytes, parsed };
   } catch (_e) {

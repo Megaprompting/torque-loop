@@ -45,6 +45,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     stale-mirror truing commit moves ONLY the mirror — no duplicate log/history line,
     no restamped proof timestamp; "commits once solely to admit it" now means exactly
     that (W3 extended); and the doctor probe race above (W4b).
+  - **Round 3 of the same review added two more, fixed the same way:** the strict
+    mirrored-write reads and recovery's two record parses decode fatally like
+    everything else (W8, W9) — previously a lawful write over a record carrying one
+    invalid byte would commit a U+FFFD-normalized serialization and settle state and
+    ledger in permanent disagreement with no pending intent left behind; and doctor's
+    missing-store branch no longer reaches `initProject` at all (W4c) — a missing
+    store probes its nearest existing ancestor, so no first store appearing in the
+    sample-to-probe window can be recovered by the diagnosis tool. Doctor no longer
+    creates the store as a side effect; the first write does.
   - **Known limitation (parked, review round 2): the identity-checked clear is two
     syscalls.** The CLEAR step re-reads and compares before deleting, exactly as the
     spec words it — but compare and unlink cannot be one atomic operation through a

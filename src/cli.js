@@ -825,26 +825,28 @@ function cmdDoctor(cwd, asJson) {
     add('WAL intent slot', false, e.message);
   }
 
-  // The writability probe never travels the write door: initProject acquires
-  // the workspace lock, whose choke point RUNS recovery — a slot present now,
-  // or landing at any point during this command, would be consumed by the
-  // very tool that exists to report it. An existing store is probed with a
-  // scratch file (named .tmp- like every inert residue); only a store whose
-  // directory does not exist yet is created through initProject, and a
-  // directory that does not exist holds no slot to consume.
+  // The writability probe never travels the write door — not even for a store
+  // that does not exist yet: initProject acquires the workspace lock, whose
+  // choke point RUNS recovery, and a first store created by another process
+  // in the sample-to-probe window would be recovered by the very tool that
+  // exists to report it (seen live in review round 3). An existing store is
+  // probed with a scratch file (named .tmp- like every inert residue); a
+  // missing store probes its nearest existing ancestor — the first write
+  // creates the store itself.
   let stateDetail = '';
   let stateOk = true;
   try {
     const dir = state.projectDir(cwd); // still names a store conflict out loud
-    if (fs.existsSync(dir)) {
-      const probe = path.join(dir, `.doctor-probe.tmp-${process.pid.toString(36)}`);
-      fs.writeFileSync(probe, 'doctor writability probe\n');
-      fs.unlinkSync(probe);
-      stateDetail = dir;
-    } else {
-      state.initProject(cwd);
-      stateDetail = state.projectDir(cwd);
+    let probeDir = dir;
+    while (!fs.existsSync(probeDir)) {
+      const up = path.dirname(probeDir);
+      if (up === probeDir) break;
+      probeDir = up;
     }
+    const probe = path.join(probeDir, `.doctor-probe.tmp-${process.pid.toString(36)}`);
+    fs.writeFileSync(probe, 'doctor writability probe\n');
+    fs.unlinkSync(probe);
+    stateDetail = probeDir === dir ? dir : `${dir} (not created yet — the first write creates it)`;
   } catch (e) {
     stateOk = false;
     stateDetail = e.message;
