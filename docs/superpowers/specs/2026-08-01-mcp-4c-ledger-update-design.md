@@ -1,6 +1,6 @@
 # MCP Step 4c: `ledger.update` — the second single-file safe core
 
-Date: 2026-08-01 (rev 5)
+Date: 2026-08-01 (rev 6)
 Base: `main` at `41f7bf4` (all of step 4b merged and proven; PR #37 six-of-six CI)
 Branch: `feat/mcp-4c-ledger-update`
 Status: RATIFIED AS AMENDED — awaiting the five-voice re-run on this rev. History:
@@ -18,7 +18,16 @@ supported publishers within a lineage (raw exported primitives are 4b out-of-ban
 complete receipt-row typing, the open zero-byte claim scoped to the post-recovery
 baseline, the packaged-surface checklist gaps (CLI help, qa-ledger skill, README,
 fixture truth), `ledgerRev: integer | null` typing for the v1 no-op, and
-integer-only `StaleLedgerRev`. Gate remaining: five-voice round 3 on rev 5, then 4c.1.
+integer-only `StaleLedgerRev` → five-voice round 3 on rev 5: DO-NOT-RATIFY, nine
+findings, all accepted, all patched in this rev — headline: THREE ARE LIVE IN THE
+SHIPPED SAFE CORE (prototype-unsafe canonicalizer permitting false replay; UTF-16
+receipt-cap predicate; unsafe-integer state revisions), recorded in the defects
+section below with routing owed to Danny. Spec-side: prototype-safe + iterative
+canonicalization mandated, byte-measured caps on both rings, enumerated persisted
+result, matrix bound strictly below MAX_SAFE_INTEGER (exhaustion cannot exist),
+box-8 baseline = post-recovery snapshot, out-of-band residual stated honestly,
+fixture/CHANGELOG inventory corrected. Gate remaining: Danny routes the shipped
+defects, then five-voice round 4 on rev 6, then 4c.1.
 
 ## Objective
 
@@ -100,10 +109,15 @@ existing `version/createdAt/updatedAt/features/tests/defects`:
   advancing and CAS matches forever). Advanced by exactly one on every committed
   update-family write (scope defined in D2). Monotonic WITHIN a lineage: it never
   restarts while `ledgerGen` is unchanged. A wipe (`init --force`) is a lineage
-  replacement — new gen, `ledgerRev: 0` — not a restart of this line. If a valid
-  record's revision cannot advance safely (it equals `Number.MAX_SAFE_INTEGER`), the
-  commit refuses as a store condition on the `LedgerDamaged` route with zero bytes
-  moved; fixtures pin the boundary.
+  replacement — new gen, `ledgerRev: 0` — not a restart of this line. The matrix
+  bound is `0 ≤ ledgerRev < Number.MAX_SAFE_INTEGER` — strictly below the ceiling, so
+  "valid but cannot advance" is a state that CANNOT EXIST (round-3 finding: routing
+  exhaustion to `LedgerDamaged` was an untruthful diagnosis for readable bytes; the
+  truthful fix is that a record AT the ceiling fails the matrix — it is unprovable
+  data no supported writer could have produced, 9e15 commits away — and every record
+  the matrix accepts can advance safely). Doctor names the bound violation like any
+  other matrix row; fixtures pin `MAX_SAFE_INTEGER - 1` (valid, advances) and
+  `MAX_SAFE_INTEGER` (refuses).
 - `ledgerGen` — minted once at ledger creation (same `newGeneration` discipline as
   state, distinct prefix so a swapped file cannot alias). Names the lineage, so an
   out-of-band destroy-and-recreate cannot CAS-match an old expectation at a reused
@@ -149,7 +163,18 @@ recovery precedes every supported writer.
   `{tool, collection, item, expectedLedgerRev, expectedLedgerGen,
   expectedLedgerHash}` (the hash field normalized to `null` on version-2 writes, the
   `supersededBy` precedent). Handle and operationId excluded, for the reconnect
-  reason 4.1 proved the hard way.
+  reason 4.1 proved the hard way. TWO REPAIRS TO THE INHERITED ENCODER are
+  prerequisites, both round-3 findings and both LIVE in the shipped 4.1 path:
+  (1) the canonicalizer must be prototype-safe (`Object.create(null)` or
+  equivalent) — today's `out[key] =` assignment invokes the `__proto__` setter and
+  DROPS that own key, so two different JSON-parsed items hash identically and a
+  retained retry falsely replays instead of refusing `OperationIdConflict`; the same
+  drop bypasses the item cap. Injectivity, conflict, and cap vectors with `__proto__`
+  keys join the 4.1 golden tests. (2) Canonicalization must be iterative or enforce a
+  stated nesting limit at the boundary as `-32602` — a valid below-cap item of a few
+  thousand nested arrays currently throws `RangeError` out of the recursive encoder
+  and surfaces as `-32603`, an internal error for a malformed-input condition. A
+  below-cap depth fixture pins the refusal.
 - `item` — free-form object, same admission the CLI upsert gives it today; this spec
   deliberately does not invent record schemas for features/tests (their shapes remain
   the documented conventions in `schemas.js` comments). The canonical serialization of
@@ -212,7 +237,8 @@ else as unprovable:
   `ledgerRev`, `ledgerGen`, or `operations`, including a user-invented `operations`
   key — is a HYBRID and refuses: admission must never adopt fields it did not mint.
 - **Version 2:** the v1 keys plus exactly `{ledgerRev, ledgerGen, operations}`;
-  `version === 2`; `ledgerRev` a non-negative SAFE integer; `ledgerGen` a non-empty
+  `version === 2`; `ledgerRev` a non-negative safe integer STRICTLY below
+  `Number.MAX_SAFE_INTEGER`; `ledgerGen` a non-empty
   string with the ledger prefix; `operations` an array of ≤ 32 entries, each with
   exactly the receipt keys `{id, tool, argsHash, gen, rev, at, result}`, where every
   field has ONE admissible shape (the round-2 pass caught that exact-keys without
@@ -222,10 +248,19 @@ else as unprovable:
   matching the `sha256:` pattern; `gen` equal to the record's own `ledgerGen`; `rev`
   a positive safe integer ≤ the record's `ledgerRev`, with ring revisions UNIQUE and
   STRICTLY INCREASING in ring order; `at` a non-empty string; `result` the exact
-  committed success-envelope shape for this tool (4.1 rule: persisted results must
-  conform to the declared output schema) with `result.ledgerRev === rev`; ids UNIQUE
-  across the ring (a duplicate refuses — replay must never depend on which `find`
-  wins); each entry's serialized UTF-8 length within the 4 KiB cap.
+  persisted success shape, enumerated so no two implementers disagree (round-3
+  finding): `{ok: true, committed: true, replayed: false, ledgerRev, collection,
+  recordId, action}` with NO additional properties — `ledgerRev` a safe integer
+  equal to the entry's `rev`, `collection` in the wire enum, `action` in
+  `created|updated`, `recordId` a non-empty string (a stored `replayed: true` or
+  `committed: false` is unprovable: receipts persist only committed live results);
+  ids UNIQUE across the ring (a duplicate refuses — replay must never depend on
+  which `find` wins); each entry's size within 4 KiB measured in UTF-8 BYTES —
+  `Buffer.byteLength(JSON.stringify(entry), 'utf8')`, and the SAME predicate replaces
+  the two inherited writers, which today count UTF-16 code units (round-3 finding: a
+  legal high-astral item id produced 2,697 code units but 5,097 bytes — the shipped
+  predicate would commit a receipt this strict load must then reject, bricking the
+  ledger against its own writer). Astral-character boundary fixtures on both rings.
 - Missing/extra/wrong-typed keys at either level, an unknown `version`, or any
   receipt violating its row refuses `LedgerDamaged` on the write door and refuses the
   open at the open boundary; doctor names the exact failing row locally, read-only.
@@ -372,9 +407,14 @@ APIs — the family commit, the mirror publisher, creation/wipe, and whatever
 `saveLedger` becomes — within an unchanged `ledgerGen`. The raw exported primitives
 are out-of-band by the 4b doctrine (a raw low-level write is corruption tooling, not
 a supported writer door); they cannot be made revision-aware without becoming the
-thing they exist beneath, and the pre/post hash discipline is what makes their misuse
-loud downstream. `initProject --force` is classified above: lineage replacement, not
-a rev-silent edit. The test therefore proves: through every enumerated supported
+thing they exist beneath. The residual is stated honestly (round-3 correction — rev 5
+overclaimed here): the WAL's pre/post hashes make out-of-band interference loud ONLY
+around an occupied intent. A raw write that edits a valid v2 ledger's features while
+preserving gen and rev, with no intent pending, is NOT detected — the next family CAS
+matches. That is the same trust boundary every canonical record in this system
+already lives with; the enumerated-publisher invariant is a claim about supported
+doors, not about an author with filesystem access. `initProject --force` is
+classified above: lineage replacement, not a rev-silent edit. The test therefore proves: through every enumerated supported
 publisher, features/tests cannot change without `ledgerRev` advancing under the same
 gen — not a claim over arbitrary exported plumbing.
 
@@ -528,18 +568,48 @@ it); README documents only the four read tools — the conditional write roster,
 `ledger.update`, and the v1 `ledgerBytesHash` read surface need rows.
 Tests: `cli`, `mcp-server`, `mcp-write`, `mcp-wal` (call sites migrating off raw
 `saveLedger`), entry/concurrency suites, plugin-shape (skill/README sync). Fixture
-truth (round-2 correction): the checked-in whole-object fixture covers the FOUR-tool
-read-only roster; the 18-tool write roster is asserted as a name array only. 4c keeps
-the read-only fixture unchanged and ADDS a full 19-tool write-roster whole-object
-fixture, asserted exactly in both protocol eras.
-CHANGELOG bullets owed: ledger schema v2 + lineage fields; the new tool and 19-tool
-roster; open's repair→refuse change; CLI `ledger update defects` refusal (and the
-qa-ledger skill rewrite); CLI strict load on existing bytes; identical-merge no-op;
-`item.id` string tightening; `saveLedger` classification; hash-bound admission and
-the public `ledgerBytesHash` / `expectedLedgerHash` / `actualLedgerHash` contract.
+truth (round-2 correction, tightened by round 3): the checked-in whole-object fixture
+covers the FOUR-tool read-only roster; the 18-tool write roster is asserted as a name
+array only. The read-only ROSTER stays four tools, but its fixture is NOT unchanged —
+it deep-pins `workspace.open`'s complete descriptor, and 4c changes that descriptor
+(`ledgerRev`, `ledgerGen`, conditional `ledgerBytesHash`), so the fixture is
+REGENERATED deliberately, its diff reviewed as the read-surface contract change it
+is. Separately, a full 19-tool write-roster whole-object fixture is ADDED, both
+protocol eras. `src/mcp/prompts.generated.json` is regenerated too — it is derived
+from `PROMPTS.md` and byte-pinned by plugin-shape.
+CHANGELOG bullets owed: ledger schema v2 + lineage fields, including the safe-integer
+revision bounds; the new tool and 19-tool roster; open's repair→refuse change and its
+descriptor additions; CLI `ledger update defects` refusal (and the qa-ledger skill
+rewrite); CLI strict load on existing bytes; identical-merge no-op (with
+`ledgerRev: null` on the v1 no-op); `item.id` string tightening; `saveLedger`
+classification; hash-bound admission and the public `ledgerBytesHash` /
+`expectedLedgerHash` / `actualLedgerHash` contract; the complete public
+success/error schema for the tool (`StaleLedgerRev` / `StaleLedgerGen` /
+`LedgerDamaged` shapes).
 
 Notably absent from 4c, restated: no intent-schema change, no new WAL tooling, no
 version bump (the release that ships 4c bumps all five fields then, not now).
+
+### Defects surfaced in the SHIPPED safe core (round 3; recorded, routing owed to Danny)
+
+Three round-3 findings are live in main today, independent of 4c — recorded here so
+they cannot be silently inherited:
+
+1. **False replay via `__proto__` (critical).** The shipped canonicalizer
+   (`ops.js:46`) assigns sorted keys into a plain object, so a JSON-parsed own
+   `__proto__` key invokes the setter and vanishes from the hash. Probe-confirmed:
+   two different items hash identically; a retained retry on the STATE ring replays
+   instead of refusing `OperationIdConflict`, and the drop also bypasses size caps.
+2. **Receipt cap counts UTF-16 code units, not bytes.** Both shipped receipt writers
+   use `JSON.stringify(entry).length` (`ops.js:215/293`); a legal astral-heavy
+   payload passes the writer at ~2.7k units while being ~5.1k bytes.
+3. **State revisions have the same unsafe-integer hole 4c closes for the ledger**
+   (`state.js:1126/1163`, `ops.js:205`): `Number.isInteger` admits 2^53, where `+ 1`
+   stops advancing and stale CAS matches.
+
+Recommended routing: one hardening fix PR (red-first falsifiers, shared encoder and
+predicates — the fixes are the SAME code 4c.1 needs) landed before 4c.1 builds on
+those paths. Danny picks: hardening-first or fold-into-4c.1.
 
 ## Verification (acceptance, every box)
 
@@ -575,8 +645,12 @@ version bump (the release that ships 4c bumps all five fields then, not now).
    ledger, on wire and CLI update paths; doctor names each condition locally. The
    OPEN boundary proves the same matrix: absence creates version-2 bytes
    create-exclusive under the lock; every unhealthy-existing fixture refuses the open
-   with no handle issued, no `.corrupt` backup, and byte-identical store contents —
-   the repairing path seen red against today's `workspace.open`.
+   with no handle issued, no `.corrupt` backup, and store contents byte-identical to
+   the snapshot taken IMMEDIATELY AFTER recovery and before the probe (round-3
+   correction: a pending 4b intent may legitimately publish-and-clear before the
+   probe refuses — comparing against pre-open bytes would fail while the scoped
+   guarantee holds; a recover-then-refuse fixture pins exactly that sequence). The
+   repairing path is seen red against today's `workspace.open`.
 9. **Error funnel.** Table-driven faults across every refusal cross `safeWriteError`;
    wire text matches the sentence allowlist; no path, errno, or store location leaks;
    both eras validate every structured branch against the served `outputSchema`.
@@ -651,4 +725,9 @@ Five-voice round 2 on rev 4: openai-codex (gpt-5.6-sol), 2026-08-01 — DO-NOT-R
 admission fix graded HOLDS; seven findings, all accepted at the gate, none touching a
 ratified decision point.
 Rev 5 patches (all seven) traced by: claude-fable-5
-Awaiting: five-voice round 3 on rev 5 → then 4c.1.
+Five-voice round 3 on rev 5: openai-codex (gpt-5.6-sol), 2026-08-01 — DO-NOT-RATIFY;
+nine findings, all accepted; three are live shipped-core defects (canonicalizer
+verified against ops.js:46 before this rev).
+Rev 6 patches (all nine) traced by: claude-fable-5
+Awaiting: Danny's routing for the shipped-core defects → five-voice round 4 on rev 6
+→ then 4c.1.
