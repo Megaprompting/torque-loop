@@ -1238,6 +1238,43 @@ ok('W13 the doctor probe proves directory creation, not just file creation', () 
     'a place where directories cannot be created is not writable for a store');
 });
 
+ok('W14 a half-failed doctor probe cleans up after itself', () => {
+  const repo = initRepo('w14');
+  initStore(repo);
+  const cli = require('../src/cli');
+  const realWriteFile = fs.writeFileSync;
+  const realWrite = process.stdout.write;
+  const realExit = process.exitCode;
+  const realCwd = process.cwd();
+  let captured = '';
+  try {
+    fs.writeFileSync = function denied(target, ...rest) {
+      if (String(target).includes('.doctor-probe')) {
+        const e = new Error(`EACCES: permission denied, open '${target}'`);
+        e.code = 'EACCES';
+        throw e; // the mkdir succeeded; the file inside is what fails
+      }
+      return realWriteFile.call(fs, target, ...rest);
+    };
+    process.chdir(repo);
+    process.stdout.write = (s) => {
+      captured += String(s);
+      return true;
+    };
+    cli.run(['node', 'ratchet', 'doctor', '--json']);
+  } finally {
+    fs.writeFileSync = realWriteFile;
+    process.stdout.write = realWrite;
+    process.chdir(realCwd);
+    process.exitCode = realExit;
+  }
+  const writable = JSON.parse(captured).checks.find((c) => c.name === 'state dir writable');
+  assert.strictEqual(writable.ok, false, 'the half-failed probe still answers honestly');
+  const residue = fs.readdirSync(state.projectDir(repo)).filter((n) => n.includes('.doctor-probe'));
+  assert.deepStrictEqual(residue, [],
+    'a failed diagnostic leaves nothing a cold-start scan could misread as an interrupted write');
+});
+
 // ---------------------------------------------------------------------------
 
 process.stdout.write(`\n${passed} passed, ${failures.length} failed\n`);

@@ -848,9 +848,16 @@ function cmdDoctor(cwd, asJson) {
     // Windows ACLs grant these separately, and a file-only probe said
     // "writable" where the first real write then failed its mkdir.
     const scratch = path.join(probeDir, `.doctor-probe.tmp-${process.pid.toString(36)}`);
-    fs.mkdirSync(scratch);
-    fs.writeFileSync(path.join(scratch, 'probe'), 'doctor writability probe\n');
-    fs.rmSync(scratch, { recursive: true, force: true });
+    try {
+      fs.mkdirSync(scratch);
+      fs.writeFileSync(path.join(scratch, 'probe'), 'doctor writability probe\n');
+    } finally {
+      // Best-effort, always: a probe that failed half-way must not leave
+      // residue a cold-start scan could misread as an interrupted write.
+      try {
+        fs.rmSync(scratch, { recursive: true, force: true });
+      } catch (_e) { /* the writability answer stands either way */ }
+    }
     stateDetail = probeDir === dir ? dir : `${dir} (not created yet — the first write creates it)`;
   } catch (e) {
     stateOk = false;

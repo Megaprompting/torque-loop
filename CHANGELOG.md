@@ -66,6 +66,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     answered "writable" where the first real write then failed. W12 additionally pins
     recovery's own fatal decode against an adversarially consistent slot whose hash
     certifies undecodable bytes.
+  - **Round 5 returned the review's YES** ("one operation, two files, one crash story —
+    the mirror guarantee holds"): both round-4 fixes verified, the decode sweep found
+    no remaining permissive parse on any canonical byte path, and the probe matrix
+    passed all four ACL shapes. Its one LOW — a half-failed doctor probe left its
+    scratch directory behind — is fixed (cleanup in a best-effort finally, W14).
   - **Known limitation (parked, review round 2): the identity-checked clear is two
     syscalls.** The CLEAR step re-reads and compares before deleting, exactly as the
     spec words it — but compare and unlink cannot be one atomic operation through a
