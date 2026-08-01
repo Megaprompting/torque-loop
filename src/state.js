@@ -1771,12 +1771,18 @@ function nextLedgerRev(baseRev) {
 // (built by the caller once the target lineage is known), the ring cap, the
 // updatedAt stamp, and the fenced publish.
 //
-// It PROVES both of its arguments rather than trusting them. This door is
-// exported, so "the publisher set is closed" is only true if the door itself
-// enforces the closure — the review that found this had published a rev-0
-// snapshot over a committed rev-1 write, emitting different bytes that still
-// claimed revision 1, and had inserted a defect record with no WAL behind it.
-// A caller's good behavior is not an invariant (convention 7).
+// It PROVES its arguments rather than trusting them. This door is exported, so
+// "the publisher set is closed" is only true if the door itself enforces the
+// closure — the review that found this had published a rev-0 snapshot over a
+// committed rev-1 write, emitting different bytes that still claimed revision
+// 1, and had inserted a defect record with no WAL behind it. A caller's good
+// behavior is not an invariant (convention 7).
+//
+// The trusted input from `loaded` is EXACTLY its `bytes`. The parsed copy
+// beside them is convenience for the caller, never evidence here: a second
+// review round paired genuine bytes with a forged `loaded.version` /
+// `loaded.ledger.ledgerRev` and got the same class of defect back. Everything
+// below derives from `current` — the record re-read under this lock.
 function commitLedgerFamily(cwd, action, loaded, after, opts = {}) {
   assertMayWrite(action);
   return withWorkspaceLock(cwd, action, () => {
@@ -1812,9 +1818,18 @@ function commitLedgerFamily(cwd, action, loaded, after, opts = {}) {
         throw new Error('refusing a ledger family publish: the receipt ring is appended by this door alone — retained receipts are replay evidence');
       }
     }
+    // From here nothing reads the caller's parsed copy. The ONE thing this
+    // door trusts from `loaded` is its BYTES, proven identical above; version,
+    // revision, generation and the admission verdict all come from `current`,
+    // the record just re-read under this lock. The first cut of this guard
+    // proved the bytes and then still consulted `loaded.version` and
+    // `loaded.ledger.ledgerRev`, so genuine bytes paired with one forged
+    // sibling field moved the ledger while the revision stood still, and
+    // re-minted a live generation while reporting a false admission. A parsed
+    // copy travelling beside the bytes is not evidence about the record.
     let gen;
     let rev;
-    if (loaded.version === 1) {
+    if (current.version === 1) {
       gen = schemas.newLedgerGeneration();
       rev = 1;
       after.version = schemas.LEDGER_VERSION;
@@ -1822,8 +1837,8 @@ function commitLedgerFamily(cwd, action, loaded, after, opts = {}) {
       after.ledgerGen = gen;
       after.operations = [];
     } else {
-      gen = after.ledgerGen;
-      rev = nextLedgerRev(loaded.ledger.ledgerRev);
+      gen = base.ledgerGen;
+      rev = nextLedgerRev(base.ledgerRev);
       after.ledgerRev = rev;
     }
     if (opts.receipt) {
@@ -1843,7 +1858,7 @@ function commitLedgerFamily(cwd, action, loaded, after, opts = {}) {
       );
     }
     writeJson(ledgerPath(cwd), after);
-    return { ledgerRev: rev, ledgerGen: gen, admitted: loaded.version === 1 };
+    return { ledgerRev: rev, ledgerGen: gen, admitted: current.version === 1 };
   });
 }
 

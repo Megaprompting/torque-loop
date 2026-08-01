@@ -1129,6 +1129,45 @@ ok('L23 the family publisher refuses an after-image reaching outside features/te
   }
 });
 
+ok('L25 the family publisher ignores caller metadata: only the base BYTES are trusted', () => {
+  // Proving loaded.bytes is not enough if the mechanics then read the caller's
+  // parsed copy: genuine current bytes paired with a forged sibling field once
+  // moved the ledger while the revision stood still, and once re-minted a live
+  // generation while reporting a false admission.
+  const repo = initRepo('l25-repo');
+  const conn = service([repo], true).createConnection();
+  const open = openWorkspace(conn, repo);
+  payload(callTool(conn, 'ledger.update', ledgerEnvelope(open, { item: { id: 'feat-one', name: 'one' } })));
+  const before = ledgerBytes(repo);
+  const truth = readLedger(repo);
+
+  // A forged revision must not decide the successor.
+  const revForged = state.readLedgerStrict(repo);
+  const revAfter = JSON.parse(JSON.stringify(revForged.ledger));
+  revAfter.features.push({ id: 'feat-sneak', name: 'changed while the revision stood still' });
+  revForged.ledger = JSON.parse(JSON.stringify(revForged.ledger));
+  revForged.ledger.ledgerRev = -1;
+  const revResult = state.commitLedgerFamily(repo, 'test forged rev', revForged, revAfter);
+  assert.strictEqual(revResult.ledgerRev, truth.ledgerRev + 1,
+    'the successor comes from the record on disk, never from the caller\'s parsed copy');
+  assert.strictEqual(readLedger(repo).ledgerRev, truth.ledgerRev + 1,
+    'a committed content change ALWAYS advances the revision — two meanings at one revision is the whole defect');
+
+  // A forged version must not trigger admission on a live version-2 lineage.
+  const verForged = state.readLedgerStrict(repo);
+  const verAfter = JSON.parse(JSON.stringify(verForged.ledger));
+  verAfter.features.push({ id: 'feat-relineage', name: 'v2 record treated as v1' });
+  const genBefore = verForged.ledger.ledgerGen;
+  verForged.version = 1;
+  const verResult = state.commitLedgerFamily(repo, 'test forged version', verForged, verAfter);
+  assert.strictEqual(verResult.admitted, false, 'a version-2 record cannot be admitted');
+  assert.strictEqual(verResult.ledgerGen, genBefore, 'and its generation is not re-minted');
+  const disk = readLedger(repo);
+  assert.strictEqual(disk.ledgerGen, genBefore, 'the lineage on disk survives a forged version claim');
+  assert.strictEqual(disk.operations.length, 1, 'and so does the retained receipt an admission would have wiped');
+  assert.ok(!before.equals(ledgerBytes(repo)), 'these are legitimate commits, not refusals — only the metadata was ignored');
+});
+
 ok('L24 the CLI receipt derives ledger contents and lineage from ONE snapshot', () => {
   const repo = initRepo('l24-repo');
   const receipt = require('../src/receipt');

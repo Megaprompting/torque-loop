@@ -45,13 +45,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     (removed from the exports). The supported ledger publisher set is closed to
     `commitLedgerFamily` (the only rev-advancing door), the private WAL mirror
     publisher (defects + top-level `updatedAt` only — rev-, gen-, and ring-silent),
-    and the creation/wipe paths. `commitLedgerFamily` PROVES both of its arguments
-    rather than trusting its callers: it re-reads the ledger strictly under the held
-    lock and refuses unless the base is still byte-identical to what the caller
-    decided against; it refuses an after-image that touches the defect mirror,
-    `createdAt`, the generation, or retained receipts (only `features`/`tests` may
-    differ); and it validates the complete after-image against the strict matrix
-    before the rename. Features/tests cannot change through a supported door without
+    and the creation/wipe paths. `commitLedgerFamily` PROVES its arguments rather
+    than trusting its callers: it re-reads the ledger strictly under the held lock
+    and refuses unless the base is still byte-identical to what the caller decided
+    against; it refuses an after-image that touches the defect mirror, `createdAt`,
+    the generation, or retained receipts (only `features`/`tests` may differ); and it
+    validates the complete after-image against the strict matrix before the rename.
+    The ONLY input trusted from the caller's base is its BYTES — version, revision,
+    generation and the admission verdict are all derived from the record re-read
+    under the lock, so a parsed copy travelling beside the bytes can never decide the
+    successor or re-mint a live lineage. Features/tests cannot change through a supported door without
     `ledgerRev` advancing under the same gen. Raw exported primitives (`writeJson`,
     `writeFileAtomic`) remain out-of-band corruption tooling by the 4b doctrine,
     stated, not covered.

@@ -123,7 +123,16 @@ byte-equality on the base, family-only invariants on the after-image, full matri
 validation before the rename — with falsifiers L22/L23 seen red against 6ff7748 first,
 and the reviewer's own reproductions re-run against the patched tree. The same pass
 found the receipt's two-read lineage pairing (L24) and this box-8 wording error, both
-corrected here.
+corrected here. A SECOND pass on that fix (81081d5) then found the identical class one
+layer in: the guard proved `loaded.bytes` and the mechanics below it still read
+`loaded.version` and `loaded.ledger.ledgerRev`, so genuine bytes plus one forged
+sibling field moved the ledger while the revision stood still and re-minted a live
+generation while reporting a false admission. Settled structurally rather than by
+policing: the door's trusted input from the base is EXACTLY its bytes, and version,
+revision, generation and admission are all derived from the record re-read under the
+lock (falsifier L25, red first). The transferable rule, now twice-earned: proving one
+field of a caller-supplied object says nothing about its siblings — reduce the trusted
+input, do not audit it.
 
 REVIEW LOOP CLOSED AT THE GATE (ruling, on the record): nine rounds, 54 findings,
 every one accepted or rejected with tree evidence; no round produced a RATIFY, and
