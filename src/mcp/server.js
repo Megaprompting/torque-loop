@@ -279,6 +279,9 @@ const WRITE_ENVELOPE_PROPS = Object.freeze({
   expectedStateRev: {
     type: 'integer',
     minimum: 0,
+    // The advertised bound matches the runtime check: past 2^53 - 1 a revision
+    // cannot be one a client honestly read, and the boundary refuses it.
+    maximum: 9007199254740991,
     description: 'The state revision this write was decided against, from workspace.open or the state resource. A mismatch refuses; nothing is merged.',
   },
   expectedStateGen: {
