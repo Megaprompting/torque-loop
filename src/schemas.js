@@ -31,8 +31,16 @@ function newGeneration() {
 // request, not of the store.
 const LEDGER_GEN_MAX_BYTES = 64;
 
+// FIXED WIDTH, deliberately. This generation is minted DURING an admission
+// write and lands in that write's receipt before the byte cap is measured, so
+// a variable-width clock component (base 36 gains a digit in 2059) would let
+// the environment flip an identical request between accept and
+// ReceiptTooLarge — the same class of defect the fixed-width receipt stamp
+// exists to prevent. Eleven characters cover the whole JavaScript date domain.
+// The state generation is NOT in this class: it is minted at creation and at a
+// wipe, never inside a receipt-bearing commit.
 function newLedgerGeneration() {
-  return `lgen-${Date.now().toString(36)}-${crypto.randomBytes(8).toString('hex')}`;
+  return `lgen-${Date.now().toString(36).padStart(11, '0')}-${crypto.randomBytes(8).toString('hex')}`;
 }
 
 // Format check for a STORED ledger generation: the minted shape above —

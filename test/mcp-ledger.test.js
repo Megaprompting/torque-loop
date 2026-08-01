@@ -1255,6 +1255,68 @@ ok('L25 the family publisher ignores caller metadata: only the base BYTES are tr
   assert.ok(!before.equals(ledgerBytes(repo)), 'these are legitimate commits, not refusals — only the metadata was ignored');
 });
 
+ok('L26 the mirror publisher materializes before-bytes + declared ops, nothing else', () => {
+  // The third door in the closed publisher trio, and the third instance of one
+  // pattern: `prepare` was handed the live parsed ledger and the after-image
+  // was materialized from that same object, so a caller could move records the
+  // declared ops never named — a family feature, the lineage, the ring —
+  // rev-silently, inside a transaction whose intent said "defects only".
+  const repo = initRepo('l26-repo');
+  const conn = service([repo], true).createConnection();
+  const open = openWorkspace(conn, repo);
+  payload(callTool(conn, 'ledger.update', ledgerEnvelope(open, { item: { id: 'feat-one', name: 'family record' } })));
+  const before = readLedger(repo);
+
+  state.withMirroredMutation(repo, {
+    action: 'test mirror view', door: 'cli', tool: 'defect add',
+    operationId: 'test-mirror-view-op-000000', argsHash: `sha256:${'0'.repeat(64)}`,
+  }, (s, led) => {
+    led.features.push({ id: 'feat-rev-silent', name: 'moved through the mirror door' });
+    led.ledgerGen = 'lgen-0-00';
+    led.operations = [];
+    s.defects = s.defects || [];
+    s.defects.push({ id: 'def-probe', at: schemas.nowIso(), severity: 'high', summary: 'probe', status: 'open' });
+    return {
+      kind: 'commit',
+      ledgerOps: [{
+        collection: 'defects', id: 'ldef-probe', mode: 'insert',
+        after: { id: 'ldef-probe', severity: 'high', summary: 'probe', status: 'open' },
+      }],
+    };
+  });
+
+  const after = readLedger(repo);
+  assert.strictEqual(after.ledgerRev, before.ledgerRev, 'the mirror stays revision-silent');
+  assert.strictEqual(after.ledgerGen, before.ledgerGen, 'and lineage-silent');
+  assert.deepStrictEqual(after.operations, before.operations, 'and ring-silent');
+  assert.deepStrictEqual(after.features, before.features,
+    'a family record cannot move through the mirror door — the declared ops named only defects');
+  assert.deepStrictEqual(after.defects.map((d) => d.id), ['ldef-probe'], 'the DECLARED op still lands');
+  assert.ok(!fs.existsSync(state.intentPath(repo)), 'and the transaction completed cleanly');
+});
+
+ok('L27 the ledger generation is fixed-width, so a receipt cap cannot turn on the clock', () => {
+  // The generation is minted DURING an admission write and lands in that
+  // write's receipt before the byte cap is measured, so a variable-width
+  // generation lets the clock flip an identical request between accept and
+  // ReceiptTooLarge. (The state generation is not in this class: it is minted
+  // at creation and at a wipe, never inside a receipt-bearing commit.)
+  const realNow = Date.now;
+  const widths = new Set();
+  try {
+    for (const clock of [1, 36 ** 8 - 1, 36 ** 8, 36 ** 9, 8.64e15]) {
+      Date.now = () => clock;
+      const gen = schemas.newLedgerGeneration();
+      widths.add(Buffer.byteLength(gen, 'utf8'));
+      assert.ok(schemas.isLedgerGeneration(gen), `a minted generation stays matrix-valid at clock ${clock}: ${gen}`);
+    }
+  } finally {
+    Date.now = realNow;
+  }
+  assert.strictEqual(widths.size, 1,
+    `every minted generation is the same byte width across the supported date domain; saw ${[...widths].join(', ')}`);
+});
+
 ok('L24 the CLI receipt derives ledger contents and lineage from ONE snapshot', () => {
   const repo = initRepo('l24-repo');
   const receipt = require('../src/receipt');

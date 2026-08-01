@@ -134,6 +134,25 @@ lock (falsifier L25, red first). The transferable rule, now twice-earned: provin
 field of a caller-supplied object says nothing about its siblings — reduce the trusted
 input, do not audit it.
 
+4c.3 (the adversarial pass on the built code, run against 64b2159) then found the SAME
+pattern a third time, in the last untouched member of the closed trio: `runMirrored`
+handed `prepare` the live parsed ledger and materialized the after-image from that same
+object, so a caller could move a family feature, re-mint the lineage, and drop retained
+receipts REV-SILENTLY inside a transaction whose intent declared defects only — which
+falsifies, as built, the D2 sentence promising mirror publishes are rev/gen/ring-silent.
+Fixed the same structural way: `prepare` gets a clone, and the after-image is
+materialized from a pristine parse of the recorded bytes (exactly what recovery
+reconstructs). The pass also found that `newLedgerGeneration` was VARIABLE width, and a
+generation minted during an admission write enters that write's receipt before the byte
+cap is measured — so the base-36 clock rollover in 2059 could flip an identical request
+between accept and `ReceiptTooLarge`, contradicting this spec's own
+request-not-environment determinism promise. The round-8 contributor inventory called
+`ledgerGen` "store-fixed", which is true on every path EXCEPT the one that mints it;
+generations are now fixed-width. Falsifiers L26/L27 red first. Five claims graded HOLDS
+on that pass, including the full damaged-record matrix on all three doors, concurrent
+version-1 admission, eviction and lineage recreation, refusal byte-purity across all
+nine codes, and era parity.
+
 REVIEW LOOP CLOSED AT THE GATE (ruling, on the record): nine rounds, 54 findings,
 every one accepted or rejected with tree evidence; no round produced a RATIFY, and
 the ruling is that none will — the last three rounds' findings were sentence

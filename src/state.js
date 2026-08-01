@@ -1558,7 +1558,13 @@ function runMirrored(cwd, o, action, prepare) {
   const s = rememberBase(cwd, stateRead.parsed);
   const baseRev = revOf(s);
   _scope.state = s;
-  const prep = prepare(s, ledgerRead.parsed);
+  // `prepare` gets a CLONE of the ledger. Its only channel to the mirror is
+  // the ledgerOps it declares — the intent's whole contract is that the
+  // after-image equals before-bytes + those ops — so a view it can edit is a
+  // second, undeclared channel. Handing out the live object and then
+  // materializing from it let a caller move records the ops never named (a
+  // family feature, the lineage, the receipt ring) rev-silently.
+  const prep = prepare(s, clone(ledgerRead.parsed));
   _scope.state = null;
   if (!prep || prep.kind === 'skip') return { committed: false, rev: baseRev, state: s, result: prep && prep.result };
   if (prep.kind === 'noop') return { committed: false, rev: baseRev, state: s, result: prep.result };
@@ -1573,7 +1579,12 @@ function runMirrored(cwd, o, action, prepare) {
   s.updatedAt = now;
   s.rev = targetRev;
   const stateAfterBytes = wal.serializeRecord(s);
-  const ledgerAfter = wal.applyLedgerOps(ledgerRead.parsed, prep.ledgerOps, now);
+  // Materialize from a PRISTINE parse of the recorded bytes, never from any
+  // object that crossed the prepare boundary: the hashes below certify
+  // before-bytes + declared ops, and that is exactly what recovery will
+  // reconstruct if this process dies.
+  const ledgerBase = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(ledgerRead.bytes));
+  const ledgerAfter = wal.applyLedgerOps(ledgerBase, prep.ledgerOps, now);
   const ledgerAfterBytes = wal.serializeRecord(ledgerAfter);
   const intent = {
     version: 1,

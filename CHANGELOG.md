@@ -59,6 +59,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `ledgerRev` advancing under the same gen. Raw exported primitives (`writeJson`,
     `writeFileAtomic`) remain out-of-band corruption tooling by the 4b doctrine,
     stated, not covered.
+  - **The mirror publisher materializes from the recorded bytes, not from a view a
+    caller can edit.** The write-ahead intent's contract is that the ledger
+    after-image equals before-bytes plus the ops the transaction declared, so the
+    parsed ledger handed to a `prepare` callback was a second, undeclared channel:
+    editing it moved records the ops never named — a family feature, the lineage, the
+    receipt ring — revision-silently, inside a transaction whose intent said "defects
+    only". `prepare` now receives a clone, and the after-image is materialized from a
+    pristine parse of the recorded bytes, which is exactly what recovery reconstructs.
+  - **The ledger generation is fixed-width.** It is minted DURING an admission write
+    and lands in that write's receipt before the byte cap is measured, so its
+    variable-width base-36 clock component (which gains a digit in 2059) could flip an
+    identical request between accept and `ReceiptTooLarge` — the environment-dependent
+    verdict the fixed-width receipt stamp already exists to prevent. The state
+    generation is not in this class: it is minted at creation and at a wipe, never
+    inside a receipt-bearing commit.
   - **The receipt reads the ledger once.** The CLI cold read took the ledger's
     contents from one read and its lineage from a second, so a family commit landing
     between them reported revision N beside health computed from N−1 — a record that
