@@ -220,15 +220,19 @@ ok('H3b the mirrored door refuses at the revision ceiling instead of publishing 
   const repo = initRepo('mirrored-ceiling');
   state.initProject(repo);
   const file = setStoredRev(repo, MAX_SAFE);
-  let failed = false;
+  let diagnosis = '';
   try {
     childProcess.execFileSync(process.execPath, [RATCHET, 'defect', 'add', '{"severity":"low","summary":"ceiling probe"}'], {
       cwd: repo, encoding: 'utf8', env: process.env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true,
     });
-  } catch (_e) {
-    failed = true;
+  } catch (e) {
+    diagnosis = `${e && e.stderr ? e.stderr : ''}${e && e.message ? e.message : ''}`;
   }
-  assert.ok(failed, 'a mirrored write atop MAX_SAFE_INTEGER must exit nonzero, not advance to 2^53');
+  // The EXACT nextRev diagnosis, not any failure: round 5 caught that with the
+  // mirrored guard removed, the later intent self-check still exits nonzero —
+  // a test accepting any spawned-CLI failure could not tell the two apart.
+  assert.ok(/cannot advance safely/.test(diagnosis),
+    `the refusal must be nextRev's own diagnosis, got: ${diagnosis.slice(0, 300) || '(clean exit — the write committed)'}`);
   const after = JSON.parse(fs.readFileSync(file, 'utf8'));
   assert.strictEqual(after.rev, MAX_SAFE, 'the refused mirrored write must not move the revision');
   assert.ok(!fs.existsSync(path.join(state.projectDir(repo), 'intent.json')),
@@ -245,17 +249,19 @@ ok('H3c init --force refuses to mint the un-advanceable revision', () => {
   assert.strictEqual(after.rev, MAX_SAFE, 'the refused wipe must leave the record untouched');
 });
 
-ok('H3d WAL intent parsing refuses unsafe base/target revisions', () => {
+// One vector per field — round 5 caught that a single both-unsafe vector lets
+// either field's check mask removal of the other.
+function ceilingIntent(baseStateRev, targetStateRev) {
   const zeros = `sha256:${'0'.repeat(64)}`;
-  const intent = {
+  return Buffer.from(JSON.stringify({
     version: 1,
     door: 'mcp',
     operationId: 'op-0123456789abcdefghijkl',
     tool: 'defect.add',
     argsHash: zeros,
     stateGen: 'gen-x',
-    baseStateRev: 9007199254740992, // 2^53: base + 1 === base, so target "equals" its successor
-    targetStateRev: 9007199254740992,
+    baseStateRev,
+    targetStateRev,
     stateBeforeHash: zeros,
     stateAfterHash: zeros,
     ledgerBeforeHash: zeros,
@@ -263,11 +269,24 @@ ok('H3d WAL intent parsing refuses unsafe base/target revisions', () => {
     ledgerUpdatedAt: 't',
     ledgerOps: [{ collection: 'defects', id: 'ldef-1', mode: 'insert', after: { id: 'ldef-1' } }],
     at: 't',
-  };
+  }, null, 2) + '\n', 'utf8');
+}
+
+ok('H3d WAL intent parsing refuses an unsafe base revision, named as such', () => {
+  // 2^53 on both fields: base + 1 === base, so the target "equals" its successor.
   assert.throws(
-    () => wal.parseIntent(Buffer.from(JSON.stringify(intent, null, 2) + '\n', 'utf8')),
-    /StateRev/,
-    'an intent whose target numerically equals its unsafe base must be ambiguous, never recovered'
+    () => wal.parseIntent(ceilingIntent(9007199254740992, 9007199254740992)),
+    /bad baseStateRev/,
+    'an unsafe base must be refused BY THE BASE CHECK, not caught downstream'
+  );
+});
+
+ok('H3d2 WAL intent parsing refuses an unsafe target atop a safe base', () => {
+  // base = MAX_SAFE is a legal value; its successor is not representable.
+  assert.throws(
+    () => wal.parseIntent(ceilingIntent(MAX_SAFE, MAX_SAFE + 1)),
+    /targetStateRev/,
+    'a safe base with an unsafe successor must be refused by the target check'
   );
 });
 
