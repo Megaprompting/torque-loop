@@ -1,6 +1,6 @@
 # MCP Step 4c: `ledger.update` — the second single-file safe core
 
-Date: 2026-08-01 (rev 10)
+Date: 2026-08-01 (rev 11)
 Base: `main` at `284c265` (step 4b + the hardening trilogy #38/#39/#40 merged; #40
 carries the discrimination tests the verification boxes lean on)
 Branch: `feat/mcp-4c-ledger-update`
@@ -88,8 +88,21 @@ verdict independence; the two doctor operator rows join the ACTUAL checklist and
 CHANGELOG lists with concrete repairs (restore-or-reset for an over-bound gen,
 never truncation; archive/reset before mutating at the ceiling); and the passages
 still describing the #38/#39 repairs in present tense are rewritten as history —
-4c reuses the shipped encoder, it does not re-fix it. Gate remaining: five-voice
-round 8 on this rev, then 4c.1.
+4c reuses the shipped encoder, it does not re-fix it. → five-voice round 8 on rev 10: DO-NOT-RATIFY —
+no critical, no high; the restructured 4c.1 staging and the doctor inventory both
+graded HOLDS; two medium + two low, all accepted, all in this rev: the
+ReceiptTooLarge narrative is rewritten as the COMPOSITIONAL truth it is (round 8
+refuted "cannot be receipted at all" with a reproduced 3,991-accept/4,097-refuse
+pair that flipped on operationId length alone — the variable contributors are now
+enumerated, the update remediation says a shorter valid operationId can admit what
+a longer one cannot, and near-cap fixtures sweep every variable width); the two
+passages STILL describing the #38/#39 repairs as live are rewritten in the past
+tense they deserve (second offense, same lesson: prose spliced across revisions
+must be re-read whole); plain `ratchet doctor` (`cmdDoctor`) is named as the route
+carrying the new operator rows via a shared strict helper, with `doctor
+cold-start` explicitly unchanged; and 4c.1's roster mechanics are stated (existing
+name-array assertions go to nineteen in 4c.1; the enum widens and the whole-object
+fixture lands in 4c.2). Gate remaining: five-voice round 9 on this rev, then 4c.1.
 
 ## Objective
 
@@ -238,16 +251,16 @@ recovery precedes every supported writer.
   SINCE SHIPPED as PRs #38/#39 (the reviewed base carries them; 4c reuses the
   repaired encoder, it does not re-fix it). Recorded as the design constraints
   they were:
-  (1) the canonicalizer must be prototype-safe (`Object.create(null)` or
-  equivalent) — today's `out[key] =` assignment invokes the `__proto__` setter and
-  DROPS that own key, so two different JSON-parsed items hash identically and a
-  retained retry falsely replays instead of refusing `OperationIdConflict`; the same
-  drop bypasses the item cap. Injectivity, conflict, and cap vectors with `__proto__`
-  keys join the 4.1 golden tests. (2) Canonicalization must be iterative or enforce a
-  stated nesting limit at the boundary as `-32602` — a valid below-cap item of a few
-  thousand nested arrays currently throws `RangeError` out of the recursive encoder
-  and surfaces as `-32603`, an internal error for a malformed-input condition. A
-  below-cap depth fixture pins the refusal.
+  (1) the canonicalizer is prototype-safe (`Object.create(null)`) — in the
+  pre-#38 tree, the `out[key] =` assignment invoked the `__proto__` setter and
+  DROPPED that own key, so two different JSON-parsed items hashed identically and a
+  retained retry falsely replayed instead of refusing `OperationIdConflict`, with
+  the same drop bypassing the item cap; the shipped repair and its injectivity/
+  conflict/cap vectors are the standing regressions 4c inherits. (2) Deep nesting
+  refuses `-32602` at the boundary via the shipped iterative depth cap — in the
+  pre-#38 tree, a valid below-cap item of a few thousand nested arrays threw
+  `RangeError` out of the recursive encoder and surfaced as a mislabeled retryable
+  failure; the boundary-exact fixtures 4c inherits pin the cap.
 - `item` — free-form object, same admission the CLI upsert gives it today; this spec
   deliberately does not invent record schemas for features/tests (their shapes remain
   the documented conventions in `schemas.js` comments). The canonical serialization of
@@ -550,18 +563,26 @@ identical retry must fail identically):
   request cannot succeed as sent — see ratchet doctor if the store's own fields are
   oversized.` Deterministic — the receipt echoes `recordId` (client-supplied
   `item.id`) and lineage fields, and a ~5,000-byte id stays under the 16-KiB item
-  cap while blowing the 4-KiB receipt cap. The remediation is told truthfully per
-  trigger (round-5 correction — "shorten and retry" was wrong beyond the create
-  case; round 6 then ELIMINATED the non-request triggers by bounding them in the
-  matrix): a CREATE with an oversized id proceeds as a new operation with a shorter
-  id; an UPDATE addressing an existing oversized-id record cannot be receipted over
-  the wire at all (the id names the record — shortening it addresses a different
-  record; the CLI, which persists no receipt, still can). The stored-`ledgerGen`
-  and stamped-timestamp triggers CANNOT EXIST under the matrix rows above — an
-  over-bound gen is `LedgerDamaged` at load, and every accepted stamp is exactly 24
-  bytes, so the cap verdict is a pure function of the request against the store
-  (round-7 correction: a variable-width stamp bound left a near-cap composition
-  window where the environment decided the verdict). The
+  cap while blowing the 4-KiB receipt cap. The remediation is told as what it is —
+  COMPOSITIONAL (round-8 correction: rev 10 said an oversized-id update "cannot be
+  receipted over the wire at all," and the review refuted it with a reproduced
+  pair: the same near-cap update passed at 3,991 bytes under a 22-byte operationId
+  and refused at 4,097 under a legal 128-byte one). The cap verdict is a function
+  of the WHOLE serialized entry, whose variable contributors are exactly:
+  `operationId` (client-chosen, 22–128 bytes), `ledgerGen` (store-fixed, ≤ 64),
+  the two revision spellings (entry `rev` and `result.ledgerRev`, up to 16 decimal
+  digits each), `collection` (enum), and `result.recordId` (echoes `item.id`).
+  Every accepted stamp is exactly 24 bytes and contributes nothing variable
+  (round-7 fix); an over-bound gen is `LedgerDamaged` at load. So the truthful
+  guidance: a CREATE with an oversized id proceeds as a new operation with a
+  shorter id; a near-cap UPDATE may fit or not depending on the composition — a
+  shorter (still-valid) `operationId` can admit what a longer one cannot — and a
+  record whose stored id leaves NO valid composition under the cap is not
+  receiptable over the wire (the CLI, which persists no receipt, remains its
+  route). "Non-retryable" means: unchanged envelope, unchanged verdict. Near-cap
+  fixtures sweep operationId, generation, and revision widths as well as accepted
+  clocks, proving the verdict moves only with the composition, never with the
+  environment. The
   outcome mapping is explicit: for `ledger.update`, the `capOverflow` outcome maps
   to `ReceiptTooLarge`, never to retryable `WriteFailed`. The state-side writers
   keep today's `WriteFailed` mapping for the identical condition — a known
@@ -687,9 +708,12 @@ on doctor, not a figure of speech).
   rewrite (all named CHANGELOG changes). The wire tool ships on the `features`
   collection as canary. The five crash-boundary replay tests, re-run against the
   ledger line with real process deaths.
-- **4c.2 — Roster completion.** The `tests` collection on the wire, the 19-tool
-  write-roster fixture in both protocol eras, and any remaining projection/receipt
-  surfaces the canary did not exercise.
+- **4c.2 — Roster completion.** The `tests` collection on the wire (4c.1 advertises
+  `collection: ["features"]` and 4c.2 widens the enum — and 4c.1 already updates
+  the EXISTING name-array roster assertions to nineteen, since registering the tool
+  changes them the moment it lands; deferring that would fail 4c.1's own suite),
+  the 19-tool whole-object write-roster fixture in both protocol eras, and any
+  remaining projection/receipt surfaces the canary did not exercise.
 - **4c.3 — Adversarial pass.** Family-vs-WAL interleavings under the lock, admission
   races, damaged-ledger matrix, eviction and different-gen-recreation lineage cases, refusal
   byte-purity, error-text allowlist, both protocol eras, both OS families.
@@ -702,7 +726,11 @@ becomes the family-commit core; defects refusal; string-id rule), `mcp/ops.js` (
 ledger envelope executor beside `executeWrite`), `mcp/server.js` (tool #19 appended in
 advertised order — the roster today is exactly 18: four base + fourteen writes — plus
 open changes and resource projections), `receipt.js` (ledger lineage on the one cold
-read), doctor (`coldStart`/diagnosis surface: the TWO NEW OPERATOR ROWS — a
+read), doctor — PLAIN `ratchet doctor`, i.e. `cmdDoctor` in `src/cli.js`, via a shared
+strict ledger-diagnosis helper both routes can call; `doctor cold-start`
+(`coldStart.scan`) is UNCHANGED by 4c, named so an implementer cannot satisfy the
+obligation on the route `LedgerDamaged`'s sentence does not send operators to
+(the TWO NEW OPERATOR ROWS — a
 generation exceeding its bound, repaired only by restoring a valid backup or
 archive/reset, NEVER by truncating the gen; and a revision at `MAX_SAFE_INTEGER`,
 repaired by archive/reset before further mutation — each with a fixture),
@@ -762,20 +790,23 @@ version bump (the release that ships 4c bumps all five fields then, not now).
 
 ### Defects surfaced in the SHIPPED safe core (rounds 3–4; RESOLVED)
 
-Three round-3 findings are live in main today, independent of 4c — recorded here so
-they cannot be silently inherited:
+Three round-3 findings WERE live in the pre-#38 main of 2026-08-01 — recorded here,
+in the past tense they now deserve, so the history of what this review surfaced
+cannot be silently forgotten (the reviewed base carries every repair):
 
-1. **False replay via `__proto__` (critical).** The shipped canonicalizer
-   (`ops.js:46`) assigns sorted keys into a plain object, so a JSON-parsed own
-   `__proto__` key invokes the setter and vanishes from the hash. Probe-confirmed:
-   two different items hash identically; a retained retry on the STATE ring replays
-   instead of refusing `OperationIdConflict`, and the drop also bypasses size caps.
-2. **Receipt cap counts UTF-16 code units, not bytes.** Both shipped receipt writers
-   use `JSON.stringify(entry).length` (`ops.js:215/293`); a legal astral-heavy
-   payload passes the writer at ~2.7k units while being ~5.1k bytes.
-3. **State revisions have the same unsafe-integer hole 4c closes for the ledger**
-   (`state.js:1126/1163`, `ops.js:205`): `Number.isInteger` admits 2^53, where `+ 1`
-   stops advancing and stale CAS matches.
+1. **False replay via `__proto__` (critical, FIXED in #38).** The pre-#38
+   canonicalizer assigned sorted keys into a plain object, so a JSON-parsed own
+   `__proto__` key invoked the setter and vanished from the hash. Probe-confirmed
+   then: two different items hashed identically; a retained retry on the STATE ring
+   replayed instead of refusing `OperationIdConflict`, and the drop also bypassed
+   size caps.
+2. **Receipt caps counted UTF-16 code units, not bytes (FIXED in #38, unified in
+   #39).** Both pre-#38 receipt writers used `JSON.stringify(entry).length`; a legal
+   astral-heavy payload passed the writer at ~2.7k units while being ~5.1k bytes.
+3. **State revisions had the unsafe-integer hole 4c closes for the ledger (FIXED
+   across #38/#39):** `Number.isInteger` admitted 2^53, where `+ 1` stops advancing
+   and stale CAS matched — guarded first at one publisher, then at every publisher
+   through the shared checked successor.
 
 RESOLVED in two rounds (Danny ruled hardening-first, 2026-08-01): PR #38 (merged @
 8b137e4) shipped the prototype-safe canonicalizer, byte caps, boundary + commit
@@ -928,4 +959,8 @@ Five-voice round 7 on rev 9: openai-codex (gpt-5.6-sol), 2026-08-01 — DO-NOT-R
 claims 1/4/5/6 HOLD; one high (4c.1 staging incoherence) + three medium, all
 accepted; the near-cap stamp counterexample was reproduced computationally.
 Rev 10 patches (all four) traced by: claude-fable-5
-Awaiting: five-voice round 8 on rev 10 → then 4c.1.
+Five-voice round 8 on rev 10: openai-codex (gpt-5.6-sol), 2026-08-01 —
+DO-NOT-RATIFY; no critical, no high; staging and doctor inventory HOLD; two medium
++ two low, all accepted (the compositional counterexample reproduced).
+Rev 11 patches (all four) traced by: claude-fable-5
+Awaiting: five-voice round 9 on rev 11 → then 4c.1.
