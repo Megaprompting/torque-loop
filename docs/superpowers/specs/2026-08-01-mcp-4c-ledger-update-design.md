@@ -26,8 +26,9 @@ section below with routing owed to Danny. Spec-side: prototype-safe + iterative
 canonicalization mandated, byte-measured caps on both rings, enumerated persisted
 result, matrix bound strictly below MAX_SAFE_INTEGER (exhaustion cannot exist),
 box-8 baseline = post-recovery snapshot, out-of-band residual stated honestly,
-fixture/CHANGELOG inventory corrected. Gate remaining: Danny routes the shipped
-defects, then five-voice round 4 on rev 6, then 4c.1.
+fixture/CHANGELOG inventory corrected. Danny routed the shipped defects
+hardening-first; they landed as PR #38 (main @ 8b137e4, CI 6/6). Gate remaining:
+five-voice round 4 on this rev, then 4c.1.
 
 ## Objective
 
@@ -607,9 +608,13 @@ they cannot be silently inherited:
    (`state.js:1126/1163`, `ops.js:205`): `Number.isInteger` admits 2^53, where `+ 1`
    stops advancing and stale CAS matches.
 
-Recommended routing: one hardening fix PR (red-first falsifiers, shared encoder and
-predicates — the fixes are the SAME code 4c.1 needs) landed before 4c.1 builds on
-those paths. Danny picks: hardening-first or fold-into-4c.1.
+RESOLVED (Danny ruled hardening-first, 2026-08-01): all three shipped as PR #38
+(`fix/mcp-core-hardening`, merged to main @ 8b137e4, CI six-of-six green) with
+falsifiers H1–H5 seen red against the unpatched tree — prototype-safe canonicalizer,
+`Buffer.byteLength` caps at both sites, safe-integer boundary + commit guard, and the
+iterative 64-deep argument cap as `-32602`. The tree 4c.1 builds on now carries the
+repairs this spec's envelope section mandates; `test/mcp-hardening.test.js` is the
+standing regression.
 
 ## Verification (acceptance, every box)
 
