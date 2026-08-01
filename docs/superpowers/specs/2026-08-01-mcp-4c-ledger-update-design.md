@@ -1,6 +1,6 @@
 # MCP Step 4c: `ledger.update` — the second single-file safe core
 
-Date: 2026-08-01 (rev 9)
+Date: 2026-08-01 (rev 10)
 Base: `main` at `284c265` (step 4b + the hardening trilogy #38/#39/#40 merged; #40
 carries the discrimination tests the verification boxes lean on)
 Branch: `feat/mcp-4c-ledger-update`
@@ -73,7 +73,23 @@ fourteen shipped write tools; the qa-ledger delta names Procedure steps 3–4 wi
 the real defect add/resolve/reopen/supersede contracts and a both-directions guard
 test; the base SHA distinguishes the reviewed tree (284c265, carrying #40's
 discrimination tests); and the rev-7 history line on template staging is marked
-superseded. Gate remaining: five-voice round 7 on this rev, then 4c.1.
+superseded. → five-voice round 7 on rev 9: DO-NOT-RATIFY — claims on the publisher trio, the
+durable open loop, the qa-ledger delta, and the base SHA all graded HOLDS; one high
++ three medium, all accepted, all in this rev: 4c.1 restructured to be
+INDEPENDENTLY LANDABLE (the rev-9 split shipped a canary whose clients could not
+build its envelope — projections were 4c.2 — and publisher closure necessarily
+drags the CLI in; 4c.1 now carries projections, CLI family adoption, D3 refusal,
+help/skill rewrite, and the template, leaving 4c.2 = tests collection + roster
+completion); the receipt stamp becomes a canonical FIXED-WIDTH 24-byte UTC form
+(round 7 broke the ≤ 64-byte ceiling with a near-cap counterexample — variable
+width let the environment flip an identical request's verdict), with non-canonical
+overrides refusing locally as honestly-retryable and a near-cap fixture proving
+verdict independence; the two doctor operator rows join the ACTUAL checklist and
+CHANGELOG lists with concrete repairs (restore-or-reset for an over-bound gen,
+never truncation; archive/reset before mutating at the ceiling); and the passages
+still describing the #38/#39 repairs in present tense are rewritten as history —
+4c reuses the shipped encoder, it does not re-fix it. Gate remaining: five-voice
+round 8 on this rev, then 4c.1.
 
 ## Objective
 
@@ -217,8 +233,11 @@ recovery precedes every supported writer.
   `{tool, collection, item, expectedLedgerRev, expectedLedgerGen,
   expectedLedgerHash}` (the hash field normalized to `null` on version-2 writes, the
   `supersededBy` precedent). Handle and operationId excluded, for the reconnect
-  reason 4.1 proved the hard way. TWO REPAIRS TO THE INHERITED ENCODER are
-  prerequisites, both round-3 findings and both LIVE in the shipped 4.1 path:
+  reason 4.1 proved the hard way. TWO REPAIRS TO THE INHERITED ENCODER were
+  prerequisites — round-3 findings, found live in the then-shipped 4.1 path and
+  SINCE SHIPPED as PRs #38/#39 (the reviewed base carries them; 4c reuses the
+  repaired encoder, it does not re-fix it). Recorded as the design constraints
+  they were:
   (1) the canonicalizer must be prototype-safe (`Object.create(null)` or
   equivalent) — today's `out[key] =` assignment invokes the `__proto__` setter and
   DROPS that own key, so two different JSON-parsed items hash identically and a
@@ -305,12 +324,16 @@ else as unprovable:
   wire tool — a state-tool name inside the ledger ring is unprovable); `argsHash`
   matching the `sha256:` pattern; `gen` equal to the record's own `ledgerGen`; `rev`
   a positive safe integer ≤ the record's `ledgerRev`, with ring revisions UNIQUE and
-  STRICTLY INCREASING in ring order; `at` a non-empty string of ≤ 64 UTF-8 bytes, and the PRODUCER enforces that bound
-  when stamping (round-6 finding: `RATCHET_NOW` is caller-controlled text and an
-  unconstrained stamp was a fourth receipt-overflow trigger — one an identical
-  request could dodge by fixing the environment, contradicting the deterministic
-  story; an oversized-`RATCHET_NOW` fixture pins the refusal at the stamp, before
-  any receipt is built); `result` the exact
+  STRICTLY INCREASING in ring order; `at` a CANONICAL FIXED-WIDTH UTC stamp — exactly the 24-byte
+  `YYYY-MM-DDTHH:MM:SS.mmmZ` form, validated by the producer when stamping
+  (round-6 found `RATCHET_NOW` flowing unconstrained into receipts; round 7 then
+  broke the ≤ 64-byte repair with a near-cap counterexample — a VARIABLE-width
+  stamp lets the environment flip an identical request between accept and
+  `ReceiptTooLarge`, so the bound must be an exact width, not a ceiling. An
+  override that is not a canonical stamp refuses the write locally with honest
+  retryable semantics — fix the environment and the identical request proceeds —
+  and a near-cap fixture proves every ACCEPTED clock value yields the same cap
+  verdict); `result` the exact
   persisted success shape, enumerated so no two implementers disagree (round-3
   finding): `{ok: true, committed: true, replayed: false, ledgerRev, collection,
   recordId, action}` with NO additional properties — `ledgerRev` a safe integer
@@ -319,11 +342,12 @@ else as unprovable:
   `committed: false` is unprovable: receipts persist only committed live results);
   ids UNIQUE across the ring (a duplicate refuses — replay must never depend on
   which `find` wins); each entry's size within 4 KiB measured in UTF-8 BYTES —
-  `Buffer.byteLength(JSON.stringify(entry), 'utf8')`, and the SAME predicate replaces
-  the two inherited writers, which today count UTF-16 code units (round-3 finding: a
-  legal high-astral item id produced 2,697 code units but 5,097 bytes — the shipped
-  predicate would commit a receipt this strict load must then reject, bricking the
-  ledger against its own writer). Astral-character boundary fixtures on both rings.
+  `Buffer.byteLength(JSON.stringify(entry), 'utf8')`, the ONE shared predicate the
+  hardening PRs already shipped for both inherited writers (historical note, round
+  3: the pre-#38 predicates counted UTF-16 code units, and a legal high-astral item
+  id at 2,697 units / 5,097 bytes would have committed a receipt this strict load
+  must then reject — the repair predates 4c and 4c reuses it). Astral-character
+  boundary fixtures on both rings.
 - Missing/extra/wrong-typed keys at either level, an unknown `version`, or any
   receipt violating its row refuses `LedgerDamaged` on the write door and refuses the
   open at the open boundary; doctor names the exact failing row locally, read-only.
@@ -533,9 +557,11 @@ identical retry must fail identically):
   id; an UPDATE addressing an existing oversized-id record cannot be receipted over
   the wire at all (the id names the record — shortening it addresses a different
   record; the CLI, which persists no receipt, still can). The stored-`ledgerGen`
-  and stamped-timestamp triggers CANNOT EXIST under the bounded matrix rows above —
-  an over-bound gen is `LedgerDamaged` at load, an over-bound stamp refuses at the
-  producer. The
+  and stamped-timestamp triggers CANNOT EXIST under the matrix rows above — an
+  over-bound gen is `LedgerDamaged` at load, and every accepted stamp is exactly 24
+  bytes, so the cap verdict is a pure function of the request against the store
+  (round-7 correction: a variable-width stamp bound left a near-cap composition
+  window where the environment decided the verdict). The
   outcome mapping is explicit: for `ledger.update`, the `capOverflow` outcome maps
   to `ReceiptTooLarge`, never to retryable `WriteFailed`. The state-side writers
   keep today's `WriteFailed` mapping for the identical condition — a known
@@ -645,16 +671,25 @@ on doctor, not a figure of speech).
 
 ## Internal sequence (each lands reviewed before the next)
 
-- **4c.1 — The ledger envelope.** Schema version 2, strict family loader, rev/gen/ring,
-  CAS, replay/conflict/eviction, deterministic ids, D4 admission, `LedgerDamaged` +
-  stale codes through the funnel, doctor read-only diagnosis, the `workspace.open`
-  boundary fix (create-exclusive on absence, strict refusal on unhealthy bytes — it is
-  the initialization boundary, so it hardens with the mechanism, not after), and the
-  wire tool on the `features` collection as canary. The five crash-boundary replay
-  tests, re-run against the ledger line with real process deaths.
-- **4c.2 — Roster + CLI adoption.** `tests` collection, CLI rev-advance + strict load +
-  no-op + the D3 `ledger update defects` refusal (all named CHANGELOG changes),
-  `workspace.open`/resource projections.
+- **4c.1 — The ledger envelope, INDEPENDENTLY LANDABLE (round-7 restructure: the
+  rev-9 split shipped a canary whose clients could not build its envelope, and
+  publisher closure necessarily changes the CLI — deferring "CLI adoption" was
+  incoherent).** Schema version 2 + template regeneration, strict family loader,
+  rev/gen/ring, CAS, replay/conflict/eviction, deterministic ids, D4 admission,
+  all five ledger codes through the funnel, doctor's read-only rows, the
+  `workspace.open` boundary fix (create-exclusive on absence, strict refusal on
+  unhealthy bytes) AND the open/resource projections (`ledgerRev`, `ledgerGen`,
+  v1 `ledgerBytesHash`) — without them no client can name an expectation. The
+  publisher closure lands here whole: `saveLedger` privatized, both upsert branches
+  through `commitLedgerFamily`, which means the CLI family adoption is 4c.1 too —
+  rev-advance, strict load on existing bytes, identical-merge no-op, the D3
+  `ledger update defects` refusal, help text, and the qa-ledger skill/prompt
+  rewrite (all named CHANGELOG changes). The wire tool ships on the `features`
+  collection as canary. The five crash-boundary replay tests, re-run against the
+  ledger line with real process deaths.
+- **4c.2 — Roster completion.** The `tests` collection on the wire, the 19-tool
+  write-roster fixture in both protocol eras, and any remaining projection/receipt
+  surfaces the canary did not exercise.
 - **4c.3 — Adversarial pass.** Family-vs-WAL interleavings under the lock, admission
   races, damaged-ledger matrix, eviction and different-gen-recreation lineage cases, refusal
   byte-purity, error-text allowlist, both protocol eras, both OS families.
@@ -667,7 +702,11 @@ becomes the family-commit core; defects refusal; string-id rule), `mcp/ops.js` (
 ledger envelope executor beside `executeWrite`), `mcp/server.js` (tool #19 appended in
 advertised order — the roster today is exactly 18: four base + fourteen writes — plus
 open changes and resource projections), `receipt.js` (ledger lineage on the one cold
-read), `cli.js` (delegation + refusals + HELP TEXT — the `ledger update` line still
+read), doctor (`coldStart`/diagnosis surface: the TWO NEW OPERATOR ROWS — a
+generation exceeding its bound, repaired only by restoring a valid backup or
+archive/reset, NEVER by truncating the gen; and a revision at `MAX_SAFE_INTEGER`,
+repaired by archive/reset before further mutation — each with a fixture),
+`cli.js` (delegation + refusals + HELP TEXT — the `ledger update` line still
 advertises `features|tests|defects` and must drop `defects`). `wal.js` is untouched
 BY 4C and the 4c diff proves it — its safe-integer revision parsing landed in the
 pre-4c hardening (PR #39), so "untouched" is a claim about this step, not about
@@ -715,7 +754,8 @@ work cannot undercount: the five ledger-specific (`StaleLedgerRev`,
 the last two declared non-retryable) plus the four inherited
 (`OperationIdConflict`, `DeterministicIdConflict`, `WriteFailed`,
 `MirrorUnrecoverable` via central recovery); revision ceiling semantics; the
-`saveLedger` privatization.
+`saveLedger` privatization; the two doctor operator rows (gen over bound, revision
+at ceiling) with their stated repairs.
 
 Notably absent from 4c, restated: no intent-schema change, no new WAL tooling, no
 version bump (the release that ships 4c bumps all five fields then, not now).
@@ -884,4 +924,8 @@ Rev 8 patches (spec-side) traced by: claude-fable-5
 Five-voice round 6 on rev 8: openai-codex (gpt-5.6-sol), 2026-08-01 — DO-NOT-RATIFY,
 no critical, no high; claims 1/2/3/5 HOLD; seven medium/low findings, all accepted.
 Rev 9 patches (all seven) traced by: claude-fable-5
-Awaiting: five-voice round 7 on rev 9 → then 4c.1.
+Five-voice round 7 on rev 9: openai-codex (gpt-5.6-sol), 2026-08-01 — DO-NOT-RATIFY;
+claims 1/4/5/6 HOLD; one high (4c.1 staging incoherence) + three medium, all
+accepted; the near-cap stamp counterexample was reproduced computationally.
+Rev 10 patches (all four) traced by: claude-fable-5
+Awaiting: five-voice round 8 on rev 10 → then 4c.1.
