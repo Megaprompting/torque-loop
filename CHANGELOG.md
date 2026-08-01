@@ -23,15 +23,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     UTF-16 code units (`.length`), undercounting astral characters 2:1 — a legal
     emoji-heavy result committed a receipt past the 4 KiB byte contract. Both sites
     now measure `Buffer.byteLength(..., 'utf8')`.
-  - **Revisions are safe integers end to end (H3/H5):** `Number.isInteger` admits
-    2^53, where `+ 1` silently stops advancing and every stale CAS keeps matching.
-    The write boundary now refuses an unsafe `expectedStateRev` (`-32602`), and
-    `commitState` refuses to publish atop a revision that cannot advance safely —
-    only a hand-written record can be there, and refusal beats a revision that lies.
-  - **Deep nesting is malformed input, not an internal error (H4):** a small, valid,
-    deeply nested `item` blew the recursive canonicalizer's stack and surfaced as an
-    internal failure. The write boundary now enforces an iterative depth cap (64) and
-    refuses `-32602` before anything downstream recurses.
+  - **Revisions are safe integers through EVERY publisher (H3/H3b/H3c/H3d/H5):**
+    `Number.isInteger` admits 2^53, where `+ 1` silently stops advancing and every
+    stale CAS keeps matching. One shared checked successor (`nextRev`) now guards
+    `commitState`, the mirrored WAL-backed publisher, and the `init --force` wipe —
+    the first cut guarded only `commitState`, which the round-4 review correctly
+    called a claim rather than an invariant. WAL intent parsing requires safe
+    integers on both revision fields (at 2^53 a target numerically "equals" its
+    base's successor), the write boundary refuses an unsafe `expectedStateRev`
+    (`-32602`), and the advertised schema carries the matching `maximum`.
+  - **One receipt-cap predicate, byte-measured (H2):** the two publishers now share
+    a single `Buffer.byteLength` predicate, so a regression cannot split them.
+  - **Deep nesting is malformed input (H4/H4b/H4c):** a small, valid, deeply nested
+    `item` blew the recursive canonicalizer's stack and surfaced as a generic
+    retryable `WriteFailed` — untruthful, since an identical retry fails
+    identically. The write boundary now enforces an iterative depth cap (64) and
+    refuses `-32602` before anything downstream recurses; the boundary is pinned
+    exactly (deepest-legal passes, one-more refuses, seen red against a mutated
+    cap).
 
 - **4b.3 review round (independent Codex verification, verdict "NO" on six contract
   gaps — all six accepted, fixed red-first; three claim-wording findings ruled

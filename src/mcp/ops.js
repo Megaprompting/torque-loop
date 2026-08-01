@@ -115,6 +115,18 @@ function successResult(committed, stateRev, verbFields) {
   return Object.assign({ ok: true, committed, stateRev, replayed: false }, verbFields || {});
 }
 
+// ONE cap predicate for both publishers — the round-4 review caught that two
+// inline copies let a regression split them. The cap is UTF-8 BYTES on disk,
+// not UTF-16 code units in memory: .length undercounts astral characters 2:1
+// and commits receipts the strict reader's byte cap must reject.
+function assertReceiptCap(entry) {
+  if (Buffer.byteLength(JSON.stringify(entry), 'utf8') > RECEIPT_ENTRY_CAP) {
+    const e = new Error(`operation receipt exceeds ${RECEIPT_ENTRY_CAP} bytes`);
+    e.code = 'ERATCHETRECEIPTCAP';
+    throw e;
+  }
+}
+
 function revOf(s) {
   return s && Number.isInteger(s.rev) ? s.rev : 0;
 }
@@ -217,14 +229,7 @@ function executeWrite(opts) {
         at: schemas.nowIso(),
         result,
       };
-      // The cap is UTF-8 BYTES on disk, not UTF-16 code units in memory —
-      // .length undercounts astral characters 2:1 and committed receipts the
-      // strict reader's byte cap must reject.
-      if (Buffer.byteLength(JSON.stringify(entry), 'utf8') > RECEIPT_ENTRY_CAP) {
-        const e = new Error(`operation receipt exceeds ${RECEIPT_ENTRY_CAP} bytes`);
-        e.code = 'ERATCHETRECEIPTCAP';
-        throw e;
-      }
+      assertReceiptCap(entry);
       // The ring is created on the first committed write so a refusal against a
       // pre-step-4 record never mutates it just by being looked at.
       if (!Array.isArray(s.operations)) s.operations = [];
@@ -298,14 +303,7 @@ function executeMirroredWrite(opts) {
         at: schemas.nowIso(),
         result,
       };
-      // The cap is UTF-8 BYTES on disk, not UTF-16 code units in memory —
-      // .length undercounts astral characters 2:1 and committed receipts the
-      // strict reader's byte cap must reject.
-      if (Buffer.byteLength(JSON.stringify(entry), 'utf8') > RECEIPT_ENTRY_CAP) {
-        const e = new Error(`operation receipt exceeds ${RECEIPT_ENTRY_CAP} bytes`);
-        e.code = 'ERATCHETRECEIPTCAP';
-        throw e;
-      }
+      assertReceiptCap(entry);
       if (!Array.isArray(s.operations)) s.operations = [];
       s.operations.push(entry);
       while (s.operations.length > OPERATIONS_CAP) s.operations.shift();

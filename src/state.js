@@ -1059,7 +1059,9 @@ function initProjectLocked(cwd, { force = false, resetBy = '', resetReason = '' 
     // the store exists. A genuinely new store still opens at rev 0.
     if (force) {
       const previous = readJson(sPath);
-      if (previous) fresh.rev = revOf(previous) + 1;
+      // Checked successor here too: a wipe must not be the door that publishes
+      // the un-advanceable revision every later writer chokes on.
+      if (previous) fresh.rev = nextRev(revOf(previous));
     }
     // A wipe destroys the only record of why the wipe happened. The tombstone is
     // the one line that survives it, so the next cold session reads "danny reset
@@ -1160,18 +1162,28 @@ function loadState(cwd) {
   });
 }
 
-function commitState(cwd, state, baseRev) {
-  // 2^53 passes Number.isInteger but `+ 1` no longer moves it — a commit atop
-  // it would publish a mutation whose revision did not advance, and every
-  // stale CAS would keep matching. Only a hand-written record can be here
-  // (9e15 real commits away), so refusing is the honest answer, not repair.
-  if (!Number.isSafeInteger(baseRev + 1)) {
+// The ONE checked successor for every publisher that advances the revision
+// line. 2^53 passes Number.isInteger but `+ 1` no longer moves it — a commit
+// atop it would publish a mutation whose revision did not advance, and every
+// stale CAS would keep matching. Only a hand-written record can be there
+// (9e15 real commits away), so refusing is the honest answer, not repair.
+// Shared because the round-4 review caught the alternative: a guard living in
+// one publisher while the mirrored path and the forced wipe computed `+ 1`
+// bare was a claim, not an invariant.
+function nextRev(baseRev) {
+  const next = baseRev + 1;
+  if (!Number.isSafeInteger(next)) {
     throw new Error(`state revision ${baseRev} cannot advance safely; repair the record before writing`);
   }
+  return next;
+}
+
+function commitState(cwd, state, baseRev) {
+  const next = nextRev(baseRev);
   // Last instant before the canonical publish: do we still own the lock?
-  assertStillOwner(cwd, `state rev ${baseRev + 1}`);
+  assertStillOwner(cwd, `state rev ${next}`);
   state.updatedAt = schemas.nowIso();
-  state.rev = baseRev + 1;
+  state.rev = next;
   writeJson(statePath(cwd), state);
   // The caller may save the same object again; its base has to move with it or
   // the second save would rebase against a revision that is two writes old.
@@ -1552,11 +1564,14 @@ function runMirrored(cwd, o, action, prepare) {
   if (prep.kind === 'noop') return { committed: false, rev: baseRev, state: s, result: prep.result };
 
   // MATERIALIZE once: every stamp is final before the intent publishes, and
-  // the hashes cover the exact bytes both publishes will write.
-  assertStillOwner(cwd, `state rev ${baseRev + 1}`);
+  // the hashes cover the exact bytes both publishes will write. The successor
+  // is checked BEFORE anything publishes — an unadvanceable revision must
+  // refuse here, not mint an intent whose target equals its base.
+  const targetRev = nextRev(baseRev);
+  assertStillOwner(cwd, `state rev ${targetRev}`);
   const now = schemas.nowIso();
   s.updatedAt = now;
-  s.rev = baseRev + 1;
+  s.rev = targetRev;
   const stateAfterBytes = wal.serializeRecord(s);
   const ledgerAfter = wal.applyLedgerOps(ledgerRead.parsed, prep.ledgerOps, now);
   const ledgerAfterBytes = wal.serializeRecord(ledgerAfter);
@@ -1568,7 +1583,7 @@ function runMirrored(cwd, o, action, prepare) {
     argsHash: o.argsHash,
     stateGen: String(s.gen || '') || '(none)',
     baseStateRev: baseRev,
-    targetStateRev: baseRev + 1,
+    targetStateRev: targetRev,
     stateBeforeHash: wal.hashBytes(stateRead.bytes),
     stateAfterHash: wal.hashBytes(stateAfterBytes),
     ledgerBeforeHash: wal.hashBytes(ledgerRead.bytes),

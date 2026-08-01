@@ -572,7 +572,7 @@ node test/mcp-toctou.test.js          # or run one suite directly
 npm run ratchet -- status             # drive the CLI through npm
 ```
 
-`npm test` runs eleven zero-dependency suites in one chain:
+`npm test` runs fifteen zero-dependency suites in one chain:
 
 | Suite | Guards |
 | --- | --- |
@@ -580,6 +580,7 @@ npm run ratchet -- status             # drive the CLI through npm
 | `plugin-shape` | the drift police — version alignment across all five fields, README ↔ skill-folder sync, PROMPTS.md wiring, template presence, MCP manifest validity |
 | `mcp-rpc` · `mcp-workspace` · `mcp-handles` | protocol era pinning, path containment, capability handles |
 | `mcp-repository` · `mcp-server` · `mcp-toctou` · `mcp-entry` | Git identity, composition, filesystem-replacement attacks, and the spawned-binary interop run |
+| `mcp-write` · `mcp-hardening` · `mcp-wal` · `mcp-prompts` | the write envelope and replay proofs, the safe-core hardening falsifiers, the write-ahead intent crash matrix, and the PROMPTS.md-derived prompt surface |
 
 `npm run preflight` runs twelve checks before a PR — green world, version alignment,
 dependency gate, private-path leak scan, trace tags — and deliberately leaves the
