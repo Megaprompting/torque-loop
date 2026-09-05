@@ -72,12 +72,13 @@ the moment you hit them; never close a quadrant off-screen.
    ```
 
 5. **Hand over the map.** One page, all four quadrants — shape it like
-   `templates/unknowns-map.md` and write it to `.ratchet/unknowns-map.md`. OPEN items live
+   `templates/unknowns-map.md` and write it to `.ratchet/unknowns-map-<lane-slug>.md`. OPEN items live
    **on the map**, not buried in chat — and every OPEN item names its route out (ask-user,
    probe, park with owner+reason, assumption+killTest, or defect). An OPEN item with no
    route is a stall with a receipt, not mapped fog. Add a tweakable build plan ordered by
    *what might change* (judgment calls first, routine work compressed at the bottom) and a
-   copy-paste implementation prompt. Then stop — implementation is a separate engagement.
+   copy-paste implementation prompt. One map per lane: parallel lanes in one repo overwrote a shared `unknowns-map.md`, so the
+   bare name is retired. Then stop — implementation is a separate engagement.
    The map stays live through the build: `/ratchet:build` records deviations back onto it.
 
 ## Probes — when the map must touch (build-for-learn)
@@ -135,7 +136,7 @@ UNKNOWN KNOWNS:
 UNKNOWN UNKNOWNS:
 - landmine: <name> | evidence: <file:line> | why it bites: <mechanism> | changes: <impact> | status: decided | OPEN | sharp-edge
 
-HANDOVER MAP: path <.ratchet/unknowns-map.md> · OPEN items <n> · build plan <yes/no>
+HANDOVER MAP: path <.ratchet/unknowns-map-<lane-slug>.md> · OPEN items <n> · build plan <yes/no>
 IMPLEMENTATION PROMPT: <copy-paste line that launches the build with the map's context>
 ```
 
@@ -144,7 +145,7 @@ IMPLEMENTATION PROMPT: <copy-paste line that launches the build with the map's c
 The map is durable state, not scrollback. Record it so the next context resumes cold:
 
 ```
-ratchet artifact add '{"kind":"unknown-map","title":"unknowns map: <target>","status":"handoff","path":".ratchet/unknowns-map.md","holes":["<each OPEN item>"]}'
+ratchet artifact add '{"kind":"unknown-map","title":"unknowns map: <target>","status":"handoff","path":".ratchet/unknowns-map-<lane-slug>.md","holes":["<each OPEN item>"]}'
 ratchet state append decisions  '{"choice":"<closed known-unknown>","rejected":"<the option not taken>","tripwire":"<what would reopen it>"}'
 ratchet state append assumptions '{"text":"<tacit/working assumption>","killTest":"<cheapest falsification>","status":"untested"}'
 ratchet state append openLoops   '{"text":"OPEN: <question> — unblocks: <what>","status":"open"}'

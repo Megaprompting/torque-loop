@@ -36,6 +36,17 @@ ratchet status
 5. **Set the reversal tripwire.** The specific observable signal that means: this was
    wrong, reverse now. Without a tripwire, a bad decision runs forever.
 
+## Absorbed moves (2026-09-05: `/ratchet:auction` and `/ratchet:burn` fold in here)
+
+- **When the menu is a set of blockers, rank before choosing.** Score each on leverage,
+  certainty, speed-to-unblock and risk-of-ignoring with `ratchet score friction '[...]'`
+  and let the highest product name the option; defend it against the most tempting rival.
+- **Collect option debt.** Every option neither chosen nor rejected gets a KILL / PARK / KEEP
+  verdict with the fear keeping it alive and what gets simpler if it dies. Serialize kills
+  and parks as loops so they stop costing attention:
+  `ratchet state append openLoops '{"text":"KILLED: <option>","status":"closed"}'` /
+  `ratchet state append openLoops '{"text":"PARKED until <trigger>: <option>","status":"open"}'`.
+
 ## Output contract
 
 ```

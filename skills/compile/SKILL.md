@@ -34,6 +34,10 @@ interesting-but-nonoperative commentary. If it won't change a future move, it do
 8. **Next prompt/command** — the exact `/ratchet:...` to run next.
 9. **Retrieval tags** — comma-separated handles for future search.
 10. **One-sentence memory** — the single line worth saving. Make it load-bearing.
+11. **Handoff test** (absorbs `/ratchet:handoff`) — every DONE item must be runnable by the
+    receiver and return pass or fail with no judgment call; every file reference is an exact
+    path, never "the config file"; delete anything the receiver does not need in order to
+    act. A handoff is not a diary.
 
 ## Serialize (write it all through the CLI)
 
