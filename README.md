@@ -516,7 +516,7 @@ node bin/ratchet --help
 Verify:
 
 ```bash
-ratchet --version      # -> ratchet 1.0.0
+ratchet --version      # -> ratchet 1.1.0
 ratchet init
 ratchet status
 ```
