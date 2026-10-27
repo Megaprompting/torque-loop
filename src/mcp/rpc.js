@@ -4,12 +4,14 @@
 // resources, no state — those arrive in later steps through the `methods` table.
 //
 // Era pinning is the one invariant this module exists to enforce: a connection
-// speaks exactly one protocol era. `server/discover` (protocol 2026-07-28,
-// stateless, _meta-carried version) pins modern; `initialize` (a named
-// request/response revision) pins legacy; after the pin, the other era's
-// surface is a named refusal — never a silent downgrade, never a mixed
-// connection. Mixing is how a stateless request inherits handshake state it
-// never negotiated.
+// speaks exactly one protocol era. The first era-bearing message pins it: a
+// request carrying the 2026-07-28 _meta protocol version pins modern;
+// `initialize` (a named request/response revision) pins legacy; after the pin,
+// the other era's surface is a named refusal — never a silent downgrade, never
+// a mixed connection. Mixing is how a stateless request inherits handshake
+// state it never negotiated. `server/discover` pins nothing: it negotiates no
+// state, and clients probe with it before choosing an era on the same
+// connection (Claude Code does exactly that, then sends a legacy initialize).
 
 const JSONRPC = '2.0';
 const META = 'io.modelcontextprotocol/';
@@ -86,7 +88,7 @@ function createKernel({ serverInfo, capabilities, methods }) {
         return rpcError(
           ERR_ERA_PINNED,
           `this connection has no era yet and ${method} needs one — ` +
-            `knock with server/discover (modern) or initialize (legacy) first`
+            `send initialize (legacy) or a request carrying _meta ${META}protocolVersion (modern) first`
         );
       }
       return rpcError(
@@ -96,7 +98,8 @@ function createKernel({ serverInfo, capabilities, methods }) {
       );
     }
 
-    // Built-ins pin the era. Everything else routes through the method table.
+    // initialize pins legacy; discover answers and pins nothing. Everything
+    // else routes through the method table.
     function dispatch(msg) {
       const method = msg.method;
 
@@ -136,9 +139,10 @@ function createKernel({ serverInfo, capabilities, methods }) {
       if (method === 'server/discover') {
         // Version-exempt by design (attack-round-1 ruling): discover is the
         // door a client knocks to learn what versions exist — demanding proof
-        // of a version before answering that question is circular.
+        // of a version before answering that question is circular. Answering
+        // it chooses no era either: the client reads the list and THEN picks,
+        // on this same connection.
         if (era === 'legacy') throw eraRefusal(method);
-        era = 'modern';
         return {
           protocolVersions: [MODERN_VERSION, ...LEGACY_VERSIONS],
           capabilities: caps,
@@ -204,8 +208,9 @@ function createKernel({ serverInfo, capabilities, methods }) {
 
       const isNotification = id === undefined;
       if (isNotification && (msg.method === 'initialize' || msg.method === 'server/discover')) {
-        // A handshake needs an answer to exist; a notification-shaped one can
-        // only pin an era silently, which poisons the connection. Dropped.
+        // A handshake needs an answer to exist; a notification-shaped initialize
+        // can only pin an era silently, which poisons the connection, and a
+        // discover with no id asks a question nobody hears answered. Dropped.
         dropped++;
         return null;
       }
@@ -237,7 +242,9 @@ function createKernel({ serverInfo, capabilities, methods }) {
           if (typeof result !== 'object' || result === null || Array.isArray(result)) {
             throw rpcError(ERR_INTERNAL, `handler for ${msg.method} returned a result that does not serialize to an object`);
           }
-          if (era === 'modern') {
+          // discover is a 2026-07-28 method, so its answer is modern-shaped
+          // even on the unpinned connection it leaves behind.
+          if (era === 'modern' || msg.method === 'server/discover') {
             // Modern results always name themselves: resultType is required by
             // the protocol, and serverInfo travels in _meta because there is no
             // handshake left to have said it once. Decoration works on a spread
