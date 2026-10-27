@@ -59,8 +59,37 @@ function appendItem(s, collection, item, mintId) {
   }
   const record = { id: item.id || mintId(schemas.STATE_COLLECTIONS[collection], 'record'), at: schemas.nowIso(), ...item };
   s[collection].push(record);
+  if (collection === 'touchedFiles') boundTouched(s);
   s.dirty = true;
   return { record };
+}
+
+// touchedFiles is a trail, not a log. The receipt reads it as the set of paths
+// changed since the last compile, so only each path's newest touch carries
+// information. Unbounded, the post-edit hook grew one store to 22,761 rows
+// (4.4 MB) and rewrote all of it on every edit. Keep one row per path, newest
+// last, at most TOUCHED_FILES_MAX of them; an oversized trail collapses on the
+// next touch.
+const TOUCHED_FILES_MAX = 500;
+
+function boundTouched(s) {
+  const seen = new Set();
+  const kept = [];
+  for (let i = s.touchedFiles.length - 1; i >= 0 && kept.length < TOUCHED_FILES_MAX; i--) {
+    const f = s.touchedFiles[i];
+    const key = f && f.path;
+    if (key && seen.has(key)) continue; // an older touch of a path already kept
+    if (key) seen.add(key);
+    kept.push(f);
+  }
+  s.touchedFiles = kept.reverse();
+}
+
+// The hook's and `ratchet touch`'s one write.
+function recordTouch(s, file) {
+  s.touchedFiles.push({ path: file, at: schemas.nowIso() });
+  boundTouched(s);
+  s.dirty = true;
 }
 
 // `state close`: transition one openLoop or assumption to its terminal status.
@@ -170,6 +199,8 @@ module.exports = {
   setScalar,
   BIRTH_STATUS,
   appendItem,
+  TOUCHED_FILES_MAX,
+  recordTouch,
   closeRecord,
   compileDone,
   fogAlreadyOnRecord,

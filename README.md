@@ -523,14 +523,18 @@ ratchet status
 
 ### State location
 
-State survives plugin updates. It is written to, in order of preference:
+State survives plugin updates. Every caller (the CLI, the hooks and the MCP server) writes to
+one base:
 
-1. `$CLAUDE_PLUGIN_DATA` — set by Claude Code for enabled plugins.
-2. `$RATCHET_DATA_DIR` — override it yourself.
-3. `~/.ratchet` — fallback.
+1. `$RATCHET_DATA_DIR` — override it yourself.
+2. `~/.ratchet` — default.
+
+`$CLAUDE_PLUGIN_DATA` is not used: Claude Code sets it for hooks and the MCP server but not
+for the model's own shell, so honoring it would split one project into two stores.
 
 State is scoped per project (by working-directory path), so multiple repos never collide in
-one shared data directory.
+one shared data directory. Hooks only update a store that already exists; they never create
+one.
 
 ---
 
