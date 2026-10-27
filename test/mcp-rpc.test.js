@@ -86,15 +86,16 @@ ok('a batch array is refused by name — MCP removed batching', () => {
 
 // --- modern era: server/discover -------------------------------------------
 
-ok('server/discover advertises versions, capabilities, identity — and pins modern', () => {
+ok('server/discover advertises versions, capabilities, identity — and pins nothing', () => {
   const conn = kernel().createConnection();
   const res = conn.handleMessage({ jsonrpc: '2.0', id: 1, method: 'server/discover' });
   assert.strictEqual(res.error, undefined, res.error && res.error.message);
   assert.deepStrictEqual(res.result.protocolVersions, [MODERN, LEGACY, CODEX_LEGACY]);
   assert.deepStrictEqual(res.result.serverInfo, { name: 'torque-mcp-test', version: '0.0.0' });
   assert.ok(res.result.capabilities, 'capabilities must be advertised');
-  assert.strictEqual(res.result.resultType, 'complete');
-  assert.strictEqual(conn.era(), 'modern');
+  assert.strictEqual(res.result.resultType, 'complete', 'discover is a modern method and answers modern-shaped');
+  assert.deepStrictEqual(res.result._meta[META + 'serverInfo'], { name: 'torque-mcp-test', version: '0.0.0' });
+  assert.strictEqual(conn.era(), null, 'asking which versions exist chooses none of them');
 });
 
 ok('a modern result carries resultType and serverInfo in _meta on every response', () => {
@@ -217,13 +218,51 @@ ok('notifications/initialized is accepted silently on a legacy connection', () =
 
 // --- era pinning: never mixed -----------------------------------------------
 
-ok('initialize after server/discover is refused — eras never mix', () => {
+ok('initialize after server/discover opens a legacy session — the probe chose no era', () => {
   const conn = kernel().createConnection();
   conn.handleMessage({ jsonrpc: '2.0', id: 1, method: 'server/discover' });
+  const res = conn.handleMessage({ jsonrpc: '2.0', id: 2, method: 'initialize', params: legacyInit() });
+  assert.strictEqual(res.error, undefined, res.error && res.error.message);
+  assert.strictEqual(res.result.protocolVersion, LEGACY);
+  assert.strictEqual(conn.era(), 'legacy');
+});
+
+ok('initialize after a modern request is refused — eras never mix', () => {
+  const conn = kernel({
+    'echo/params': { eras: ['modern'], handler: () => ({}) },
+  }).createConnection();
+  conn.handleMessage({ jsonrpc: '2.0', id: 1, method: 'echo/params', params: { _meta: modernMeta() } });
   const res = conn.handleMessage({ jsonrpc: '2.0', id: 2, method: 'initialize', params: legacyInit() });
   assert.strictEqual(res.error.code, rpc.ERR_ERA_PINNED);
   assert.match(res.error.message, /modern/);
   assert.match(res.error.message, /reconnect/i, 'the refusal must hand the client its remedy');
+});
+
+// Recorded 2026-10-27 from Claude Code 2.1.308 and 2.1.310 through a pass-through
+// stdio shim: the client probes with server/discover (carrying the modern _meta),
+// reads the version list, and opens a legacy session on the SAME connection.
+// Pinning modern on the probe refused every Claude Code connect from 2026-10-04.
+ok('the recorded Claude Code handshake — discover probe, then initialize 2025-11-25 — succeeds', () => {
+  const input = new PassThrough();
+  const output = new PassThrough();
+  const lines = [];
+  output.on('data', (chunk) => lines.push(...String(chunk).split('\n').filter((l) => l.length)));
+  const conn = kernel().createConnection();
+  stdio.attach({ createConnection: () => conn }, { input, output });
+  const clientInfo = '{"name":"claude-code","title":"Claude Code","version":"2.1.310","description":"Anthropic\'s agentic coding tool","websiteUrl":"https://claude.com/claude-code"}';
+  const clientCaps = '{"roots":{"listChanged":true},"elicitation":{"form":{},"url":{}},"extensions":{"io.modelcontextprotocol/tasks":{}}}';
+  input.write('{"jsonrpc":"2.0","id":"server-discover-probe-1","method":"server/discover","params":{"_meta":{' +
+    `"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":${clientInfo},` +
+    `"io.modelcontextprotocol/clientCapabilities":${clientCaps}}}}\n`);
+  input.write(`{"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":${clientCaps},` +
+    `"clientInfo":${clientInfo}},"jsonrpc":"2.0","id":0}\n`);
+  const [discover, init] = lines.map((l) => JSON.parse(l));
+  assert.strictEqual(discover.id, 'server-discover-probe-1');
+  assert.deepStrictEqual(discover.result.protocolVersions, [MODERN, LEGACY, CODEX_LEGACY]);
+  assert.strictEqual(init.id, 0);
+  assert.strictEqual(init.error, undefined, init.error && init.error.message);
+  assert.strictEqual(init.result.protocolVersion, LEGACY);
+  assert.strictEqual(conn.era(), 'legacy');
 });
 
 ok('server/discover after initialize is refused — eras never mix', () => {
@@ -510,8 +549,8 @@ ok('C14 notifications/initialized moves no era, anywhere', () => {
   legacy.handleMessage({ jsonrpc: '2.0', id: 1, method: 'initialize', params: legacyInit() });
   assert.strictEqual(legacy.handleMessage({ jsonrpc: '2.0', method: 'notifications/initialized' }), null);
   assert.strictEqual(legacy.era(), 'legacy');
-  const modern = kernel().createConnection();
-  modern.handleMessage({ jsonrpc: '2.0', id: 1, method: 'server/discover' });
+  const modern = kernel({ 'echo/params': { eras: ['modern'], handler: () => ({}) } }).createConnection();
+  modern.handleMessage({ jsonrpc: '2.0', id: 1, method: 'echo/params', params: { _meta: modernMeta() } });
   assert.strictEqual(modern.handleMessage({ jsonrpc: '2.0', method: 'notifications/initialized' }), null);
   assert.strictEqual(modern.era(), 'modern', 'a dropped legacy notification must not unpin or flip modern');
   const unpinned = kernel().createConnection();
@@ -605,8 +644,8 @@ ok('D10 dropped notifications are countable — acceptance and rejection are dif
   legacy.handleMessage({ jsonrpc: '2.0', id: 1, method: 'initialize', params: legacyInit() });
   legacy.handleMessage({ jsonrpc: '2.0', method: 'notifications/initialized' });
   assert.strictEqual(legacy.dropped(), 0, 'a legitimate legacy notification is accepted, not dropped');
-  const modern = kernel().createConnection();
-  modern.handleMessage({ jsonrpc: '2.0', id: 1, method: 'server/discover' });
+  const modern = kernel({ 'echo/params': { eras: ['modern'], handler: () => ({}) } }).createConnection();
+  modern.handleMessage({ jsonrpc: '2.0', id: 1, method: 'echo/params', params: { _meta: modernMeta() } });
   modern.handleMessage({ jsonrpc: '2.0', method: 'notifications/initialized' });
   assert.strictEqual(modern.dropped(), 1, 'the same notification on modern is a counted drop');
 });

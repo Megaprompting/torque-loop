@@ -128,6 +128,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Claude Code could not connect to the Torque MCP server (refused since 2026-10-04).**
+  Claude Code (2.1.308 desktop-bundled and 2.1.310 on PATH, recorded 2026-10-27 through a
+  pass-through stdio shim) probes with `server/discover` (id `server-discover-probe-1`),
+  reads the version list, then sends `initialize` with `2025-11-25` on the same
+  connection. The kernel pinned the connection modern on the probe and refused that
+  `initialize` with -32010 ("eras never mix"), so every connect failed. `server/discover`
+  now answers (still modern-shaped, still version-exempt) without pinning an era; the
+  first era-bearing message pins it — `initialize` pins legacy, a request carrying the
+  `_meta` protocol version pins modern. Everything else about "eras never mix" holds:
+  discover after `initialize`, a modern-marked request on a legacy connection, and
+  `initialize` after a real modern request all stay refused, and ambiguous or incomplete
+  handshakes still pin nothing. The unpinned-connection refusal no longer names discover
+  as a way to pin. Falsifier: the recorded two-line handshake, replayed over stdio,
+  seen red (-32010) against the unpatched kernel.
 - **Safe-core hardening (three live defects found by the 4c design review rounds 2–3,
   2026-08-01; all CLI-enforced, each with a falsifier (H1–H5) seen red against the
   unpatched tree):**
