@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-10-27 — Ledger Gate
+
 ### Added
 
 - **MCP step 4c.1 — `ledger.update`, the second single-file safe core (all CLI-enforced;
@@ -1802,7 +1804,8 @@ Initial public release.
 - Single-plugin marketplace manifest so the repo installs directly as a Claude Code plugin.
 - Zero-dependency smoke test suites for the state engine and the evolution helpers.
 
-[Unreleased]: https://github.com/Megaprompting/torque-loop/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/Megaprompting/torque-loop/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/Megaprompting/torque-loop/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/Megaprompting/torque-loop/compare/v0.9.0...v1.0.0
 [0.9.0]: https://github.com/Megaprompting/torque-loop/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/Megaprompting/torque-loop/compare/v0.7.0...v0.8.0
