@@ -128,6 +128,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **One store per project, and a bounded touch trail (found 2026-10-27 reading a live
+  install; all CLI-enforced, each test seen red against the unpatched tree):**
+  - **One base for every caller.** `baseDir()` honored `$CLAUDE_PLUGIN_DATA`, which Claude
+    Code sets for hooks and the MCP server but never for the model's own shell. Hook
+    writes therefore landed in a shadow store the CLI never read, and the `stop-check`
+    nag read that shadow store too, so `/ratchet:compile` could never clear it. The base
+    is now `$RATCHET_DATA_DIR`, else `~/.ratchet`, for all callers. Stores left under
+    `$CLAUDE_PLUGIN_DATA` are no longer read and are never moved or deleted. On the
+    machine where this was found, all 992 of them held only hook touch rows.
+  - **Hooks never create a store.** `session-start` initialized a store, and `stop-check`
+    loaded one, in every directory a session opened in. Hooks now act only on a store
+    that already exists, so a project gets a store only where someone runs ratchet.
+  - **`touchedFiles` is bounded.** Every edit appended a row and rewrote the whole list,
+    and nothing trimmed it: one store reached 22,761 rows (4.4 MB). Each path now keeps
+    only its newest touch, newest last, capped at `TOUCHED_FILES_MAX` (500). The cap
+    applies to the hook, `ratchet touch` and `state append touchedFiles`, and an
+    oversized trail collapses on the next touch. The receipt's "touched since compile"
+    set is unchanged, because it only ever read each path's newest touch.
+
 - **Safe-core hardening (three live defects found by the 4c design review rounds 2–3,
   2026-08-01; all CLI-enforced, each with a falsifier (H1–H5) seen red against the
   unpatched tree):**

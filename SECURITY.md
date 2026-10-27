@@ -29,7 +29,7 @@ Torque Loop is a Claude Code plugin and a **zero-dependency**, local Node.js CLI
 network surface and no runtime dependencies. The most relevant areas for security review are:
 
 - **Local file & state handling** — the CLI reads and writes state under the resolved data
-  directory (`$CLAUDE_PLUGIN_DATA`, `$RATCHET_DATA_DIR`, or `~/.ratchet`).
+  directory (`$RATCHET_DATA_DIR`, or `~/.ratchet`).
 - **Hooks** — the bundled hooks (`hooks/hooks.json`) run on session events. By design they
   never run tests or edits on their own; a hook that executes something unexpected is a bug
   worth reporting.

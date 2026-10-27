@@ -242,10 +242,7 @@ function run(argv) {
       const file = sub;
       if (!file) throw new Error('usage: ratchet touch <file>');
       assertMayWrite('touch');
-      mutate(cwd, 'touch', (s) => {
-        s.touchedFiles.push({ path: file, at: schemas.nowIso() });
-        s.dirty = true;
-      });
+      mutate(cwd, 'touch', (s) => verbs.recordTouch(s, file));
       return out(`touched ${file}`);
     }
 
@@ -627,9 +624,13 @@ function cmdExport(cwd, sub) {
 
 function cmdHook(cwd, sub) {
   try {
+    // Hooks fire in every project the plugin is enabled in, so they act only on
+    // a store that already exists. Creating one here left a store behind in
+    // every directory a session ever opened in — 992 empty ones on one machine.
+    const hasStore = fs.existsSync(state.statePath(cwd));
     switch (sub) {
       case 'session-start': {
-        state.initProject(cwd);
+        if (hasStore) state.initProject(cwd);
         return; // silent
       }
       case 'post-edit': {
@@ -641,19 +642,17 @@ function cmdHook(cwd, sub) {
         } catch (_e) {
           /* ignore malformed */
         }
-        if (file) {
+        if (file && hasStore) {
           // A hook fires while the session's own commands are running, so this
           // is the write most likely to race one. It goes through the boundary
           // like every other mutation — and, like every other mutation, it is
           // refused for a propose-only agent (which leaves no footprint at all).
-          mutate(cwd, 'hook post-edit', (s) => {
-            s.touchedFiles.push({ path: file, at: schemas.nowIso() });
-            s.dirty = true;
-          });
+          mutate(cwd, 'hook post-edit', (s) => verbs.recordTouch(s, file));
         }
         return; // silent, non-blocking
       }
       case 'stop-check': {
+        if (!hasStore) return; // ratchet never ran here: nothing to compile, nothing to nag
         const s = state.loadState(cwd);
         const stale = s.dirty && (!s.lastCompileAt || s.lastCompileAt < s.updatedAt);
         if (stale) {
