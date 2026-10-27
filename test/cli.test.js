@@ -1030,7 +1030,13 @@ ok('a propose-only hook says it is propose-only, not that the state is unreadabl
   const proj = path.join(tmp, 'hook-propose-only');
   fs.rmSync(proj, { recursive: true, force: true });
   fs.mkdirSync(proj, { recursive: true });
-  const r = spawnSync(process.execPath, [path.resolve(__dirname, '..', 'bin', 'ratchet'), 'hook', 'post-edit'], {
+  // The store must exist: a hook in a project with no store records nothing, so
+  // there would be no write for the guard to refuse.
+  const bin = path.resolve(__dirname, '..', 'bin', 'ratchet');
+  const init = { ...process.env, RATCHET_DATA_DIR: path.join(proj, '.data') };
+  delete init.RATCHET_AGENT;
+  assert.strictEqual(spawnSync(process.execPath, [bin, 'init'], { cwd: proj, env: init, encoding: 'utf8' }).status, 0);
+  const r = spawnSync(process.execPath, [bin, 'hook', 'post-edit'], {
     cwd: proj,
     env: { ...process.env, RATCHET_DATA_DIR: path.join(proj, '.data'), RATCHET_AGENT: 'ratchet-builder' },
     input: JSON.stringify({ tool_input: { file_path: 'README.md' } }),
@@ -1040,6 +1046,98 @@ ok('a propose-only hook says it is propose-only, not that the state is unreadabl
   assert.strictEqual(r.status, 0, 'a hook never breaks the session, whatever it hits');
   assert.ok(/propose-only/.test(text), `the refusal must name itself; got: ${text.trim() || '(silence)'}`);
   assert.ok(!/closure state unreadable/.test(text), `and must not claim the record is unreadable; got: ${text.trim()}`);
+});
+
+ok('hooks and the CLI resolve one store, whether or not CLAUDE_PLUGIN_DATA is set', () => {
+  // Claude Code sets CLAUDE_PLUGIN_DATA for hooks and the MCP server, never for
+  // the model's own shell. Honoring it put every hook write in a shadow store
+  // the CLI never read: one project grew 22,761 touch rows there while its real
+  // record sat untouched under ~/.ratchet.
+  const { spawnSync } = require('child_process');
+  const bin = path.resolve(__dirname, '..', 'bin', 'ratchet');
+  const proj = path.join(tmp, 'one-base');
+  fs.rmSync(proj, { recursive: true, force: true });
+  fs.mkdirSync(proj, { recursive: true });
+  const home = path.join(proj, '.home');
+  const pluginData = path.join(proj, '.plugin-data');
+  const shell = { ...process.env, HOME: home, USERPROFILE: home, RATCHET_EVOLVE_LOG: path.join(proj, 'evolve-log.jsonl') };
+  delete shell.RATCHET_DATA_DIR;
+  delete shell.RATCHET_AGENT;
+  delete shell.CLAUDE_PLUGIN_DATA;
+  const hook = { ...shell, CLAUDE_PLUGIN_DATA: pluginData };
+
+  assert.strictEqual(spawnSync(process.execPath, [bin, 'state', 'set', 'objective', 'one base'], { cwd: proj, env: shell, encoding: 'utf8' }).status, 0);
+  const r = spawnSync(process.execPath, [bin, 'hook', 'post-edit'], {
+    cwd: proj, env: hook, input: JSON.stringify({ tool_input: { file_path: 'README.md' } }), encoding: 'utf8',
+  });
+  assert.strictEqual(r.status, 0, r.stderr);
+
+  assert.ok(!fs.existsSync(path.join(pluginData, 'projects')), 'the hook must not open a second store under CLAUDE_PLUGIN_DATA');
+  const projects = path.join(home, '.ratchet', 'projects');
+  const stores = fs.readdirSync(projects);
+  assert.strictEqual(stores.length, 1, `one store for one project — got: ${stores.join(', ')}`);
+  const s = JSON.parse(fs.readFileSync(path.join(projects, stores[0], 'state.json'), 'utf8'));
+  assert.strictEqual(s.objective, 'one base');
+  assert.deepStrictEqual(s.touchedFiles.map((f) => f.path), ['README.md'], 'the hook touch lands in the store the CLI wrote');
+});
+
+ok('hooks never create a store in a project that has none', () => {
+  // A hook fires in every project the plugin is enabled in. Creating a store
+  // there filled one plugin data dir with 992 empty stores; a store exists only
+  // where someone ran ratchet.
+  const { spawnSync } = require('child_process');
+  const bin = path.resolve(__dirname, '..', 'bin', 'ratchet');
+  const proj = path.join(tmp, 'hook-no-store');
+  fs.rmSync(proj, { recursive: true, force: true });
+  fs.mkdirSync(proj, { recursive: true });
+  const data = path.join(proj, '.data');
+  const env = { ...process.env, RATCHET_DATA_DIR: data };
+  delete env.RATCHET_AGENT;
+  for (const sub of ['session-start', 'post-edit', 'stop-check']) {
+    const r = spawnSync(process.execPath, [bin, 'hook', sub], {
+      cwd: proj, env, input: JSON.stringify({ tool_input: { file_path: 'README.md' } }), encoding: 'utf8',
+    });
+    assert.strictEqual(r.status, 0, `${sub} never breaks the session`);
+    assert.strictEqual(String(r.stderr || ''), '', `${sub} has nothing to say about a project ratchet never ran in`);
+  }
+  assert.ok(!fs.existsSync(path.join(data, 'projects')), 'no store was created');
+});
+
+ok('touchedFiles keeps one row per path, newest last, and stays bounded', () => {
+  // The receipt reads touchedFiles as the set of paths changed since the last
+  // compile, so only each path's newest touch carries information. Unbounded,
+  // every edit appended a row and rewrote the whole list.
+  const verbs = require('../src/verbs');
+  const max = verbs.TOUCHED_FILES_MAX;
+  const proj = path.join(tmp, 'touch-bound');
+  fs.rmSync(proj, { recursive: true, force: true });
+  fs.mkdirSync(proj, { recursive: true });
+  state.initProject(proj, { force: true });
+  inProject(proj, () => {
+    const s = state.loadState(proj);
+    s.touchedFiles = [{ path: 'dup.md', at: '2026-01-01T00:00:00.000Z' }];
+    for (let i = 0; i < max + 50; i++) s.touchedFiles.push({ path: `f${i}.md`, at: '2026-01-02T00:00:00.000Z' });
+    s.touchedFiles.push({ path: 'dup.md', at: '2026-01-03T00:00:00.000Z' });
+    state.saveState(proj, s);
+
+    say(() => cli.run(['node', 'ratchet', 'touch', 'new.md']));
+    let t = state.loadState(proj).touchedFiles;
+    assert.strictEqual(t.length, max, `an oversized trail collapses to the bound on the next touch — got ${t.length}`);
+    assert.strictEqual(t[t.length - 1].path, 'new.md', 'the newest touch is last');
+    const dups = t.filter((f) => f.path === 'dup.md');
+    assert.strictEqual(dups.length, 1, 'one row per path');
+    assert.strictEqual(dups[0].at, '2026-01-03T00:00:00.000Z', 'and it is the newest touch of that path');
+    assert.ok(!t.some((f) => f.path === 'f0.md'), 'the oldest paths fall off first');
+
+    say(() => cli.run(['node', 'ratchet', 'touch', 'new.md']));
+    t = state.loadState(proj).touchedFiles;
+    assert.strictEqual(t.filter((f) => f.path === 'new.md').length, 1, 'touching a path again moves it, never repeats it');
+
+    say(() => cli.run(['node', 'ratchet', 'state', 'append', 'touchedFiles', '{"path":"appended.md"}']));
+    t = state.loadState(proj).touchedFiles;
+    assert.strictEqual(t.length, max, 'state append is bounded by the same rule');
+    assert.strictEqual(t[t.length - 1].path, 'appended.md');
+  });
 });
 
 ok('score confidence leaves no write footprint for a propose-only agent', () => {

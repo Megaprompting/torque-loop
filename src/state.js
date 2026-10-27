@@ -10,13 +10,16 @@ const schemas = require('./schemas');
 const wal = require('./wal');
 
 // ---------------------------------------------------------------------------
-// Location. State survives plugin updates when CLAUDE_PLUGIN_DATA is set.
-// Everything is scoped per-project so multiple repos never collide in one
-// shared plugin data directory.
+// Location. One base for every caller: RATCHET_DATA_DIR, else ~/.ratchet.
+// CLAUDE_PLUGIN_DATA is deliberately ignored. Claude Code sets it for hooks and
+// the MCP server but never for the model's own shell, so honoring it split one
+// project into two stores: hook writes landed in a shadow store the CLI never
+// read. ~/.ratchet already survives plugin updates.
+// Everything is scoped per-project so multiple repos never collide in one base.
 // ---------------------------------------------------------------------------
 
 function baseDir() {
-  const explicit = process.env.RATCHET_DATA_DIR || process.env.CLAUDE_PLUGIN_DATA;
+  const explicit = process.env.RATCHET_DATA_DIR;
   if (explicit && explicit.trim()) return explicit.trim();
   const home = process.env.HOME || process.env.USERPROFILE || os.homedir();
   return path.join(home, '.ratchet');
