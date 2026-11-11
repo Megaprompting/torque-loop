@@ -36,7 +36,7 @@ ratchet status
 5. **Set the reversal tripwire.** The specific observable signal that means: this was
    wrong, reverse now. Without a tripwire, a bad decision runs forever.
 
-## Absorbed moves (2026-09-05: `/ratchet:auction` and `/ratchet:burn` fold in here)
+## Absorbed moves (the former auction and burn commands live here)
 
 - **When the menu is a set of blockers, rank before choosing.** Score each on leverage,
   certainty, speed-to-unblock and risk-of-ignoring with `ratchet score friction '[...]'`

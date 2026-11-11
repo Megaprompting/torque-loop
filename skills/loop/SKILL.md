@@ -22,7 +22,7 @@ Each iteration:
 
 1. **Discover the missing thing.** The highest-leverage gap right now — an untested
    assumption, an open defect, a missing piece of the artifact. (Borrow `/ratchet:cut`
-   and `/ratchet:auction` logic to pick it.)
+   logic and the blocker ranking in `/ratchet:decide` to pick it.)
 2. **Build** the artifact or the fix (`/ratchet:build`).
 3. **Attack** it with the five-voice board (`/ratchet:attack`); record defects.
 4. **Patch** only what failed (`/ratchet:patch`); resolve the original defect with evidence.

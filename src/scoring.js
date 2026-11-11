@@ -285,11 +285,14 @@ const APERTURE_DIMENSIONS = ['ambiguity', 'terrain', 'taste', 'blastRadius', 're
 // resume), and any sequence that builds VERIFIES after its last build/patch
 // (otherwise the last edit ships unrun). A0 gained compile and A3 gained verify
 // on exactly those grounds; A4 ends on compile because a decision is an artifact.
+// A third, pinned in plugin-shape: every step is a shipped skill. A3 lost its
+// `auction` step when that skill folded into `decide`, which now ranks blockers
+// (`ratchet score friction`) before it chooses.
 const APERTURE_LEVELS = [
   { max: 2, level: 'A0', name: 'Snap', implement: true, sequence: ['build', 'verify', 'compile'] },
   { max: 4, level: 'A1', name: 'Narrow', implement: true, sequence: ['lock', 'build', 'verify', 'compile'] },
   { max: 6, level: 'A2', name: 'Working', implement: true, sequence: ['lock', 'cut', 'build', 'attack', 'patch', 'verify', 'compile'] },
-  { max: 8, level: 'A3', name: 'Wide', implement: true, sequence: ['lock', 'map', 'auction', 'cut', 'decide', 'build', 'attack', 'patch', 'verify', 'compile'] },
+  { max: 8, level: 'A3', name: 'Wide', implement: true, sequence: ['lock', 'map', 'cut', 'decide', 'build', 'attack', 'patch', 'verify', 'compile'] },
   { max: 10, level: 'A4', name: 'Max', implement: false, sequence: ['lock', 'map', 'cut', 'decide', 'compile'] },
 ];
 

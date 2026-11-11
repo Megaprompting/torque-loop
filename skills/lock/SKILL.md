@@ -74,4 +74,5 @@ ratchet score aperture '{"ambiguity":_,"terrain":_,"taste":_,"blastRadius":_,"re
 - **A4** → do not build yet; produce options and lock constraints first.
 
 Then point forward: the locked target's smallest artifact is now the target of
-`/ratchet:build`, or run `/ratchet:auction` first if the path to it is blocked.
+`/ratchet:build`, or rank the blockers with `/ratchet:decide` first if the path to it is
+blocked.

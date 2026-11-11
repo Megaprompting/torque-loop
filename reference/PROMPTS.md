@@ -16,7 +16,6 @@ KEEP is bound to that exact revision — `ratchet artifact close <id>`. No proof
 | `/ratchet:ignite` | Master Ignition Prompt (consequence engine) |
 | `/ratchet:lock` | 1 · The Target Is Not The Topic |
 | `/ratchet:map` | The Fog Map (four-quadrant unknowns walk) |
-| `/ratchet:auction` | 2 · The Friction Auction |
 | `/ratchet:cut` | 3 · The Assumption Guillotine |
 | `/ratchet:mechanism` | 4 · The Mechanism Knife |
 | `/ratchet:attack` | 5 · The Hostile Board |
@@ -24,12 +23,14 @@ KEEP is bound to that exact revision — `ratchet artifact close <id>`. No proof
 | `/ratchet:verify` | 7 · The Embarrassment Harness |
 | `/ratchet:patch` | 8 · The Delta Surgeon |
 | `/ratchet:decide` | 9 · The Decision Spike |
-| `/ratchet:burn` | 10 · The Option Burn |
 | `/ratchet:compile` | 11 · The State Compiler |
-| `/ratchet:push` | 12 · The Boundary Push |
 | `/ratchet:repo-audit`, `/ratchet:qa-ledger`, `/ratchet:verify` | Software QA agent prompt |
-| `/ratchet:prompt-audit` | Prompt-library evolution prompt |
-| `/ratchet:handoff` | State Compiler, aimed at another agent |
+
+**Retired numbers.** Prompts 2 (Friction Auction) and 10 (Option Burn) were retired as
+commands: the `/ratchet:decide` skill carries their moves (blocker ranking, option debt)
+as prompt-level guidance, and canonical prompt 9 is unchanged. Prompt 12 (Boundary Push),
+the prompt-library evolution prompt and the standalone handoff command were removed
+unused. Surviving prompts keep their numbers, so a number never changes meaning.
 
 The operating rule for the whole system: **never keep a move unless it forces a choice,
 creates an artifact, tests an artifact, patches a defect, serializes useful state, kills a
@@ -170,36 +171,6 @@ Then hand over ONE page: the four-quadrant map (OPEN items stay on the map, not 
 a tweakable build plan ordered by what might change, and a copy-paste implementation prompt.
 
 What you deliver is the map, not a build. Stop when I have it.
-```
-
----
-
-## 2 · The Friction Auction  → `/ratchet:auction`
-
-```text
-Run a friction auction on this target:
-
-[TARGET]
-
-List the obstacles that are actually preventing progress.
-
-For each obstacle, score:
-
-- Leverage if removed: 1-10
-- Certainty that it matters: 1-10
-- Time-to-unblock: 1-10, where 10 means fast
-- Risk of ignoring it: 1-10
-
-Calculate Priority = Leverage × Certainty × Time-to-unblock × Risk.
-
-Then choose the single highest-priority obstacle.
-
-Return:
-
-1. Ranked obstacle table.
-2. The winning obstacle.
-3. Why it beats the more tempting alternatives.
-4. The next artifact required to remove it.
 ```
 
 ---
@@ -415,30 +386,6 @@ Pick.
 
 ---
 
-## 10 · The Option Burn  → `/ratchet:burn`
-
-```text
-We are carrying too many options.
-
-Given this project state:
-
-[PASTE STATE]
-
-Identify the options we should deliberately stop preserving.
-
-For each option:
-
-- Why it is attractive.
-- Why it is stealing energy.
-- What fear keeps it alive.
-- What becomes simpler if we kill it.
-- Whether to kill, park, or keep.
-
-Then name the one option to burn now and the exact sentence I should use to record that decision.
-```
-
----
-
 ## 11 · The State Compiler  → `/ratchet:compile`
 
 ```text
@@ -463,34 +410,6 @@ Return a compact record with:
 
 Only include information that changes future behavior.
 Delete interesting-but-nonoperative commentary.
-```
-
----
-
-## 12 · The Boundary Push  → `/ratchet:push`
-
-```text
-Now push the boundary.
-
-Current artifact or plan:
-
-[PASTE ARTIFACT / PLAN]
-
-Find the boldest adjacent move that could multiply the result without turning it into fantasy.
-
-Return:
-
-1. The safe default path.
-2. The boundary-pushing path.
-3. Why the boundary path might work.
-4. Why it might be stupid.
-5. The cheapest experiment that distinguishes them.
-6. The version we should try.
-7. The first irreversible move.
-
-Do not be reckless.
-Do not be timid.
-Find the edge where information gain is highest.
 ```
 
 ---
@@ -534,42 +453,5 @@ Routing rule: defect records enter and change ONLY through the defect verbs
 A generic edit to the defect mirror would make it lie about the record it mirrors.
 ```
 
----
-
-## Specialized · Prompt-library evolution  → `/ratchet:prompt-audit`
-
-```text
-Audit this prompt library as an operating system.
-
-Prompt list:
-
-[PASTE PROMPTS]
-
-Do not rewrite them yet.
-
-First classify each prompt by the type of work it performs:
-
-- target locking
-- diagnosis
-- artifact production
-- adversarial testing
-- decision
-- patching
-- memory/state
-- orchestration
-- compression
-- boundary pushing
-
-Then find:
-
-1. Overrepresented moves.
-2. Missing moves.
-3. Prompts that cause meta-looping.
-4. Prompts that create artifacts.
-5. Prompts that should be deleted or merged.
-6. The minimum new prompt set that would outperform the library.
-
-Finally, produce the upgraded library as a sequenced workflow, not a pile of prompts.
-```
-
 <!-- Traced by: claude-opus-5[1m] · 2026-07-29 (0.8 Closure Gate: canonical path gains verify; the ending rule) -->
+<!-- Traced by: claude-fable-5-2 · 2026-11-11 (surface cut: prompts 2, 10, 12 and prompt-library evolution retired) -->
