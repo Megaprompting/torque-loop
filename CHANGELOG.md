@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- **Six commands cut from the surface: `/ratchet:auction`, `/ratchet:burn`,
+  `/ratchet:handoff`, `/ratchet:push`, `/ratchet:prompt-audit`, `/ratchet:status`**
+  (21 commands → 15). Evidence, scope named: a scan of the owner's Claude Code
+  transcripts (3,356 files, 22 GB, 2026-08 to 2026-11-11; Codex sessions not scanned)
+  found zero invocations of any of the six, by a model or typed by hand, and all six
+  were already switched off in the owner's own settings. Nothing they guaranteed is lost:
+  - `auction` and `burn` live in `/ratchet:decide` (blocker ranking with
+    `ratchet score friction`; KILL / PARK / KEEP for option debt), folded 2026-09-05.
+  - `handoff` lives in `/ratchet:compile`, which now also carries its two tested
+    duties: surfacing deviations from the map, and labelling every probe disposed or
+    promoted.
+  - `status` was a wrapper; `ratchet status` and `ratchet receipt` are unchanged.
+  - `push` and `prompt-audit` are removed outright.
+- **Canonical prompts 2, 10, 12 and the prompt-library evolution prompt** leave
+  `reference/PROMPTS.md`, so the MCP `prompts/list` surface serves 12 prompts, down from
+  16. Surviving prompts keep their numbers. **Breaking for an MCP client that requested
+  `auction`, `burn`, `push` or `prompt-audit` by name.**
+
+### Changed
+
+- **The A3 aperture sequence drops its `auction` step (CLI-enforced):**
+  `lock → map → cut → decide → build → attack → patch → verify → compile`. The engine
+  printed `/ratchet:auction` as a step to run; with the skill gone that was an
+  instruction to run a command that does not exist. `ratchet score friction` and the
+  `bottleneck` state field are unchanged.
+- Prompt-level: `ignite`, `lock` and `loop` point at the blocker ranking in
+  `/ratchet:decide` where they named `/ratchet:auction`.
+
+### Added
+
+- **Two drift guards in `plugin-shape`:** every step of every metered aperture
+  sequence is a shipped skill folder, and no shipped guidance surface (skills, agents,
+  README, PROMPTS.md) names a `/ratchet:` command that has no skill folder. Both fail on
+  the tree before this change. Three handoff guards were retargeted to
+  `skills/compile/SKILL.md`, which now carries what they protect.
+
+Traced by: claude-fable-5-2 · 2026-11-11
+
 ## [1.1.0] - 2026-10-27 — Ledger Gate
 
 ### Added

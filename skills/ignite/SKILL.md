@@ -49,7 +49,7 @@ The result names an aperture and the exact ratchet sequence to run:
 | A0 Snap | 0–2 | `build → verify → compile` — do it, prove it, record it. |
 | A1 Narrow | 3–4 | `lock → build → verify → compile`. |
 | A2 Working | 5–6 | `lock → cut → build → attack → patch → verify → compile` — the pipeline below. |
-| A3 Wide | 7–8 | `lock → map → auction → cut → decide → build → attack → patch → verify → compile` — map the fog before you build. |
+| A3 Wide | 7–8 | `lock → map → cut → decide → build → attack → patch → verify → compile` — map the fog before you build. |
 | A4 Max | 9–10 | `lock → map → cut → decide → compile`, then **STOP — produce options, do not build** until constraints are locked. |
 
 Every sequence ends on `compile`, and every sequence that builds runs `verify` after its
@@ -77,9 +77,9 @@ as skipping it on an A4 task. Spend proof where uncertainty earns it.
    highest-information missing variable, and the assumption you'll adopt if it's missing.
    Persist: `ratchet state set objective "<one line>"`.
 
-2. **Run the friction auction.** Apply `/ratchet:auction`. List the real blockers, score
-   each, and pick the one bottleneck with the highest leverage. Feed candidates to
-   `ratchet score friction '[...]'` and adopt its winner. Persist:
+2. **Rank the blockers.** Apply the blocker ranking in `/ratchet:decide`. List the real
+   blockers, score each, and pick the one bottleneck with the highest leverage. Feed
+   candidates to `ratchet score friction '[...]'` and adopt its winner. Persist:
    `ratchet state set bottleneck "<winner>"`.
 
 3. **Cut assumptions.** Apply `/ratchet:cut`. Name the assumptions that would make this

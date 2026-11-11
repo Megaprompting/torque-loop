@@ -20,7 +20,7 @@ Torque Loop gives it a job:
 
 It bundles three things:
 
-- **The Ratchet command family** (`/ratchet:*`) — 21 commands that turn ambiguity into
+- **The Ratchet command family** (`/ratchet:*`) — 15 commands that turn ambiguity into
   shipped, falsifiable artifacts through adversarial execution loops.
 - **`/ratchet:evolve`** — a narrower, bounded loop that mutates one artifact, tests it, and
   keeps only proven improvement.
@@ -100,7 +100,6 @@ when it isn't. In Codex, ask it to use the matching Torque Loop skill, for examp
 | `/ratchet:ignite` | Run the full consequence loop on any messy task. |
 | `/ratchet:lock` | Convert vague input into a locked, executable target. |
 | `/ratchet:map` | Map the fog before building — walk the four unknown-quadrants, hand over a durable map. |
-| `/ratchet:auction` | Rank the real blockers by leverage; pick the one bottleneck. |
 | `/ratchet:cut` | Attack the hidden assumptions before you invest. |
 | `/ratchet:mechanism` | Name the one mechanism under a confusing situation. |
 | `/ratchet:build` | Force artifact production — the smallest usable v0. |
@@ -108,10 +107,7 @@ when it isn't. In Codex, ask it to use the matching Torque Loop skill, for examp
 | `/ratchet:verify` | Build a harness that could embarrass the artifact, then run it. |
 | `/ratchet:patch` | Fix only what failed — minimal REMOVE / ADD / CHANGE delta. |
 | `/ratchet:decide` | Force one defended choice with a reversal tripwire. |
-| `/ratchet:burn` | Kill or park the options draining your energy. |
-| `/ratchet:push` | Push the boundary once a safe version exists. |
 | `/ratchet:compile` | Serialize the session into durable state. |
-| `/ratchet:status` | Read the current ratchet state. |
 | `/ratchet:loop` | Repeat build → attack → patch → compile until it holds. |
 
 > **When to reach for `/ratchet:map`.** High-uncertainty work — aperture **A3–A4**,
@@ -135,8 +131,6 @@ when it isn't. In Codex, ask it to use the matching Torque Loop skill, for examp
 | --- | --- |
 | `/ratchet:repo-audit` | Discover user-facing features/routes/APIs by code evidence. |
 | `/ratchet:qa-ledger` | Create/update the canonical feature/test/defect ledger. |
-| `/ratchet:prompt-audit` | Audit a prompt library as an operating system. |
-| `/ratchet:handoff` | Produce a compact handoff for another agent or session. |
 
 Every command maps to a canonical prompt. The source prompts live in
 [`reference/PROMPTS.md`](reference/PROMPTS.md) — the load-bearing intent each skill

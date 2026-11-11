@@ -56,3 +56,20 @@ RECORD: ratchet defect add '{"severity":"...","summary":"..."}'  (one per real d
 
 If you found nothing critical or high after genuinely trying, say so plainly — that is a
 real result, not a failure to find fault.
+
+## Rubric-audit mode (absorbs the skill-rubric-auditor agent, 2026-09-05)
+
+When the artifact is a rubric library or a skill's judgment system, run these ten checks
+instead of the five-voice board, with the same evidence standard and severity scale
+(BLOCKER / HIGH / MEDIUM / LOW / PASS):
+
+1. Skill boundary integrity — bound to exactly one skill; out-of-scope lessons kept as external candidates.
+2. Evidence quality — every `proven` rubric cites real, inspectable evidence that supports that exact rubric.
+3. Candidate versus proven separation — unproven ideas stay `candidate`; status words used consistently; every promotion or retirement has a rationale.
+4. Rubric schema completeness — stable id, skill anchor, purpose, trigger, success and failure criteria, scoring guide, required evidence, examples; indexes match the prose.
+5. LLM usability — criteria observable and gate-like, scales anchored; another model could judge with them.
+6. Duplicate and bloat control — no re-worded duplicates; new text improves judgment, not volume.
+7. Maintenance log integrity — append-only, dated, says what changed, which ids, why, on what evidence.
+8. Promotion readiness — a recommended `proven` survives skeptical review and names what would invalidate it.
+9. Safety and authority — no silent authority expansion; advisory wording not turned into enforcement.
+10. Diff minimality — edits surgical for the stated need; no churn in unrelated files.

@@ -34,6 +34,18 @@ interesting-but-nonoperative commentary. If it won't change a future move, it do
 8. **Next prompt/command** — the exact `/ratchet:...` to run next.
 9. **Retrieval tags** — comma-separated handles for future search.
 10. **One-sentence memory** — the single line worth saving. Make it load-bearing.
+11. **Handoff test** (the former handoff command lives here) — every DONE item must be
+    runnable by the receiver and return pass or fail with no judgment call; every file
+    reference is an exact path, never "the config file"; delete anything the receiver does
+    not need in order to act. A handoff is not a diary. When the reader is another agent,
+    start the brief from `ratchet receipt`: its eight fixed sections are the spine.
+12. **Deviations from the map** — if `/ratchet:map` ran, where the build diverged from its
+    plan (map said X → code revealed Y → call made) and which calls still need the user's
+    judgment. This stops the receiver re-litigating what you already discovered.
+13. **Probe outcomes** — for each probe: the unknown it attacked, the finding, and whether
+    its code was **disposed** or explicitly **promoted**. An undisposed probe is a
+    watch-out, not an asset: the receiver must not mistake build-for-learn residue for
+    kept work.
 
 ## Serialize (write it all through the CLI)
 

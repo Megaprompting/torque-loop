@@ -35,6 +35,9 @@ silent, infer the most reasonable value and mark it as an assumption.
    the plan most.
 8. **Assumption if missing** — the value you will adopt for that variable so work can
    start now, stated explicitly so it can be challenged later.
+9. **Downstream consumer** — who consumes the result and what they do with it. The
+   proof-of-done must be runnable by that consumer; strip any field that merely restates the
+   task and any word like "clean", "properly" or "works well".
 
 ## Output contract
 
@@ -47,6 +50,7 @@ PROOF-OF-DONE: <the checkable test>
 SMALLEST ARTIFACT: <20-minute forward motion>
 MISSING VARIABLE: <highest-information unknown>
 WORKING ASSUMPTION: <adopted value + one-line justification>
+CONSUMER: <who runs the proof-of-done and what they do with the result>
 ```
 
 ## Serialize
@@ -70,4 +74,5 @@ ratchet score aperture '{"ambiguity":_,"terrain":_,"taste":_,"blastRadius":_,"re
 - **A4** → do not build yet; produce options and lock constraints first.
 
 Then point forward: the locked target's smallest artifact is now the target of
-`/ratchet:build`, or run `/ratchet:auction` first if the path to it is blocked.
+`/ratchet:build`, or rank the blockers with `/ratchet:decide` first if the path to it is
+blocked.

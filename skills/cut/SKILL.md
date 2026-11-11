@@ -33,6 +33,11 @@ ratchet status
 4. **Pick the top three kill-tests** — the ones worth running before any further build.
    A kill-test is a test designed to *end* the plan cheaply, not to confirm it.
 
+5. **A SURVIVE is only as strong as the attack shown.** When a kill-test fails to kill,
+   report SURVIVE with the attack visible and still name the specific break case, so the
+   next reviewer knows where the edge is. "Could not break it" is the only evidence of
+   soundness; a weak attack yields a weak SURVIVE.
+
 ## Output contract
 
 ```

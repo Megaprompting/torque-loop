@@ -35,12 +35,14 @@ const META = 'io.modelcontextprotocol/';
 const MODERN = '2026-07-28';
 const LEGACY = '2025-11-25';
 
-// The 16 commands PROMPTS.md declares, written out rather than re-derived: a test
+// The 12 commands PROMPTS.md declares, written out rather than re-derived: a test
 // that parses the source the same way the generator does would pass on the same
-// mistake twice (convention 14).
+// mistake twice (convention 14). It was 16 until auction, burn, push and
+// prompt-audit were retired with their skills; a prompt served for a command
+// nobody can run is a dangling instruction.
 const EXPECTED = [
-  'ignite', 'lock', 'map', 'auction', 'cut', 'mechanism', 'attack', 'build',
-  'verify', 'patch', 'decide', 'burn', 'compile', 'push', 'repo-audit', 'prompt-audit',
+  'ignite', 'lock', 'map', 'cut', 'mechanism', 'attack', 'build',
+  'verify', 'patch', 'decide', 'compile', 'repo-audit',
 ];
 
 let passed = 0;
@@ -166,7 +168,7 @@ ok('P2 the Software QA prompt keeps its second command as an alias, not a second
 ok('P3 arguments are derived from the placeholders actually in the body', () => {
   const byName = new Map(prompts.list().prompts.map((p) => [p.name, p]));
   assert.deepStrictEqual(byName.get('lock').arguments.map((a) => a.name), ['context']);
-  assert.deepStrictEqual(byName.get('auction').arguments.map((a) => a.name), ['target']);
+  assert.deepStrictEqual(byName.get('mechanism').arguments.map((a) => a.name), ['situation']);
   assert.deepStrictEqual(byName.get('patch').arguments.map((a) => a.name), ['artifact', 'failures']);
   assert.deepStrictEqual(byName.get('build').arguments.map((a) => a.name), ['context', 'outcome']);
   for (const p of prompts.list().prompts) {

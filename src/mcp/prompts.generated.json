@@ -41,19 +41,6 @@
       "body": "Map the fog before you build.\n\nGiven this task and its codebase:\n\n[PASTE CONTEXT]\n\nDo not build yet. Scan the terrain first — existing, half-built, and reverted work —\nthen walk four quadrants in order, naming the current one:\n\n1. Known knowns — state the settled ground, each fact cited to file:line. Mark every\n   assumption separately and say you will treat it as true until I correct it.\n2. Known unknowns — ask ONE question at a time, widest-impact first. Give lettered options\n   with a recommended answer so I react in a few characters. Close each by:\n   user answer | territory (you researched it, show question + finding) | probe (a time-boxed\n   throwaway build whose only durable output is the finding — probe code dies, probe findings\n   live) | OPEN (+ what unblocks it AND the route that will close it: ask-user, probe,\n   park with owner, assumption + kill test, or defect).\n3. Unknown knowns — surface my tacit taste and context. Don't make me imagine it; put\n   something concrete in front of me to react to (sample data, a throwaway mock, competing\n   design directions). Record what each reaction reveals.\n4. Unknown unknowns — sweep for landmines: wrong-by-default data, stale denormalizations,\n   unwritten conventions, prior attempts that were abandoned or rolled back (and the reason\n   they died), latent bugs on this path. Each as a card: evidence (file:line) → why it bites\n   → what it changes → decided | OPEN | sharp-edge.\n\nThen hand over ONE page: the four-quadrant map (OPEN items stay on the map, not in chat),\na tweakable build plan ordered by what might change, and a copy-paste implementation prompt.\n\nWhat you deliver is the map, not a build. Stop when I have it.\n"
     },
     {
-      "name": "auction",
-      "title": "2 · The Friction Auction",
-      "description": "2 · The Friction Auction",
-      "arguments": [
-        {
-          "name": "target",
-          "placeholder": "[TARGET]",
-          "required": true
-        }
-      ],
-      "body": "Run a friction auction on this target:\n\n[TARGET]\n\nList the obstacles that are actually preventing progress.\n\nFor each obstacle, score:\n\n- Leverage if removed: 1-10\n- Certainty that it matters: 1-10\n- Time-to-unblock: 1-10, where 10 means fast\n- Risk of ignoring it: 1-10\n\nCalculate Priority = Leverage × Certainty × Time-to-unblock × Risk.\n\nThen choose the single highest-priority obstacle.\n\nReturn:\n\n1. Ranked obstacle table.\n2. The winning obstacle.\n3. Why it beats the more tempting alternatives.\n4. The next artifact required to remove it.\n"
-    },
-    {
       "name": "cut",
       "title": "3 · The Assumption Guillotine",
       "description": "3 · The Assumption Guillotine",
@@ -154,19 +141,6 @@
       "body": "Make the decision.\n\nDecision context:\n\n[PASTE CONTEXT]\n\nOptions under consideration:\n\n[PASTE OPTIONS]\n\nJudge by:\n\n1. Expected upside.\n2. Reversibility.\n3. Time-to-feedback.\n4. Strategic compounding.\n5. Cost of being wrong.\n6. What this unlocks next.\n\nReturn:\n\n- The chosen option.\n- The rejected option that was most tempting.\n- Why it loses.\n- The first action.\n- The tripwire that would make us reverse the decision.\n\nNo balanced overview.\nPick.\n"
     },
     {
-      "name": "burn",
-      "title": "10 · The Option Burn",
-      "description": "10 · The Option Burn",
-      "arguments": [
-        {
-          "name": "state",
-          "placeholder": "[PASTE STATE]",
-          "required": true
-        }
-      ],
-      "body": "We are carrying too many options.\n\nGiven this project state:\n\n[PASTE STATE]\n\nIdentify the options we should deliberately stop preserving.\n\nFor each option:\n\n- Why it is attractive.\n- Why it is stealing energy.\n- What fear keeps it alive.\n- What becomes simpler if we kill it.\n- Whether to kill, park, or keep.\n\nThen name the one option to burn now and the exact sentence I should use to record that decision.\n"
-    },
-    {
       "name": "compile",
       "title": "11 · The State Compiler",
       "description": "11 · The State Compiler",
@@ -174,31 +148,11 @@
       "body": "Compile this session into durable state.\n\nSession content:\n\n[PASTE SESSION / NOTES / OUTPUTS]\n\nReturn a compact record with:\n\n1. Working title.\n2. Current objective.\n3. Decisions made.\n4. Artifacts created.\n5. Defects or risks found.\n6. Open loops.\n7. Next action.\n8. Next prompt to run.\n9. Retrieval tags.\n10. One-sentence memory worth saving.\n\nOnly include information that changes future behavior.\nDelete interesting-but-nonoperative commentary.\n"
     },
     {
-      "name": "push",
-      "title": "12 · The Boundary Push",
-      "description": "12 · The Boundary Push",
-      "arguments": [],
-      "body": "Now push the boundary.\n\nCurrent artifact or plan:\n\n[PASTE ARTIFACT / PLAN]\n\nFind the boldest adjacent move that could multiply the result without turning it into fantasy.\n\nReturn:\n\n1. The safe default path.\n2. The boundary-pushing path.\n3. Why the boundary path might work.\n4. Why it might be stupid.\n5. The cheapest experiment that distinguishes them.\n6. The version we should try.\n7. The first irreversible move.\n\nDo not be reckless.\nDo not be timid.\nFind the edge where information gain is highest.\n"
-    },
-    {
       "name": "repo-audit",
       "title": "Specialized · Software QA agent",
       "description": "Specialized · Software QA agent. Aliases: /ratchet:qa-ledger.",
       "arguments": [],
       "body": "Turn this codebase into a quality ledger.\n\nGiven access to the repository or file tree:\n\n[PASTE TREE / CONTEXT]\n\nDiscover user-facing features by evidence, not guesses.\n\nFor each feature, create:\n\n- Feature ID\n- Feature name\n- User story\n- Evidence in code\n- Expected behavior\n- Edge cases\n- Test cases\n- Dependencies\n- Known assumptions\n- Current risk level\n\nThen identify:\n\n1. Screens/routes/workflows not yet documented.\n2. APIs or state transitions that need tests.\n3. The highest-risk feature.\n4. The first test suite to write.\n5. The smallest fix likely to improve user trust.\n\nDo not declare coverage complete unless every route, screen, workflow, and API interaction has evidence.\n\nRouting rule: defect records enter and change ONLY through the defect verbs\n(defect add / resolve / reopen / supersede); ledger update addresses features and tests.\nA generic edit to the defect mirror would make it lie about the record it mirrors.\n"
-    },
-    {
-      "name": "prompt-audit",
-      "title": "Specialized · Prompt-library evolution",
-      "description": "Specialized · Prompt-library evolution",
-      "arguments": [
-        {
-          "name": "prompts",
-          "placeholder": "[PASTE PROMPTS]",
-          "required": true
-        }
-      ],
-      "body": "Audit this prompt library as an operating system.\n\nPrompt list:\n\n[PASTE PROMPTS]\n\nDo not rewrite them yet.\n\nFirst classify each prompt by the type of work it performs:\n\n- target locking\n- diagnosis\n- artifact production\n- adversarial testing\n- decision\n- patching\n- memory/state\n- orchestration\n- compression\n- boundary pushing\n\nThen find:\n\n1. Overrepresented moves.\n2. Missing moves.\n3. Prompts that cause meta-looping.\n4. Prompts that create artifacts.\n5. Prompts that should be deleted or merged.\n6. The minimum new prompt set that would outperform the library.\n\nFinally, produce the upgraded library as a sequenced workflow, not a pile of prompts.\n"
     }
   ]
 }

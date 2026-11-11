@@ -198,6 +198,39 @@ ok('README command list matches the skill folders', () => {
   }
 });
 
+ok('every metered sequence step is a shipped skill', () => {
+  // The aperture read prints its sequence as `/ratchet:<step>` commands
+  // (src/markdown.js), so a step with no skill folder is an instruction to run a
+  // command that does not exist. The engine and the package shrink together or
+  // not at all — this is the guard that caught `auction` when its skill was cut.
+  const scoring = require('../src/scoring');
+  for (const band of scoring.APERTURE_LEVELS) {
+    for (const step of band.sequence) {
+      assert.ok(
+        skillDirs.includes(step),
+        `${band.level} sequence names "${step}", which has no skills/${step}/ folder`
+      );
+    }
+  }
+});
+
+ok('no shipped guidance surface names a command that does not exist', () => {
+  // Scope, out loud: skills, agents, README and the prompt catalog — the surfaces
+  // a user or agent reads as instructions. CHANGELOG and docs/ are history and may
+  // name retired commands. A retired command left in live guidance sends the
+  // reader to a skill that is gone, and nothing else in the suite would notice.
+  const agentFiles = fs.readdirSync(path.join(root, 'agents')).filter((f) => f.endsWith('.md'));
+  const surfaces = ['README.md', 'reference/PROMPTS.md']
+    .concat(skillDirs.map((name) => `skills/${name}/SKILL.md`))
+    .concat(agentFiles.map((f) => `agents/${f}`));
+  for (const rel of surfaces) {
+    const named = new Set(Array.from(read(rel).matchAll(/\/ratchet:([a-z][a-z-]*)/g), (m) => m[1]));
+    for (const name of named) {
+      assert.ok(skillDirs.includes(name), `${rel} names /ratchet:${name}, which has no skills/${name}/ folder`);
+    }
+  }
+});
+
 ok('README version examples match package.json (readouts must not drift)', () => {
   // The project's whole claim is state/readout trust — a README that shows a
   // stale `ratchet --version` output is the exact poison the receipt hunts.
@@ -240,18 +273,23 @@ ok('the /ratchet:map fog gate is wired into the prompt catalog', () => {
   assert.ok(prompts.includes('/ratchet:map'), 'PROMPTS.md references /ratchet:map');
 });
 
-ok('the living unknowns-map ships as templates and threads through build → handoff', () => {
+// The handoff guards below read skills/compile since the handoff command was
+// folded into compile and its skill removed. Retargeted, not weakened: each one
+// still demands the same guarantee, from the skill that now carries it.
+
+ok('the living unknowns-map ships as templates and threads through build → compile', () => {
   // The map is not a pre-build formality: it has a file shape, and it stays alive
-  // through the build as deviation notes that surface again at handoff.
+  // through the build as deviation notes that surface again at the handoff, which
+  // compile now owns.
   assert.ok(exists('templates/unknowns-map.md'), 'templates/unknowns-map.md exists');
   assert.ok(exists('templates/deviation-note.md'), 'templates/deviation-note.md exists');
   assert.ok(/deviation/i.test(read('skills/build/SKILL.md')), 'build records map deviations');
-  assert.ok(/deviation/i.test(read('skills/handoff/SKILL.md')), 'handoff surfaces map deviations');
+  assert.ok(/deviation/i.test(read('skills/compile/SKILL.md')), 'compile surfaces map deviations');
 });
 
-ok('the probe primitive threads map → build → handoff with a disposal rule', () => {
+ok('the probe primitive threads map → build → compile with a disposal rule', () => {
   // A probe is a build whose proof-of-done is knowledge, not code: the map can
-  // close an unknown by probe, build runs it as build-for-learn, handoff reports
+  // close an unknown by probe, build runs it as build-for-learn, compile reports
   // whether its code died or was explicitly promoted.
   assert.ok(exists('templates/probe-card.md'), 'templates/probe-card.md exists');
   assert.ok(/disposal/i.test(read('templates/probe-card.md')), 'the probe card carries a disposal rule');
@@ -259,7 +297,10 @@ ok('the probe primitive threads map → build → handoff with a disposal rule',
   assert.ok(/\bprobe\b/i.test(mapSkill), 'map can close an unknown by probe');
   assert.ok(/park/i.test(mapSkill), 'map OPEN items can be parked with an owner');
   assert.ok(/build-for-learn/i.test(read('skills/build/SKILL.md')), 'build distinguishes build-for-learn from build-for-keep');
-  assert.ok(/probe/i.test(read('skills/handoff/SKILL.md')), 'handoff surfaces probe outcomes');
+  const compileSkill = read('skills/compile/SKILL.md');
+  assert.ok(/probe/i.test(compileSkill), 'compile surfaces probe outcomes');
+  assert.ok(/disposed/i.test(compileSkill) && /promoted/i.test(compileSkill),
+    'and labels each probe disposed or promoted');
   assert.ok(/probe/i.test(read('reference/PROMPTS.md')), 'the prompt source of truth knows the probe closure');
   assert.ok(/probe/i.test(read('templates/unknowns-map.md')), 'the map template offers probe as a closure');
 });
@@ -363,10 +404,10 @@ ok('compile teaches CHECKPOINT, not CLOSED', () => {
   );
 });
 
-ok('handoff checkpoints through compile done, never the scalar bypass', () => {
-  const handoff = read('skills/handoff/SKILL.md');
-  assert.ok(/ratchet compile done/.test(handoff), 'handoff uses compile done');
-  assert.ok(!/state set (dirty|lastCompileAt)/.test(handoff), 'and not the removed scalar bypass');
+ok('the handoff checkpoints through compile done, never the scalar bypass', () => {
+  const compile = read('skills/compile/SKILL.md');
+  assert.ok(/ratchet compile done/.test(compile), 'compile checkpoints with compile done');
+  assert.ok(!/state set (dirty|lastCompileAt)/.test(compile), 'and not the removed scalar bypass');
 });
 
 

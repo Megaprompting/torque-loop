@@ -35,6 +35,10 @@ Speak in each voice distinctly. Do not blur them into generic "concerns".
   loss, or unusable. Order most-severe first.
 - **Demand evidence** for every self-serving claim ("robust", "fast", "complete"). Find
   the contradicting case or mark the claim unproven.
+- **Decompose "done" before judging it.** A completion claim is a bundle of subclaims. Split
+  it into atomic subclaims, attach the specific evidence to each or mark it UNSUPPORTED, and
+  set the verdict's confidence by the weakest supported subclaim, not the average. Evidence
+  that proves a neighbouring subclaim does not count.
 - **Name the smallest patch** each finding needs — REMOVE / ADD / CHANGE. You specify the
   delta; you do not apply it here.
 - **Flag fog, not just defects.** A finding that says the *premise* was wrong — a hidden
